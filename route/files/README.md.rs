@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::static_read_spec(),read:|_:&petal::Ctx|petal::read_json_value(&"Pump.fun Petal: coin reads, scoped sessions, create, buy, sell, fee collection, cashback, fee sharing, and operation receipts."));

@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::signing_write_spec("pumpfun.collect_fees").caps(&["bloom:http","bloom:store","bloom:sign"]),read:|_:&petal::Ctx|petal::read_json_value(&crate::json!({"description":"collect creator fees, distribute shares, or claim cashback","required":["operationId","mint"]})),write:|c:&petal::Ctx,b:&[u8]|crate::route_action(c,b,crate::Action::Fees));

@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("session.json",false,false),("stop",false,true),("create.json",false,true),("buy.json",false,true),("sell.json",false,true),("collect_fees.json",false,true),("sharing_config.json",false,true),("operations",true,false)]));

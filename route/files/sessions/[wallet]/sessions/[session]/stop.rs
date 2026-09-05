@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::write_spec().caps(&["bloom:store"]),read:|_:&petal::Ctx|petal::read_json_value(&crate::json!({"description":"stop this session"})),write:|c:&petal::Ctx,_:&[u8]|crate::route_stop(c));

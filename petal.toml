@@ -1,0 +1,59 @@
+schema = "bloom.petal.package.v1"
+name = "pumpfun"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-pumpfun"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["petal/pumpfun"]
+
+[consent]
+summary = "Inspect Pump.fun coins; create and trade coins; collect fees or cashback; and manage fee sharing with a scoped Bloom Solana key."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:key.derive"]
+
+[[net.allow]]
+binding = "pump"
+host = "fun-block.pump.fun"
+methods = ["post"]
+paths = ["/agents/create-coin", "/agents/swap", "/agents/collect-fees", "/agents/sharing-config"]
+
+[[net.allow]]
+binding = "coins"
+host = "frontend-api-v3.pump.fun"
+methods = ["get"]
+paths = ["/coins-v2/*"]
+
+[[net.allow]]
+binding = "solana"
+host = "rpc.solanatracker.io"
+methods = ["post"]
+paths = ["/public"]
+
+[[net.allow]]
+binding = "jito"
+host = "mainnet.block-engine.jito.wtf"
+methods = ["post"]
+paths = ["/api/v1/transactions"]
+
+[sign]
+allowed_intents = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config"]
+
+[[key.derive]]
+route = "sessions/[wallet]/new.json"
+allowed_routes = [
+  "sessions/[wallet]/new.json",
+  "sessions/[wallet]/sessions/[session]/create.json",
+  "sessions/[wallet]/sessions/[session]/buy.json",
+  "sessions/[wallet]/sessions/[session]/sell.json",
+  "sessions/[wallet]/sessions/[session]/collect_fees.json",
+  "sessions/[wallet]/sessions/[session]/sharing_config.json",
+]
+operation_classes = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]

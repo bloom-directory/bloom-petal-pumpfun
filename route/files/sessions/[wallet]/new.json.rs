@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::signing_write_spec("pumpfun.create").caps(&["bloom:store","bloom:key.derive"]),read:|_:&petal::Ctx|petal::read_json_value(&crate::json!({"description":"create a scoped Pump.fun Solana session"})),write:|c:&petal::Ctx,b:&[u8]|{if let Err(e)=crate::body(b){return e}match crate::wallet(c){Ok(w)=>crate::new_session(c,w,b),Err(e)=>e}});
