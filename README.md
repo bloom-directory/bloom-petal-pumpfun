@@ -14,10 +14,15 @@ approval, broadcast, confirmation, failure, and finalization status. A failed
 pre-broadcast simulation can be retried with the same request and operation ID;
 the Petal rebuilds it with a fresh blockhash and requires a fresh approval.
 
-Pump's builder is treated as untrusted input: only Solana v0 transactions with
+Pump's builder and the public RPC are treated as untrusted input: only Solana v0 transactions with
 the session key as fee payer, the requested mint, valid signer-slot shape, and
 an allowlist of official Pump, PumpSwap, Pump Fees, Agent Payments, SPL Token,
 Associated Token, System, and Compute Budget programs are eligible to sign.
+Address lookup tables are resolved independently through Solana RPC before
+their accounts are checked. Swap requests include a caller-selected
+`minOutputAmount`; the on-chain instruction must preserve at least that many
+raw output units. Bloom also applies a local base and priority fee floor and
+requires an explicit successful simulation result before broadcast.
 
 Optional request fields follow Pump's official agent API: `mayhemMode`,
 `cashback`, `tokenizedAgent`, `buybackBps`, `slippagePct`,
@@ -31,15 +36,29 @@ status.json
 coins/<mint>.json
 sessions/<wallet>/new.json
 sessions/<wallet>/sessions/<session>/session.json
-sessions/<wallet>/sessions/<session>/{create,buy,sell,collect_fees,sharing_config}.json
+sessions/<wallet>/sessions/<session>/{create,buy,sell,collect_fees,sharing_config,close_token_account,sweep}.json
 sessions/<wallet>/sessions/<session>/operations/<operationId>.json
 sessions/<wallet>/sessions/<session>/stop
 ```
 
 Create a session by writing `{"id":"agent-1","duration_ms":3600000}` to
 `new.json`, then fund the `address` exposed by its `session.json`. Create bodies
-require `name`, `symbol`, `uri`, and a positive decimal-string `solLamports`.
-Buy and sell bodies require `mint` and a positive decimal-string `amount`.
-Fee collection requires `mint`; sharing changes also require 1–10 distinct
+require `name`, `symbol`, `uri`, positive decimal-string `solLamports`, and a
+positive decimal-string `minOutputAmount`. Buy and sell bodies require `mint`,
+a positive decimal-string `amount`, and `minOutputAmount` in raw output units.
+Fee collection requires `mint` plus `feeKind` set to `cashback`, `creator`, or
+`sharing_distribution`; sharing changes also require 1–10 distinct
 `shareholders` whose integer `bps` values total 10,000. Every action body also
 requires `operationId`.
+
+Before stopping a session, sell any remaining token balance. Then write
+`{"operationId":"close-1","mint":"<mint>","tokenAccount":"<session token account>","destination":"<owner Solana address>","maxLamports":"2100000"}`
+to `close_token_account.json`. The Petal independently verifies through two
+RPCs that the account belongs to the session, holds the requested mint, has no
+conflicting close authority, contains zero tokens, and holds no more than the
+declared `maxLamports`. It then builds one exact SPL Token `CloseAccount`
+instruction to return that native balance. Finally write
+`{"operationId":"return-1","destination":"<owner Solana address>"}` to
+`sweep.json`. The Petal builds one exact System transfer for the full native
+SOL balance minus the quoted fee. Sweep while the session scope is still
+active; expired signing scopes cannot recover assets.

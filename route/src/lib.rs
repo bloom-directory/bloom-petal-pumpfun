@@ -13,25 +13,34 @@ const MAX: usize = 131072;
 const MAX_TX: usize = 1232;
 const MAX_SESSION_MS: u64 = 86_400_000;
 const MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000_000;
+const ATA_RENT_ALLOWANCE_LAMPORTS: u64 = 2_100_000;
+const CREATE_RENT_ALLOWANCE_LAMPORTS: u64 = 20_000_000;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const RPC: &str = "https://rpc.solanatracker.io/public";
+const RPC_VERIFY: &str = "https://api.mainnet-beta.solana.com";
 const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";
 const SOL: &str = "So11111111111111111111111111111111111111112";
-const ROUTES: [&str; 6] = [
+#[cfg(not(test))]
+const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e1111111111111111111111111";
+const ROUTES: [&str; 8] = [
     "ROUTE_CREATE",
     "ROUTE_BUY",
     "ROUTE_SELL",
     "ROUTE_FEES",
     "ROUTE_SHARING",
+    "ROUTE_CLOSE_TOKEN_ACCOUNT",
+    "ROUTE_SWEEP",
     "ROUTE_NEW",
 ];
-const CLASSES: [&str; 5] = [
+const CLASSES: [&str; 7] = [
     "pumpfun.create",
     "pumpfun.buy",
     "pumpfun.sell",
     "pumpfun.collect_fees",
     "pumpfun.sharing_config",
+    "pumpfun.close_token_account",
+    "pumpfun.sweep",
 ];
 const PROGRAMS: [&str; 9] = [
     "ComputeBudget111111111111111111111111111111",
@@ -315,6 +324,8 @@ pub enum Action {
     Sell,
     Fees,
     Sharing,
+    CloseTokenAccount,
+    Sweep,
 }
 impl Action {
     fn class(self) -> &'static str {
@@ -324,6 +335,8 @@ impl Action {
             Self::Sell => CLASSES[2],
             Self::Fees => CLASSES[3],
             Self::Sharing => CLASSES[4],
+            Self::CloseTokenAccount => CLASSES[5],
+            Self::Sweep => CLASSES[6],
         }
     }
     fn path(self) -> &'static str {
@@ -332,6 +345,7 @@ impl Action {
             Self::Buy | Self::Sell => "/agents/swap",
             Self::Fees => "/agents/collect-fees",
             Self::Sharing => "/agents/sharing-config",
+            Self::CloseTokenAccount | Self::Sweep => "",
         }
     }
 }
@@ -370,18 +384,27 @@ fn build_pending(
     request: &Map<String, Value>,
     digest: String,
 ) -> Result<Pending, DispatchResponse> {
+    match a {
+        Action::CloseTokenAccount => {
+            return build_close_token_account_pending(user, request, digest);
+        }
+        Action::Sweep => return build_sweep_pending(user, request, digest),
+        _ => {}
+    }
+    let mut builder_request = request.clone();
+    builder_request.remove("minOutputAmount");
+    builder_request.remove("feeKind");
     let response = post(
         &format!("{BUILD}{}", a.path()),
-        &Value::Object(request.clone()),
+        &Value::Object(builder_request),
     )?;
     let tx = response
         .get("transaction")
         .and_then(Value::as_str)
         .ok_or_else(|| fail("builder omitted transaction"))?
         .to_owned();
-    validate_tx(&tx, user, a, request, &response)
-        .map_err(|error| fail(format!("unsafe builder transaction: {error}")))?;
-    let network_fee_lamports = transaction_fee(&tx)?;
+    validate_tx(&tx, user, a, request, &response)?;
+    let network_fee_lamports = transaction_fee(&tx, request)?;
     let mut api = response;
     api.as_object_mut()
         .ok_or_else(|| fail("builder response must be an object"))?
@@ -394,6 +417,268 @@ fn build_pending(
             .get("frontRunningProtection")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        network_fee_lamports,
+        status: "built".into(),
+        signature: None,
+        approval: None,
+    })
+}
+
+fn sweep_message(
+    user: &str,
+    destination: &str,
+    blockhash: &str,
+    lamports: u64,
+) -> Result<Vec<u8>, DispatchResponse> {
+    let payer = pk(user).map_err(bad)?;
+    let destination = pk(destination).map_err(bad)?;
+    let system = pk(PROGRAMS[1]).map_err(fail)?;
+    let blockhash = pk(blockhash).map_err(|_| fail("Solana RPC returned an invalid blockhash"))?;
+    let mut message = vec![0x80, 1, 0, 1, 3];
+    message.extend_from_slice(&payer);
+    message.extend_from_slice(&destination);
+    message.extend_from_slice(&system);
+    message.extend_from_slice(&blockhash);
+    message.extend_from_slice(&[1, 2, 2, 0, 1, 12]);
+    message.extend_from_slice(&2u32.to_le_bytes());
+    message.extend_from_slice(&lamports.to_le_bytes());
+    message.push(0);
+    Ok(message)
+}
+
+#[derive(Debug, PartialEq)]
+struct TokenAccountFact {
+    token_program: String,
+    mint: String,
+    owner: String,
+    amount: String,
+    lamports: u64,
+    close_authority: Option<String>,
+}
+
+fn token_account_fact(
+    rpc_url: &str,
+    token_account: &str,
+) -> Result<TokenAccountFact, DispatchResponse> {
+    let value = post(
+        rpc_url,
+        &rpc(
+            "getAccountInfo",
+            json!([token_account, {"encoding":"jsonParsed","commitment":"finalized"}]),
+        ),
+    )?;
+    let account = value
+        .pointer("/result/value")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| deny("token account does not exist at finalized commitment"))?;
+    let field = |pointer: &str, label: &str| {
+        account
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| fail(format!("Solana RPC omitted token account {label}")))
+    };
+    let token_program = field("/owner", "program owner")?;
+    let parsed_program = field("/data/program", "parsed program")?;
+    let expected_parsed_program = if token_program == PROGRAMS[3] {
+        "spl-token"
+    } else if token_program == PROGRAMS[4] {
+        "spl-token-2022"
+    } else {
+        return Err(deny("account is not owned by an allowed SPL Token program"));
+    };
+    if parsed_program != expected_parsed_program
+        || account.pointer("/data/parsed/type").and_then(Value::as_str) != Some("account")
+    {
+        return Err(fail(
+            "Solana RPC returned invalid parsed token account data",
+        ));
+    }
+    Ok(TokenAccountFact {
+        token_program,
+        mint: field("/data/parsed/info/mint", "mint")?,
+        owner: field("/data/parsed/info/owner", "authority")?,
+        amount: field("/data/parsed/info/tokenAmount/amount", "balance")?,
+        lamports: account
+            .get("lamports")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| fail("Solana RPC omitted token account lamports"))?,
+        close_authority: account
+            .pointer("/data/parsed/info/closeAuthority")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn close_token_account_message(
+    user: &str,
+    token_account: &str,
+    destination: &str,
+    token_program: &str,
+    blockhash: &str,
+) -> Result<Vec<u8>, DispatchResponse> {
+    let keys = [user, token_account, destination, token_program]
+        .map(pk)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(bad)?;
+    let blockhash = pk(blockhash).map_err(|_| fail("Solana RPC returned an invalid blockhash"))?;
+    let mut message = vec![0x80, 1, 0, 1, 4];
+    for key in keys {
+        message.extend_from_slice(&key);
+    }
+    message.extend_from_slice(&blockhash);
+    message.extend_from_slice(&[1, 3, 3, 1, 2, 0, 1, 9, 0]);
+    Ok(message)
+}
+
+fn quote_message_fee(message: &[u8]) -> Result<u64, DispatchResponse> {
+    let response = post(
+        RPC,
+        &rpc(
+            "getFeeForMessage",
+            json!([B64.encode(message), {"commitment":"processed"}]),
+        ),
+    )?;
+    response
+        .pointer("/result/value")
+        .and_then(Value::as_u64)
+        .map(|quoted| quoted.max(5_000))
+        .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))
+}
+
+fn build_sweep_pending(
+    user: &str,
+    request: &Map<String, Value>,
+    digest: String,
+) -> Result<Pending, DispatchResponse> {
+    let destination = request
+        .get("destination")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("destination required"))?;
+    let balance = post(
+        RPC,
+        &rpc("getBalance", json!([user, {"commitment":"processed"}])),
+    )?
+    .pointer("/result/value")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| fail("Solana RPC omitted the session balance"))?;
+    let latest = post(
+        RPC,
+        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+    )?;
+    let blockhash = latest
+        .pointer("/result/value/blockhash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("Solana RPC omitted the latest blockhash"))?;
+    let last_valid_block_height = latest
+        .pointer("/result/value/lastValidBlockHeight")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| fail("Solana RPC omitted lastValidBlockHeight"))?;
+    let network_fee_lamports = quote_message_fee(&sweep_message(user, destination, blockhash, 1)?)?;
+    let lamports = balance
+        .checked_sub(network_fee_lamports)
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| deny("session balance does not cover the sweep fee"))?;
+    let message = sweep_message(user, destination, blockhash, lamports)?;
+    let mut transaction = vec![1];
+    transaction.extend_from_slice(&[0; 64]);
+    transaction.extend_from_slice(&message);
+    let tx = B64.encode(transaction);
+    validate_sweep_tx(&tx, user, destination, lamports)?;
+    Ok(Pending {
+        digest,
+        tx,
+        api: json!({
+            "destination": destination,
+            "balanceLamports": balance.to_string(),
+            "sweepLamports": lamports.to_string(),
+            "lastValidBlockHeight": last_valid_block_height,
+        }),
+        front: false,
+        network_fee_lamports,
+        status: "built".into(),
+        signature: None,
+        approval: None,
+    })
+}
+
+fn build_close_token_account_pending(
+    user: &str,
+    request: &Map<String, Value>,
+    digest: String,
+) -> Result<Pending, DispatchResponse> {
+    let token_account = request
+        .get("tokenAccount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("tokenAccount required"))?;
+    let destination = request
+        .get("destination")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("destination required"))?;
+    let mint = request
+        .get("mint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("mint required"))?;
+    let maximum_lamports = request
+        .get("maxLamports")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| bad("maxLamports required"))?;
+    let fact = token_account_fact(RPC, token_account)?;
+    if fact != token_account_fact(RPC_VERIFY, token_account)? {
+        return Err(fail("independent RPCs disagree on the token account"));
+    }
+    if fact.owner != user
+        || fact
+            .close_authority
+            .as_deref()
+            .is_some_and(|authority| authority != user)
+        || fact.mint != mint
+        || fact.amount != "0"
+        || fact.lamports > maximum_lamports
+    {
+        return Err(deny(
+            "token account must be session-closeable, match the requested mint, be empty, and stay within maxLamports",
+        ));
+    }
+    let latest = post(
+        RPC,
+        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+    )?;
+    let blockhash = latest
+        .pointer("/result/value/blockhash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("Solana RPC omitted the latest blockhash"))?;
+    let last_valid_block_height = latest
+        .pointer("/result/value/lastValidBlockHeight")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| fail("Solana RPC omitted lastValidBlockHeight"))?;
+    let message = close_token_account_message(
+        user,
+        token_account,
+        destination,
+        &fact.token_program,
+        blockhash,
+    )?;
+    let network_fee_lamports = quote_message_fee(&message)?;
+    let mut transaction = vec![1];
+    transaction.extend_from_slice(&[0; 64]);
+    transaction.extend_from_slice(&message);
+    let tx = B64.encode(transaction);
+    validate_close_token_account_tx(&tx, user, token_account, destination, &fact.token_program)?;
+    Ok(Pending {
+        digest,
+        tx,
+        api: json!({
+            "mint": mint,
+            "tokenAccount": token_account,
+            "destination": destination,
+            "tokenProgram": fact.token_program,
+            "accountLamports": fact.lamports.to_string(),
+            "lastValidBlockHeight": last_valid_block_height,
+        }),
+        front: false,
         network_fee_lamports,
         status: "built".into(),
         signature: None,
@@ -503,7 +788,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())),"claim_assurance":{"kind":"machine_asserted"}});
+    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
@@ -622,6 +907,7 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "symbol",
             "uri",
             "solLamports",
+            "minOutputAmount",
             "mayhemMode",
             "cashback",
             "tokenizedAgent",
@@ -632,11 +918,12 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         Action::Buy | Action::Sell => &[
             "mint",
             "amount",
+            "minOutputAmount",
             "slippagePct",
             "frontRunningProtection",
             "tipAmount",
         ][..],
-        Action::Fees => &["mint", "frontRunningProtection", "tipAmount"][..],
+        Action::Fees => &["mint", "feeKind", "frontRunningProtection", "tipAmount"][..],
         Action::Sharing => &[
             "mint",
             "shareholders",
@@ -644,6 +931,8 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "frontRunningProtection",
             "tipAmount",
         ][..],
+        Action::CloseTokenAccount => &["mint", "tokenAccount", "destination", "maxLamports"][..],
+        Action::Sweep => &["destination"][..],
     };
     if let Some(field) = r.keys().find(|field| !allowed.contains(&field.as_str())) {
         return Err(bad(format!("unsupported field {field}")));
@@ -672,6 +961,7 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             text(r, "symbol", 1, 16)?;
             text(r, "uri", 1, 512)?;
             number(r, "solLamports", 1)?;
+            number(r, "minOutputAmount", 1)?;
             let mayhem = optional_bool(r, "mayhemMode")?.unwrap_or(false);
             let cashback = optional_bool(r, "cashback")?.unwrap_or(false);
             let tokenized = optional_bool(r, "tokenizedAgent")?.unwrap_or(false);
@@ -695,6 +985,7 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             let mint = text(r, "mint", 32, 64)?;
             pk(&mint).map_err(bad)?;
             let amount = number(r, "amount", 1)?;
+            number(r, "minOutputAmount", 1)?;
             let slip = r.get("slippagePct").and_then(Value::as_f64).unwrap_or(2.0);
             if !slip.is_finite() || !(0.0..=50.0).contains(&slip) {
                 return Err(bad("slippagePct must be 0..=50"));
@@ -717,6 +1008,14 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         }
         Action::Fees => {
             pk(&text(r, "mint", 32, 64)?).map_err(bad)?;
+            if !matches!(
+                r.get("feeKind").and_then(Value::as_str),
+                Some("cashback" | "creator" | "sharing_distribution")
+            ) {
+                return Err(bad(
+                    "feeKind must be cashback, creator, or sharing_distribution",
+                ));
+            }
         }
         Action::Sharing => {
             pk(&text(r, "mint", 32, 64)?).map_err(bad)?;
@@ -759,6 +1058,34 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             }
             if total != 10000 {
                 return Err(bad("shareholder bps must total 10000"));
+            }
+        }
+        Action::CloseTokenAccount => {
+            let mint = text(r, "mint", 32, 64)?;
+            let token_account = text(r, "tokenAccount", 32, 64)?;
+            let destination = text(r, "destination", 32, 64)?;
+            number(r, "maxLamports", 1)?;
+            pk(&mint).map_err(bad)?;
+            pk(&token_account).map_err(bad)?;
+            pk(&destination).map_err(bad)?;
+            if destination == user {
+                return Err(bad(
+                    "close destination must differ from the session address",
+                ));
+            }
+            if token_account == user || token_account == destination {
+                return Err(bad(
+                    "tokenAccount must differ from the signer and destination",
+                ));
+            }
+        }
+        Action::Sweep => {
+            let destination = text(r, "destination", 32, 64)?;
+            pk(&destination).map_err(bad)?;
+            if destination == user {
+                return Err(bad(
+                    "sweep destination must differ from the session address",
+                ));
             }
         }
     }
@@ -814,6 +1141,22 @@ fn number(r: &Map<String, Value>, n: &str, min: u64) -> Result<String, DispatchR
 }
 fn effects(a: Action, r: &Map<String, Value>, message: &Msg) -> Result<Vec<Value>, String> {
     let tip = tip_lamports(r).map_err(|_| "invalid normalized tipAmount")?;
+    let associated = pk(PROGRAMS[2])?;
+    let ata_count = message
+        .instructions
+        .iter()
+        .filter(|ix| message.keys.get(ix.program) == Some(&associated))
+        .count() as u64;
+    let account_rent = ata_count
+        .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
+        .and_then(|rent| {
+            rent.checked_add(if matches!(a, Action::Create) {
+                CREATE_RENT_ALLOWANCE_LAMPORTS
+            } else {
+                0
+            })
+        })
+        .ok_or("account rent allowance exceeds u64")?;
     let mut effects = match a {
         Action::Create | Action::Buy => {
             let trade = message
@@ -822,7 +1165,10 @@ fn effects(a: Action, r: &Map<String, Value>, message: &Msg) -> Result<Vec<Value
                 .find(|ix| has_discriminator(ix, IX_BUY))
                 .ok_or_else(|| "approved buy instruction missing".to_owned())
                 .and_then(|ix| instruction_u64(ix, 16))?;
-            let total = trade.checked_add(tip).ok_or("native debit exceeds u64")?;
+            let total = trade
+                .checked_add(tip)
+                .and_then(|value| value.checked_add(account_rent))
+                .ok_or("native debit exceeds u64")?;
             vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":total.to_string()})]
         }
         Action::Sell => vec![json!({
@@ -830,17 +1176,39 @@ fn effects(a: Action, r: &Map<String, Value>, message: &Msg) -> Result<Vec<Value
             "amount":r.get("amount").and_then(Value::as_str).ok_or("sell amount missing")?
         })],
         Action::Fees | Action::Sharing => vec![],
+        Action::CloseTokenAccount => vec![json!({
+            "asset":{"chain":"solana","asset":"native"},
+            "amount":r.get("maxLamports").and_then(Value::as_str).ok_or("close maxLamports missing")?
+        })],
+        Action::Sweep => {
+            let transfer = message
+                .instructions
+                .first()
+                .ok_or_else(|| "sweep transfer missing".to_owned())
+                .and_then(|ix| instruction_u64(ix, 4))?;
+            vec![json!({
+                "asset":{"chain":"solana","asset":"native"},
+                "amount":transfer.to_string()
+            })]
+        }
     };
-    if tip > 0 && !matches!(a, Action::Create | Action::Buy) {
+    let auxiliary_native = tip
+        .checked_add(account_rent)
+        .ok_or("native debit exceeds u64")?;
+    if auxiliary_native > 0 && !matches!(a, Action::Create | Action::Buy) {
         effects.push(json!({
             "asset":{"chain":"solana","asset":"native"},
-            "amount":tip.to_string()
+            "amount":auxiliary_native.to_string()
         }));
     }
     Ok(effects)
 }
-fn destinations(message: &Msg) -> Vec<Value> {
+fn destinations(action: Action, message: &Msg) -> Vec<Value> {
     let system = pk(PROGRAMS[1]).ok();
+    let token_programs = PROGRAMS[3..=4]
+        .iter()
+        .filter_map(|program| pk(program).ok())
+        .collect::<Vec<_>>();
     let tips = JITO_TIPS
         .iter()
         .filter_map(|tip| pk(tip).ok())
@@ -859,7 +1227,13 @@ fn destinations(message: &Msg) -> Vec<Value> {
         }
         if Some(program) == system.as_ref()
             && let Ok(destination) = account(message, ix, 1)
-            && tips.contains(destination)
+            && (tips.contains(destination) || matches!(action, Action::Sweep))
+        {
+            values.insert(bs58::encode(destination).into_string());
+        }
+        if matches!(action, Action::CloseTokenAccount)
+            && token_programs.contains(program)
+            && let Ok(destination) = account(message, ix, 1)
         {
             values.insert(bs58::encode(destination).into_string());
         }
@@ -981,11 +1355,16 @@ pub fn list_operations(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchRespon
 fn rpc(m: &str, p: Value) -> Value {
     json!({"jsonrpc":"2.0","id":"bloom-pumpfun","method":m,"params":p})
 }
-fn transaction_fee(transaction: &str) -> Result<u64, DispatchResponse> {
+fn transaction_fee(
+    transaction: &str,
+    request: &Map<String, Value>,
+) -> Result<u64, DispatchResponse> {
     let raw = B64
         .decode(transaction)
         .map_err(|_| fail("builder transaction is not base64"))?;
     let env = envelope(&raw).map_err(fail)?;
+    let message = message(env.message).map_err(fail)?;
+    let local_floor = local_fee_floor(&message, request).map_err(fail)?;
     let response = post(
         RPC,
         &rpc(
@@ -993,10 +1372,11 @@ fn transaction_fee(transaction: &str) -> Result<u64, DispatchResponse> {
             json!([B64.encode(env.message), {"commitment":"processed"}]),
         ),
     )?;
-    response
+    let quoted = response
         .pointer("/result/value")
         .and_then(Value::as_u64)
-        .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))
+        .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
+    Ok(quoted.max(local_floor))
 }
 fn simulate(tx: &str) -> Result<(), DispatchResponse> {
     let v = post(
@@ -1006,10 +1386,13 @@ fn simulate(tx: &str) -> Result<(), DispatchResponse> {
             json!([tx,{"encoding":"base64","sigVerify":true,"commitment":"processed"}]),
         ),
     )?;
-    if v.pointer("/result/value/err").is_none_or(Value::is_null) {
-        Ok(())
-    } else {
-        Err(fail(format!("simulation failed: {}", safe(&v))))
+    simulation_result(&v).map_err(fail)
+}
+fn simulation_result(v: &Value) -> Result<(), String> {
+    match v.pointer("/result/value/err") {
+        Some(Value::Null) => Ok(()),
+        Some(_) => Err(format!("simulation failed: {}", safe(v))),
+        None => Err("Solana RPC omitted the simulation result".into()),
     }
 }
 struct Env<'a> {
@@ -1022,6 +1405,12 @@ struct Msg {
     instructions: Vec<Ix>,
     blockhash: [u8; 32],
     required: usize,
+    lookups: Vec<Lookup>,
+}
+struct Lookup {
+    table: [u8; 32],
+    writable: Vec<u8>,
+    readonly: Vec<u8>,
 }
 struct Ix {
     program: usize,
@@ -1118,15 +1507,25 @@ fn message(b: &[u8]) -> Result<Msg, String> {
         });
     }
     let nl = short(b, &mut o)?;
+    let mut lookups = Vec::with_capacity(nl);
     for _ in 0..nl {
+        let table = b
+            .get(o..o + 32)
+            .ok_or("truncated lookup table key")?
+            .try_into()
+            .map_err(|_| "invalid lookup table key")?;
         o += 32;
         let w = short(b, &mut o)?;
+        let writable = b.get(o..o + w).ok_or("truncated writable lookup")?.to_vec();
         o += w;
         let r = short(b, &mut o)?;
+        let readonly = b.get(o..o + r).ok_or("truncated readonly lookup")?.to_vec();
         o += r;
-        if o > b.len() {
-            return Err("truncated lookup".into());
-        }
+        lookups.push(Lookup {
+            table,
+            writable,
+            readonly,
+        });
     }
     if o != b.len() {
         return Err("trailing message bytes".into());
@@ -1136,6 +1535,7 @@ fn message(b: &[u8]) -> Result<Msg, String> {
         instructions,
         blockhash,
         required,
+        lookups,
     })
 }
 const IX_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
@@ -1176,25 +1576,232 @@ fn require_account(
         Err(format!("{label} account mismatch"))
     }
 }
+
+fn validate_sweep_tx(
+    transaction: &str,
+    user: &str,
+    destination: &str,
+    lamports: u64,
+) -> Result<(), DispatchResponse> {
+    let raw = B64
+        .decode(transaction)
+        .map_err(|_| fail("invalid sweep base64"))?;
+    let env = envelope(&raw).map_err(fail)?;
+    let message = message(env.message).map_err(fail)?;
+    let expected_keys = [
+        pk(user).map_err(bad)?,
+        pk(destination).map_err(bad)?,
+        pk(PROGRAMS[1]).map_err(fail)?,
+    ];
+    if message.required != 1
+        || !message.lookups.is_empty()
+        || message.keys != expected_keys
+        || message.instructions.len() != 1
+    {
+        return Err(fail("sweep transaction has an unexpected message shape"));
+    }
+    let ix = &message.instructions[0];
+    let mut expected_data = 2u32.to_le_bytes().to_vec();
+    expected_data.extend_from_slice(&lamports.to_le_bytes());
+    if ix.program != 2 || ix.accounts != [0, 1] || ix.data != expected_data {
+        return Err(fail(
+            "sweep transaction is not the exact requested System transfer",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_close_token_account_tx(
+    transaction: &str,
+    user: &str,
+    token_account: &str,
+    destination: &str,
+    token_program: &str,
+) -> Result<(), DispatchResponse> {
+    let raw = B64
+        .decode(transaction)
+        .map_err(|_| fail("invalid close-account base64"))?;
+    let env = envelope(&raw).map_err(fail)?;
+    let message = message(env.message).map_err(fail)?;
+    let expected_keys = [user, token_account, destination, token_program]
+        .map(pk)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(bad)?;
+    if message.required != 1
+        || !message.lookups.is_empty()
+        || message.keys != expected_keys
+        || message.instructions.len() != 1
+    {
+        return Err(fail(
+            "close-account transaction has an unexpected message shape",
+        ));
+    }
+    let ix = &message.instructions[0];
+    if ix.program != 3 || ix.accounts != [1, 2, 0] || ix.data != [9] {
+        return Err(fail(
+            "transaction is not the exact requested SPL Token CloseAccount",
+        ));
+    }
+    Ok(())
+}
+
+fn append_lookup_addresses(message: &mut Msg, tables: &Map<String, Value>) -> Result<(), String> {
+    let mut writable = Vec::new();
+    let mut readonly = Vec::new();
+    for lookup in &message.lookups {
+        let table = bs58::encode(lookup.table).into_string();
+        let addresses = tables
+            .get(&table)
+            .ok_or_else(|| format!("lookup table {table} missing"))?;
+        let address_at = |index: u8| -> Result<[u8; 32], String> {
+            let value = match addresses {
+                Value::Array(values) => values.get(index as usize),
+                Value::Object(values) => values.get(&index.to_string()),
+                _ => None,
+            }
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("lookup table {table} address {index} missing"))?;
+            pk(value)
+        };
+        writable.extend(
+            lookup
+                .writable
+                .iter()
+                .map(|index| address_at(*index))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        readonly.extend(
+            lookup
+                .readonly
+                .iter()
+                .map(|index| address_at(*index))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    message.keys.extend(writable);
+    message.keys.extend(readonly);
+    Ok(())
+}
+
+fn hydrate_lookups(message: &mut Msg, _response: &Value) -> Result<(), DispatchResponse> {
+    if message.lookups.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let tables = _response
+        .get("_lookupTableAddresses")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(test_lookup_tables);
+    #[cfg(not(test))]
+    let tables = {
+        let mut tables = Map::new();
+        for lookup in &message.lookups {
+            let table = bs58::encode(lookup.table).into_string();
+            let addresses = fetch_lookup_table(RPC, &table)?;
+            if addresses != fetch_lookup_table(RPC_VERIFY, &table)? {
+                return Err(fail(format!(
+                    "independent RPCs disagree on address lookup table {table}"
+                )));
+            }
+            tables.insert(table, Value::Array(addresses));
+        }
+        tables
+    };
+    append_lookup_addresses(message, &tables)
+        .map_err(|error| fail(format!("unsafe builder transaction: {error}")))
+}
+
+#[cfg(not(test))]
+fn fetch_lookup_table(url: &str, table: &str) -> Result<Vec<Value>, DispatchResponse> {
+    let value = post(
+        url,
+        &rpc(
+            "getAccountInfo",
+            json!([table, {"encoding":"jsonParsed","commitment":"finalized"}]),
+        ),
+    )?;
+    if value.pointer("/result/value/owner").and_then(Value::as_str)
+        != Some(ADDRESS_LOOKUP_TABLE_PROGRAM)
+        || value
+            .pointer("/result/value/data/program")
+            .and_then(Value::as_str)
+            != Some("address-lookup-table")
+        || value
+            .pointer("/result/value/data/parsed/type")
+            .and_then(Value::as_str)
+            != Some("lookupTable")
+    {
+        return Err(fail(format!("invalid address lookup table {table}")));
+    }
+    value
+        .pointer("/result/value/data/parsed/info/addresses")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| fail(format!("address lookup table {table} omitted addresses")))
+}
+
+#[cfg(test)]
+fn test_lookup_tables() -> Map<String, Value> {
+    json!({
+        "Hyif6eWb8x88RVrvjPfabsgRYnwkVnyByEXTVTXbUcyP": {
+            "0":"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "1":"4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+            "3":"Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+            "4":"Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y",
+            "5":"pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+            "6":"GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR",
+            "10":"11111111111111111111111111111111",
+            "11":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "12":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "13":"ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+            "14":"8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+            "15":"pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+            "16":"MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e",
+            "18":"13ec7XdrjF3h3YcqBTFDSReRcUFwbCnJaAQspM4j6DDJ",
+            "19":"BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s",
+            "26":"CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
+            "27":"FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+            "32":"3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+            "36":"A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+            "41":"8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6",
+            "124":"So11111111111111111111111111111111111111112",
+            "151":"D6QxXDt6hhcCpto4HiZKkN2YQ2iZRF5R7S3caCHpUsML",
+            "154":"ALeLWphFxNVNXpXFEC4Ssf2Jan1Wki72Us8tXMMrQuQZ",
+            "155":"HcAR1LpgSGFxeLyb1vkhsCuN6AtxQsww3E2pMMXkwHqx",
+            "158":"TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
+        }
+    })
+    .as_object()
+    .expect("test lookup fixture object")
+    .clone()
+}
+
 fn validate_tx(
     transaction: &str,
     user: &str,
     action: Action,
     request: &Map<String, Value>,
     response: &Value,
-) -> Result<(), String> {
-    let raw = B64.decode(transaction).map_err(|_| "invalid base64")?;
-    let env = envelope(&raw)?;
-    let message = message(env.message)?;
-    let payer = pk(user)?;
+) -> Result<(), DispatchResponse> {
+    let raw = B64
+        .decode(transaction)
+        .map_err(|_| fail("unsafe builder transaction: invalid base64"))?;
+    let env =
+        envelope(&raw).map_err(|error| fail(format!("unsafe builder transaction: {error}")))?;
+    let mut message = message(env.message)
+        .map_err(|error| fail(format!("unsafe builder transaction: {error}")))?;
+    hydrate_lookups(&mut message, response)?;
+    let payer = pk(user).map_err(fail)?;
     if message.keys.first() != Some(&payer) {
-        return Err("payer is not session key".into());
+        return Err(fail("unsafe builder transaction: payer is not session key"));
     }
     let mint_text = if matches!(action, Action::Create) {
         response
             .get("mintPublicKey")
             .and_then(Value::as_str)
-            .ok_or("mint missing")?
+            .ok_or_else(|| fail("unsafe builder transaction: mint missing"))?
     } else {
         request
             .get("mint")
@@ -1209,13 +1816,14 @@ fn validate_tx(
                     .filter(|mint| mint.as_str() != Some(SOL))
             })
             .and_then(Value::as_str)
-            .ok_or("requested mint missing")?
+            .ok_or_else(|| fail("unsafe builder transaction: requested mint missing"))?
     };
-    let mint = pk(mint_text)?;
+    let mint = pk(mint_text).map_err(fail)?;
     if matches!(action, Action::Create) && message.keys.get(1) != Some(&mint) {
-        return Err("mint signer mismatch".into());
+        return Err(fail("unsafe builder transaction: mint signer mismatch"));
     }
     validate_message(&message, &payer, &mint, action, request, response)
+        .map_err(|error| fail(format!("unsafe builder transaction: {error}")))
 }
 fn validate_message(
     message: &Msg,
@@ -1254,7 +1862,7 @@ fn validate_message(
     )?;
     validate_protocol_instructions(message, payer, mint, action, request, response)
 }
-fn validate_compute_budget(message: &Msg, request: &Map<String, Value>) -> Result<(), String> {
+fn validate_compute_budget(message: &Msg, request: &Map<String, Value>) -> Result<u64, String> {
     let compute = pk(PROGRAMS[0])?;
     let dont_front = pk(JITO_DONT_FRONT)?;
     let protected = request
@@ -1303,7 +1911,16 @@ fn validate_compute_budget(message: &Msg, request: &Map<String, Value>) -> Resul
     if priority_fee > u128::from(MAX_PRIORITY_FEE_LAMPORTS) {
         return Err("priority fee exceeds 0.005 SOL".into());
     }
-    Ok(())
+    u64::try_from(priority_fee).map_err(|_| "priority fee overflows u64".into())
+}
+
+fn local_fee_floor(message: &Msg, request: &Map<String, Value>) -> Result<u64, String> {
+    let base = u64::try_from(message.required)
+        .map_err(|_| "signer count overflows u64")?
+        .checked_mul(5_000)
+        .ok_or("base fee overflows u64")?;
+    base.checked_add(validate_compute_budget(message, request)?)
+        .ok_or_else(|| "transaction fee overflows u64".into())
 }
 fn validate_system_transfers(
     message: &Msg,
@@ -1379,7 +1996,7 @@ fn validate_auxiliary_instructions(
     mint: &[u8; 32],
     action: Action,
     _request: &Map<String, Value>,
-    response: &Value,
+    _response: &Value,
     wrapped_accounts: &[[u8; 32]],
 ) -> Result<(), String> {
     let system = pk(PROGRAMS[1])?;
@@ -1402,33 +2019,23 @@ fn validate_auxiliary_instructions(
             require_account(message, ix, 0, payer, "associated-token payer")?;
             let owner = account(message, ix, 2)?;
             let account_mint = account(message, ix, 3)?;
-            if let Ok(system_program) = account(message, ix, 4)
-                && system_program != &system
-            {
+            if account(message, ix, 4)? != &system {
                 return Err("associated-token System program mismatch".into());
             }
-            if let Ok(token_program) = account(message, ix, 5)
-                && token_program != &token
-                && token_program != &token_2022
-            {
+            let token_program = account(message, ix, 5)?;
+            if token_program != &token && token_program != &token_2022 {
                 return Err("unapproved associated-token program".into());
             }
             let mint_allowed = match action {
                 Action::Create => account_mint == mint,
                 Action::Buy | Action::Sell => account_mint == mint || account_mint == &wrapped_mint,
                 Action::Fees | Action::Sharing => account_mint == &wrapped_mint,
+                Action::CloseTokenAccount | Action::Sweep => false,
             };
             if !mint_allowed {
                 return Err("associated-token mint is unrelated to the request".into());
             }
-            let owner_allowed = owner == payer
-                || matches!(action, Action::Fees | Action::Sharing)
-                    && ["creator", "sharingConfigAddress"]
-                        .iter()
-                        .filter_map(|field| response.get(field).and_then(Value::as_str))
-                        .filter_map(|value| pk(value).ok())
-                        .any(|value| &value == owner);
-            if !owner_allowed {
+            if owner != payer {
                 return Err("associated-token owner is unrelated to the request".into());
             }
             if account_mint == &wrapped_mint && owner == payer {
@@ -1514,6 +2121,7 @@ fn validate_protocol_instructions(
                 let requested = request_u64(request, "solLamports")?;
                 let maximum = u128::from(requested) + (u128::from(requested) * 2).div_ceil(100);
                 validate_buy_cost(ix, maximum)?;
+                validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Create if program == &agent && has_discriminator(ix, IX_AGENT_INITIALIZE) => {
@@ -1526,6 +2134,7 @@ fn validate_protocol_instructions(
                 require_account(message, ix, 2, mint, "buy mint")?;
                 require_account(message, ix, 6, payer, "buy user")?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
+                validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Buy if program == &amm && has_discriminator(ix, IX_BUY) => {
@@ -1533,12 +2142,14 @@ fn validate_protocol_instructions(
                 require_account(message, ix, 3, mint, "AMM buy mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM buy quote mint")?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
+                validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Sell if program == &pump && has_discriminator(ix, IX_SELL) => {
                 require_account(message, ix, 2, mint, "sell mint")?;
                 require_account(message, ix, 6, payer, "sell user")?;
                 validate_sell_amount(ix, request_u64(request, "amount")?)?;
+                validate_minimum_output(ix, 16, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Sell if program == &amm && has_discriminator(ix, IX_SELL) => {
@@ -1546,30 +2157,77 @@ fn validate_protocol_instructions(
                 require_account(message, ix, 3, mint, "AMM sell mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM sell quote mint")?;
                 validate_sell_amount(ix, request_u64(request, "amount")?)?;
-                primary += 1;
-            }
-            Action::Fees if program == &pump && has_discriminator(ix, IX_CLAIM_CASHBACK) => {
-                require_account(message, ix, 0, payer, "cashback user")?;
-                primary += 1;
-            }
-            Action::Fees if program == &pump && has_discriminator(ix, IX_COLLECT_CREATOR_FEE) => {
+                validate_minimum_output(ix, 16, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Fees
-                if program == &pump && has_discriminator(ix, IX_DISTRIBUTE_CREATOR_FEES) =>
+                if program == &pump
+                    && has_discriminator(ix, IX_CLAIM_CASHBACK)
+                    && request.get("feeKind").and_then(Value::as_str) == Some("cashback") =>
+            {
+                require_account(message, ix, 0, payer, "cashback user")?;
+                require_account(message, ix, 2, &pk(PROGRAMS[1])?, "cashback System program")?;
+                require_account(message, ix, 4, &pump, "cashback program")?;
+                primary += 1;
+            }
+            Action::Fees
+                if program == &pump
+                    && has_discriminator(ix, IX_COLLECT_CREATOR_FEE)
+                    && request.get("feeKind").and_then(Value::as_str) == Some("creator") =>
+            {
+                require_account(message, ix, 0, payer, "creator fee recipient")?;
+                require_account(
+                    message,
+                    ix,
+                    2,
+                    &pk(PROGRAMS[1])?,
+                    "creator fee System program",
+                )?;
+                require_account(message, ix, 4, &pump, "creator fee program")?;
+                primary += 1;
+            }
+            Action::Fees
+                if program == &pump
+                    && has_discriminator(ix, IX_DISTRIBUTE_CREATOR_FEES)
+                    && request.get("feeKind").and_then(Value::as_str)
+                        == Some("sharing_distribution") =>
             {
                 require_account(message, ix, 0, mint, "fee-distribution mint")?;
                 primary += 1;
             }
-            Action::Fees if program == &amm && has_discriminator(ix, IX_CLAIM_CASHBACK) => {
+            Action::Fees
+                if program == &amm
+                    && has_discriminator(ix, IX_CLAIM_CASHBACK)
+                    && request.get("feeKind").and_then(Value::as_str) == Some("cashback") =>
+            {
                 require_account(message, ix, 0, payer, "AMM cashback user")?;
                 require_account(message, ix, 2, &wrapped_mint, "AMM cashback quote mint")?;
+                require_account(
+                    message,
+                    ix,
+                    3,
+                    &pk(PROGRAMS[3])?,
+                    "AMM cashback token program",
+                )?;
+                require_account(
+                    message,
+                    ix,
+                    6,
+                    &pk(PROGRAMS[1])?,
+                    "AMM cashback System program",
+                )?;
+                require_account(message, ix, 8, &amm, "AMM cashback program")?;
                 primary += 1;
             }
             Action::Fees
-                if program == &amm && has_discriminator(ix, IX_AMM_COLLECT_CREATOR_FEE) =>
+                if program == &amm
+                    && has_discriminator(ix, IX_AMM_COLLECT_CREATOR_FEE)
+                    && request.get("feeKind").and_then(Value::as_str) == Some("creator") =>
             {
                 require_account(message, ix, 0, &wrapped_mint, "AMM fee quote mint")?;
+                require_account(message, ix, 1, &pk(PROGRAMS[3])?, "AMM fee token program")?;
+                require_account(message, ix, 2, payer, "AMM creator fee recipient")?;
+                require_account(message, ix, 7, &amm, "AMM creator fee program")?;
                 primary += 1;
             }
             Action::Sharing if program == &fees && has_discriminator(ix, IX_CREATE_SHARING) => {
@@ -1669,6 +2327,13 @@ fn validate_sell_amount(ix: &Ix, requested: u64) -> Result<(), String> {
         Ok(())
     } else {
         Err("sell amount differs from request".into())
+    }
+}
+fn validate_minimum_output(ix: &Ix, offset: usize, requested: u64) -> Result<(), String> {
+    if instruction_u64(ix, offset)? >= requested {
+        Ok(())
+    } else {
+        Err("transaction minimum output is below the approved request".into())
     }
 }
 fn take<'a>(data: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8], String> {
@@ -1897,45 +2562,160 @@ mod tests {
         assert_fixture(
             "create",
             Action::Create,
-            json!({"name":"Bloom Fixture","symbol":"BLMF","uri":"https://example.com/pumpfun-fixture.json","solLamports":"1000000"}),
+            json!({"name":"Bloom Fixture","symbol":"BLMF","uri":"https://example.com/pumpfun-fixture.json","solLamports":"1000000","minOutputAmount":"1"}),
         );
         assert_fixture(
             "mayhem",
             Action::Create,
-            json!({"name":"Bloom Mayhem Fixture","symbol":"BLMM","uri":"https://example.com/pumpfun-mayhem-fixture.json","solLamports":"1000000","mayhemMode":true,"frontRunningProtection":true,"tipAmount":0.0001}),
+            json!({"name":"Bloom Mayhem Fixture","symbol":"BLMM","uri":"https://example.com/pumpfun-mayhem-fixture.json","solLamports":"1000000","minOutputAmount":"1","mayhemMode":true,"frontRunningProtection":true,"tipAmount":0.0001}),
         );
         assert_fixture(
             "agent",
             Action::Create,
-            json!({"name":"Bloom Agent Fixture","symbol":"BLMA","uri":"https://example.com/pumpfun-agent-fixture.json","solLamports":"1000000","tokenizedAgent":true,"buybackBps":5000}),
+            json!({"name":"Bloom Agent Fixture","symbol":"BLMA","uri":"https://example.com/pumpfun-agent-fixture.json","solLamports":"1000000","minOutputAmount":"1","tokenizedAgent":true,"buybackBps":5000}),
         );
         assert_fixture(
             "buy_bond",
             Action::Buy,
-            json!({"mint":BOND_MINT,"amount":"1000000","slippagePct":2}),
-        );
-        assert_fixture(
-            "sell_bond",
-            Action::Sell,
-            json!({"mint":BOND_MINT,"amount":"1","slippagePct":2}),
+            json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         assert_fixture(
             "buy_amm",
             Action::Buy,
-            json!({"mint":AMM_MINT,"amount":"1000000","slippagePct":2}),
+            json!({"mint":AMM_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         assert_fixture(
-            "sell_amm",
-            Action::Sell,
-            json!({"mint":AMM_MINT,"amount":"1","slippagePct":2}),
+            "fees",
+            Action::Fees,
+            json!({"mint":BOND_MINT,"feeKind":"cashback"}),
         );
-        assert_fixture("fees", Action::Fees, json!({"mint":BOND_MINT}));
         assert_fixture_for(
             "sharing",
             Action::Sharing,
             AMM_CREATOR,
             json!({"mint":AMM_MINT,"shareholders":[{"address":AMM_CREATOR,"bps":10000}]}),
         );
+    }
+    #[test]
+    fn zero_output_sell_quotes_are_rejected() {
+        for (fixture_name, mint) in [("sell_bond", BOND_MINT), ("sell_amm", AMM_MINT)] {
+            let response = fixture(fixture_name);
+            let transaction = response
+                .get("transaction")
+                .and_then(Value::as_str)
+                .expect("fixture transaction");
+            let request = normalized(
+                Action::Sell,
+                json!({"mint":mint,"amount":"1","minOutputAmount":"1","slippagePct":2}),
+            );
+            assert!(validate_tx(transaction, USER, Action::Sell, &request, &response).is_err());
+        }
+    }
+    #[test]
+    fn fee_collection_requires_an_explicit_bound_kind() {
+        let mut request = json!({"mint":BOND_MINT}).as_object().unwrap().clone();
+        assert!(normalize(Action::Fees, USER, &mut request).is_err());
+    }
+    #[test]
+    fn simulation_requires_an_explicit_result() {
+        assert!(simulation_result(&json!({"result":{"value":{"err":null}}})).is_ok());
+        assert!(simulation_result(&json!({"result":{"value":{"err":{"code":1}}}})).is_err());
+        assert!(simulation_result(&json!({"result":{"value":{}}})).is_err());
+        assert!(simulation_result(&json!({})).is_err());
+    }
+    #[test]
+    fn sweep_is_one_exact_system_transfer_and_declares_its_destination() {
+        let message_bytes = sweep_message(USER, AMM_CREATOR, BOND_MINT, 123_456).unwrap();
+        let mut transaction = vec![1];
+        transaction.extend_from_slice(&[0; 64]);
+        transaction.extend_from_slice(&message_bytes);
+        let encoded = B64.encode(transaction);
+        validate_sweep_tx(&encoded, USER, AMM_CREATOR, 123_456).unwrap();
+
+        let parsed = message(&message_bytes).unwrap();
+        let request = normalized(Action::Sweep, json!({"destination":AMM_CREATOR}));
+        assert_eq!(
+            effects(Action::Sweep, &request, &parsed).unwrap(),
+            vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":"123456"})]
+        );
+        assert_eq!(
+            destinations(Action::Sweep, &parsed),
+            vec![json!({"chain":"solana","destination":AMM_CREATOR})]
+        );
+        assert!(validate_sweep_tx(&encoded, USER, AMM_CREATOR, 123_455).is_err());
+        assert!(
+            normalize(
+                Action::Sweep,
+                USER,
+                &mut json!({"destination":USER}).as_object().unwrap().clone()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn close_token_account_is_one_exact_instruction_and_declares_its_destination() {
+        let token_account = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
+        let message_bytes =
+            close_token_account_message(USER, token_account, AMM_CREATOR, PROGRAMS[3], BOND_MINT)
+                .unwrap();
+        let mut transaction = vec![1];
+        transaction.extend_from_slice(&[0; 64]);
+        transaction.extend_from_slice(&message_bytes);
+        let encoded = B64.encode(transaction);
+        validate_close_token_account_tx(&encoded, USER, token_account, AMM_CREATOR, PROGRAMS[3])
+            .unwrap();
+
+        let parsed = message(&message_bytes).unwrap();
+        let request = normalized(
+            Action::CloseTokenAccount,
+            json!({"mint":BOND_MINT,"tokenAccount":token_account,"destination":AMM_CREATOR,"maxLamports":"2100000"}),
+        );
+        assert_eq!(
+            effects(Action::CloseTokenAccount, &request, &parsed).unwrap(),
+            vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":"2100000"})]
+        );
+        assert_eq!(
+            destinations(Action::CloseTokenAccount, &parsed),
+            vec![json!({"chain":"solana","destination":AMM_CREATOR})]
+        );
+
+        let mut tampered = B64.decode(encoded).unwrap();
+        *tampered.last_mut().unwrap() = 8;
+        assert!(
+            validate_close_token_account_tx(
+                &B64.encode(tampered),
+                USER,
+                token_account,
+                AMM_CREATOR,
+                PROGRAMS[3]
+            )
+            .is_err()
+        );
+        assert!(
+            normalize(
+                Action::CloseTokenAccount,
+                USER,
+                &mut json!({"mint":BOND_MINT,"tokenAccount":token_account,"destination":USER,"maxLamports":"2100000"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn local_fee_floor_includes_base_and_priority_fees() {
+        let response = fixture("buy_bond");
+        let raw = B64
+            .decode(response.get("transaction").and_then(Value::as_str).unwrap())
+            .unwrap();
+        let env = envelope(&raw).unwrap();
+        let parsed = message(env.message).unwrap();
+        let request = normalized(
+            Action::Buy,
+            json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
+        );
+        assert!(local_fee_floor(&parsed, &request).unwrap() > 5_000);
     }
     fn parsed_buy_fixture() -> (Msg, Map<String, Value>, Value) {
         let response = fixture("buy_bond");
@@ -1951,7 +2731,7 @@ mod tests {
         let message = message(env.message).expect("versioned message");
         let request = normalized(
             Action::Buy,
-            json!({"mint":BOND_MINT,"amount":"1000000","slippagePct":2}),
+            json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         (message, request, response)
     }

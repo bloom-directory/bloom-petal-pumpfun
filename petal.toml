@@ -34,13 +34,19 @@ methods = ["post"]
 paths = ["/public"]
 
 [[net.allow]]
+binding = "solana-verify"
+host = "api.mainnet-beta.solana.com"
+methods = ["post"]
+paths = ["/"]
+
+[[net.allow]]
 binding = "jito"
 host = "mainnet.block-engine.jito.wtf"
 methods = ["post"]
 paths = ["/api/v1/transactions"]
 
 [sign]
-allowed_intents = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config"]
+allowed_intents = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config", "pumpfun.close_token_account", "pumpfun.sweep"]
 
 [[key.derive]]
 route = "sessions/[wallet]/new.json"
@@ -51,8 +57,10 @@ allowed_routes = [
   "sessions/[wallet]/sessions/[session]/sell.json",
   "sessions/[wallet]/sessions/[session]/collect_fees.json",
   "sessions/[wallet]/sessions/[session]/sharing_config.json",
+  "sessions/[wallet]/sessions/[session]/close_token_account.json",
+  "sessions/[wallet]/sessions/[session]/sweep.json",
 ]
-operation_classes = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config"]
+operation_classes = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config", "pumpfun.close_token_account", "pumpfun.sweep"]
 allowed_crypto_suites = ["ed25519-message"]
 maximum_lifetime_ms = 86400000
 
