@@ -1,1 +1,1 @@
-petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[]));
+petal::route_file!(spec:petal::store_dir_spec().caps(&["bloom:store"]),ctx_list:|c:&petal::Ctx|crate::list_operations(c));

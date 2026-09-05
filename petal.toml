@@ -53,6 +53,8 @@ allowed_routes = [
   "sessions/[wallet]/sessions/[session]/sharing_config.json",
 ]
 operation_classes = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config"]
+allowed_crypto_suites = ["ed25519-message"]
+maximum_lifetime_ms = 86400000
 
 [store]
 namespaces = ["state"]

@@ -68,7 +68,7 @@ while IFS= read -r route_file; do
     echo "route architecture check: writable route needs a local read handler: $route_file" >&2
     failed=1
   fi
-done < <(search_files 'petal::write_spec' route/files)
+done < <(search_files 'petal::(signing_)?write_spec' route/files)
 
 if [[ "$failed" -ne 0 ]]; then
   exit 1
