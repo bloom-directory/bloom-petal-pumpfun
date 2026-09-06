@@ -13,6 +13,8 @@ broadcast attempt. Read `operations/<operationId>.json` for durable build,
 approval, broadcast, confirmation, failure, and finalization status. A failed
 pre-broadcast simulation can be retried with the same request and operation ID;
 the Petal rebuilds it with a fresh blockhash and requires a fresh approval.
+Operation projections publish the SHA-256 of the staged Solana message so a
+canary-capable Machine can bind its one-shot authorization to the exact bytes.
 
 Pump's builder and the public RPC are treated as untrusted input: only Solana v0 transactions with
 the session key as fee payer, the requested mint, valid signer-slot shape, and

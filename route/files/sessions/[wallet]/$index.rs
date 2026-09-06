@@ -1,1 +1,1 @@
-petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("new.json",false,true),("sessions",true,false)]));
+petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("new.json",false,true),("preflight.json",false,true),("sessions",true,false)]));

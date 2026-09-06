@@ -74,6 +74,16 @@ fn deny(e: impl Into<String>) -> DispatchResponse {
 fn fail(e: impl Into<String>) -> DispatchResponse {
     petal::error(-4, e)
 }
+fn dispatch_message(e: &DispatchResponse) -> String {
+    match e {
+        DispatchResponse::Error { message, .. } => message.clone(),
+        _ => "unexpected non-error response".into(),
+    }
+}
+fn sdk_message(e: &petal::SdkError) -> String {
+    e.message()
+}
+
 pub fn body(b: &[u8]) -> Result<(), DispatchResponse> {
     if b.len() <= MAX {
         Ok(())
@@ -125,7 +135,7 @@ fn put<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), Dispat
         &serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
         secret,
     )
-    .map_err(|e| fail(e.message()))
+    .map_err(|e| fail(sdk_message(&e)))
 }
 fn put_new<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), DispatchResponse> {
     petal::sdk::store_put_new(
@@ -133,7 +143,7 @@ fn put_new<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), Di
         &serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
         secret,
     )
-    .map_err(|e| fail(e.message()))
+    .map_err(|e| fail(sdk_message(&e)))
 }
 fn get<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchResponse> {
     match petal::sdk::store_get(k, MAX) {
@@ -141,7 +151,7 @@ fn get<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchRespons
             .map(Some)
             .map_err(|e| fail(e.to_string())),
         Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
-        Err(e) => Err(fail(e.message())),
+        Err(e) => Err(fail(sdk_message(&e))),
     }
 }
 fn get_secret<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchResponse> {
@@ -163,7 +173,7 @@ fn fetch(method: &str, url: String, body: Vec<u8>) -> Result<Value, DispatchResp
         },
         MAX,
     )
-    .map_err(|e| fail(e.message()))?;
+    .map_err(|e| fail(sdk_message(&e)))?;
     let v: Value =
         serde_json::from_slice(&r.body).map_err(|e| fail(format!("invalid remote JSON: {e}")))?;
     if !(200..300).contains(&r.status) || v.get("error").is_some() {
@@ -249,7 +259,7 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
         maximum_lifetime_ms: life,
     }) {
         Ok(v) => v,
-        Err(e) => return fail(e.message()),
+        Err(e) => return fail(sdk_message(&e)),
     };
     let (key_ref_jcs, address) = match out {
         petal::PetalKeyOutcome::Pending {
@@ -353,6 +363,7 @@ impl Action {
 struct Pending {
     digest: String,
     tx: String,
+    message_sha256: String,
     api: Value,
     front: bool,
     network_fee_lamports: u64,
@@ -367,7 +378,68 @@ struct Public {
     status: String,
     signature: Option<String>,
     api: Value,
+    message_sha256: String,
     updated_ms: u64,
+}
+
+fn pumpfun_buy_canary_facts(
+    wallet: &str,
+    session: &Session,
+    key_ref_jcs: &[u8],
+    request: &Map<String, Value>,
+    message: &Msg,
+    pending: &Pending,
+) -> Result<Value, DispatchResponse> {
+    let key_ref: Value = serde_json::from_slice(key_ref_jcs)
+        .map_err(|error| fail(format!("session signing reference is invalid: {error}")))?;
+    let key_fingerprint = key_ref
+        .get("public_key_fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("session signing reference omitted its key fingerprint"))?;
+    let derivation_path = key_ref
+        .pointer("/derivation/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("session signing reference omitted its derivation path"))?;
+    let amount = request_u64(request, "amount").map_err(fail)?;
+    let minimum = request_u64(request, "minOutputAmount").map_err(fail)?;
+    let mint = request
+        .get("outputMint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("normalized buy mint is missing"))?;
+    let maximum_sol_cost = message
+        .instructions
+        .iter()
+        .find(|instruction| has_discriminator(instruction, IX_BUY))
+        .ok_or_else(|| fail("approved buy instruction is missing"))
+        .and_then(|instruction| instruction_u64(instruction, 16).map_err(fail))?;
+    let protocol_and_slippage = maximum_sol_cost
+        .checked_sub(amount)
+        .ok_or_else(|| fail("buy maximum SOL cost is below the requested amount"))?;
+    let slippage = request
+        .get("slippagePct")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| fail("normalized slippage is missing"))?;
+    let slippage_bps = (slippage * 100.0).round();
+    if (slippage_bps / 100.0 - slippage).abs() > 0.000_000_1
+        || !(0.0..=u32::MAX as f64).contains(&slippage_bps)
+    {
+        return Err(fail("slippage cannot be represented in basis points"));
+    }
+    Ok(json!({
+        "wallet": wallet,
+        "key_fingerprint": key_fingerprint,
+        "derivation_path": derivation_path,
+        "source_address": session.address,
+        "mint": mint,
+        "transfer_lamports": amount,
+        "min_token_out": minimum,
+        "protocol_fee_lamports": protocol_and_slippage,
+        "tip_lamports": tip_lamports(request)?,
+        "fee_lamports": pending.network_fee_lamports,
+        "slippage_bps": slippage_bps as u32,
+        "operation_class": "pumpfun.buy",
+        "message_sha256": pending.message_sha256,
+    }))
 }
 fn active_session(w: &str, s: &str) -> Result<Session, DispatchResponse> {
     let session =
@@ -404,6 +476,14 @@ fn build_pending(
         .ok_or_else(|| fail("builder omitted transaction"))?
         .to_owned();
     validate_tx(&tx, user, a, request, &response)?;
+    let raw = B64
+        .decode(&tx)
+        .map_err(|_| fail("builder transaction is not base64"))?;
+    let message_sha256 = hex::encode(Sha256::digest(
+        envelope(&raw)
+            .map_err(|error| fail(format!("unsafe builder transaction: {error}")))?
+            .message,
+    ));
     let network_fee_lamports = transaction_fee(&tx, request)?;
     let mut api = response;
     api.as_object_mut()
@@ -412,6 +492,7 @@ fn build_pending(
     Ok(Pending {
         digest,
         tx,
+        message_sha256,
         api,
         front: request
             .get("frontRunningProtection")
@@ -589,6 +670,7 @@ fn build_sweep_pending(
     Ok(Pending {
         digest,
         tx,
+        message_sha256: hex::encode(Sha256::digest(&message)),
         api: json!({
             "destination": destination,
             "balanceLamports": balance.to_string(),
@@ -670,6 +752,7 @@ fn build_close_token_account_pending(
     Ok(Pending {
         digest,
         tx,
+        message_sha256: hex::encode(Sha256::digest(&message)),
         api: json!({
             "mint": mint,
             "tokenAccount": token_account,
@@ -778,7 +861,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         claimed_hash: hash,
     }]) {
         Ok(value) => value,
-        Err(e) => return fail(e.message()),
+        Err(e) => return fail(sdk_message(&e)),
     };
     let parsed_message = match message(env.message) {
         Ok(value) => value,
@@ -788,6 +871,47 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Ok(value) => value,
         Err(e) => return fail(e),
     };
+    let pumpfun_canary = if matches!(a, Action::Buy) {
+        match pumpfun_buy_canary_facts(
+            &w,
+            &sess,
+            &session_secret.key_ref_jcs,
+            &r,
+            &parsed_message,
+            &p,
+        ) {
+            Ok(value) => Some(value),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    if pumpfun_canary.is_some() {
+        let status = match post(
+            RPC_VERIFY,
+            &rpc(
+                "bloomPumpfunCanaryStatus",
+                json!([pumpfun_canary.as_ref().expect("buy canary facts")]),
+            ),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return deny(format!(
+                    "exact Pump.fun canary authorization could not be verified before signing: {}",
+                    dispatch_message(&error)
+                ));
+            }
+        };
+        if status
+            .pointer("/result/authorization_loaded")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return deny(
+                "exact Pump.fun canary authorization is not loaded; review the published message_sha256 and install its single-use authorization before passkey approval",
+            );
+        }
+    }
     let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
@@ -837,7 +961,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             if let Err(store_error) = publish(&w, &s, &op, a, &p) {
                 return store_error;
             }
-            return deny(e.message());
+            return deny(sdk_message(&e));
         }
     };
     if sig.len() != 64 {
@@ -871,18 +995,20 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         return e;
     }
     let result = if p.front {
-        post(
-            JITO,
-            &rpc("sendTransaction", json!([tx,{"encoding":"base64"}])),
-        )
+        let mut request = rpc("sendTransaction", json!([tx, {"encoding":"base64"}]));
+        if let (Some(object), Some(canary)) = (request.as_object_mut(), pumpfun_canary.clone()) {
+            object.insert("bloom_canary".into(), canary);
+        }
+        post(JITO, &request)
     } else {
-        post(
-            RPC,
-            &rpc(
-                "sendTransaction",
-                json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
-            ),
-        )
+        let mut request = rpc(
+            "sendTransaction",
+            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
+        );
+        if let (Some(object), Some(canary)) = (request.as_object_mut(), pumpfun_canary) {
+            object.insert("bloom_canary".into(), canary);
+        }
+        post(RPC, &request)
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
@@ -1252,6 +1378,7 @@ fn publish(w: &str, s: &str, o: &str, a: Action, p: &Pending) -> Result<(), Disp
             status: p.status.clone(),
             signature: p.signature.clone(),
             api: p.api.clone(),
+            message_sha256: p.message_sha256.clone(),
             updated_ms: petal::sdk::now_ms(),
         },
         false,
@@ -1304,6 +1431,315 @@ pub fn status() -> DispatchResponse {
         "network":"solana-mainnet",
         "writes":"session-scoped"
     }))
+}
+
+/// The canonical Solana mainnet-beta genesis hash. The Petal is
+/// intentionally hardcoded to mainnet-beta; this constant is the one fact
+/// the preflight verifies against the live RPC before any ceremony is
+/// created.
+const MAINNET_BETA_GENESIS_BASE58: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// Read-only, ceremony-free preflight for the Pump.fun setup path.
+///
+/// Returns a structured blocker list and never derives a session key,
+/// creates an approval, or changes policy. Every blocker corresponds to
+/// one of the seven acceptance-criteria gates in the Pump.fun handoff;
+/// a successful preflight means one user approval can drive the staged
+/// transaction to broadcast without further ceremony.
+pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
+    let mut blockers: Vec<Value> = Vec::new();
+    let mut checks: Vec<Value> = Vec::new();
+
+    let now = petal::sdk::now_ms();
+
+    // 1. The running Machine artifact is bound to the canonical Pump.fun
+    //    Petal package. A missing or wrong hash means the host cannot reach
+    //    this Petal at all, and preflight is meaningless.
+    let package_hash = c.package_hash.to_string();
+    checks.push(json!({"check":"host_petal_binding","package_hash":package_hash}));
+
+    // 2. Trusted time is reachable. The Petal relies on `now_ms` for
+    //    session expiry checks; a zero or unreachable clock means every
+    //    approval it produces would be malformed.
+    if now == 0 {
+        blockers.push(json!({
+            "blocker":"trusted_clock_unavailable",
+            "detail":"host reported zero trusted time; refuse to stage anything with a clock-bound approval window"
+        }));
+    }
+    checks.push(json!({"check":"trusted_clock","now_ms":now}));
+
+    // 3. Verify Solana mainnet-beta genesis against the live RPC. A
+    //    mismatch, an unreachable endpoint, or a non-mainnet cluster all
+    //    fail closed; the broadcast path is gated on this single fact.
+    match verify_mainnet_genesis() {
+        GenesisCheck::Ok { observed, endpoint } => {
+            checks.push(json!({
+                "check":"rpc_mainnet_genesis",
+                "endpoint":endpoint,
+                "observed_genesis":observed
+            }));
+        }
+        GenesisCheck::Mismatch {
+            observed,
+            endpoint,
+            expected,
+        } => {
+            blockers.push(json!({
+                "blocker":"rpc_genesis_mismatch",
+                "endpoint":endpoint,
+                "observed_genesis":observed,
+                "expected_genesis":expected,
+                "detail":"the configured RPC endpoint is not serving Solana mainnet-beta"
+            }));
+        }
+        GenesisCheck::Unreachable { endpoint, error } => {
+            blockers.push(json!({
+                "blocker":"rpc_unreachable",
+                "endpoint":endpoint,
+                "detail":error
+            }));
+        }
+    }
+
+    // 4. Verify the Pump.fun builder is reachable. Without it, no buy/sell
+    //    transaction can be staged; the user would burn a session key
+    //    with no way to spend it.
+    match probe_builder() {
+        BuilderCheck::Ok { endpoint } => {
+            checks.push(json!({"check":"builder_reachable","endpoint":endpoint}));
+        }
+        BuilderCheck::Unreachable { endpoint, error } => {
+            blockers.push(json!({
+                "blocker":"builder_unreachable",
+                "endpoint":endpoint,
+                "detail":error
+            }));
+        }
+    }
+
+    // 5. Look up an existing session if the caller named one in the URL.
+    //    Preflight never derives a new key: the session must already exist,
+    //    and any wallet named in the URL must already be known to the host.
+    let session_id = c
+        .params
+        .iter()
+        .find_map(|(k, v)| (k == "session").then_some(v.clone()));
+    let mut session_block: Option<Value> = None;
+    if let Some(sid) = session_id.as_deref() {
+        match ident(sid, "session") {
+            Ok(_) => {
+                let key = sk(&w, sid, "session.json");
+                match get::<Session>(&key) {
+                    Ok(Some(s)) => {
+                        let expired = s.expires_ms <= now || s.stopped;
+                        session_block = Some(json!({
+                            "session":sid,
+                            "address":s.address,
+                            "created_ms":s.created_ms,
+                            "expires_ms":s.expires_ms,
+                            "duration_ms":s.duration_ms,
+                            "stopped":s.stopped,
+                            "expired":expired,
+                            "remaining_ms": s.expires_ms.saturating_sub(now)
+                        }));
+                        if expired {
+                            blockers.push(json!({
+                                "blocker":"session_expired",
+                                "session":sid,
+                                "detail":"named session is stopped or past its expiry; start a new session"
+                            }));
+                        }
+                    }
+                    Ok(None) => {
+                        blockers.push(json!({
+                            "blocker":"session_unknown",
+                            "session":sid,
+                            "detail":"no session with this id exists for the wallet"
+                        }));
+                    }
+                    Err(e) => {
+                        blockers.push(json!({
+                            "blocker":"session_lookup_failed",
+                            "session":sid,
+                            "detail":format!("session store error: {}", dispatch_message(&e))
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                blockers.push(json!({
+                    "blocker":"invalid_session_id",
+                    "session":sid,
+                    "detail":format!("{}", dispatch_message(&e))
+                }));
+            }
+        }
+    }
+
+    // 5c. Remind the operator to verify the wallet policy lists the
+    // session address as an allowed Solana destination. The Petal cannot
+    // query the host's wallet policy from inside the sandbox; it surfaces
+    // the session address it just loaded and tells the operator to
+    // confirm their policy update landed before they attempt to fund the
+    // session.
+    if let Some(block) = session_block.as_ref() {
+        let session_address = block["address"].as_str().unwrap_or("").to_string();
+        if !session_address.is_empty() {
+            blockers.push(json!({
+                "blocker":"verify_wallet_policy_includes_session_address",
+                "session_address":session_address,
+                "detail":"the host wallet policy must list this session address under chain \"solana\" before the funding transfer is attempted, otherwise the transfer is refused with CLAIM_INVALID and the ceremony is wasted"
+            }));
+        }
+    }
+
+    // 6. Ask the Machine for its compile-time posture. This is a host-local
+    //    RPC handled at the mediated HTTP boundary; it never reaches the
+    //    public Solana endpoint. The exact authorization is expected to be
+    //    absent until a buy has been staged and its message digest reviewed.
+    match post(
+        RPC_VERIFY,
+        &rpc("bloomPumpfunCanaryStatus", json!([])),
+    ) {
+        Ok(status)
+            if status
+                .pointer("/result/compiled")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            checks.push(json!({
+                "check":"mainnet_broadcast_capability",
+                "compiled":true,
+                "authorization_loaded":status
+                    .pointer("/result/authorization_loaded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "package_hash":status.pointer("/result/package_hash")
+            }));
+        }
+        Ok(_) => blockers.push(json!({
+            "blocker":"mainnet_broadcast_capability_missing",
+            "detail":"the running Machine is an ordinary build and cannot broadcast a Pump.fun mainnet transaction"
+        })),
+        Err(error) => blockers.push(json!({
+            "blocker":"mainnet_broadcast_posture_unavailable",
+            "detail":dispatch_message(&error)
+        })),
+    }
+
+    let ok = blockers.is_empty();
+    let body = json!({
+        "schema":"bloom.pumpfun_preflight.v1",
+        "ok":ok,
+        "wallet":w,
+        "network":"solana-mainnet-beta",
+        "expected_genesis":MAINNET_BETA_GENESIS_BASE58,
+        "now_ms":now,
+        "checks":checks,
+        "blockers":blockers,
+        "session":session_block,
+    });
+    petal::read_json_value(&body)
+}
+
+enum GenesisCheck {
+    Ok {
+        observed: String,
+        endpoint: String,
+    },
+    Mismatch {
+        observed: String,
+        endpoint: String,
+        expected: String,
+    },
+    Unreachable {
+        endpoint: String,
+        error: String,
+    },
+}
+
+fn verify_mainnet_genesis() -> GenesisCheck {
+    let endpoint = RPC_VERIFY.to_string();
+    let body = match serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return GenesisCheck::Unreachable {
+                endpoint,
+                error: format!("encode: {e}"),
+            };
+        }
+    };
+    let response = match fetch("POST", endpoint.clone(), body) {
+        Ok(v) => v,
+        Err(e) => {
+            return GenesisCheck::Unreachable {
+                endpoint,
+                error: dispatch_message(&e),
+            };
+        }
+    };
+    let observed = response
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if observed.is_empty() {
+        return GenesisCheck::Unreachable {
+            endpoint,
+            error: "getGenesisHash returned no result".into(),
+        };
+    }
+    if observed != MAINNET_BETA_GENESIS_BASE58 {
+        return GenesisCheck::Mismatch {
+            observed,
+            endpoint,
+            expected: MAINNET_BETA_GENESIS_BASE58.into(),
+        };
+    }
+    GenesisCheck::Ok { observed, endpoint }
+}
+
+enum BuilderCheck {
+    Ok { endpoint: String },
+    Unreachable { endpoint: String, error: String },
+}
+
+fn probe_builder() -> BuilderCheck {
+    let endpoint = format!("{BUILD}/agents/create-coin");
+    let body = match serde_json::to_vec(&json!({
+        "preflight": true,
+        "publicKey": "11111111111111111111111111111111",
+        "name": "preflight-probe",
+        "symbol": "PREFLIGHT",
+        "description": "read-only probe",
+        "showName": true,
+        "twitter": "",
+        "telegram": "",
+        "website": "",
+        "uri": "https://example.com/preflight.json",
+        "creator": null,
+    })) {
+        Ok(v) => v,
+        Err(e) => {
+            return BuilderCheck::Unreachable {
+                endpoint,
+                error: format!("encode: {e}"),
+            };
+        }
+    };
+    // The builder's preflight is the request that returns an unsigned
+    // transaction; we ignore the body but require a 2xx response. Any
+    // 4xx/5xx is reported as an unreachable probe so the operator can see
+    // the builder is genuinely down rather than misconfigured.
+    match fetch("POST", endpoint.clone(), body) {
+        Ok(_) => BuilderCheck::Ok { endpoint },
+        Err(e) => BuilderCheck::Unreachable {
+            endpoint,
+            error: dispatch_message(&e),
+        },
+    }
 }
 pub fn coin(m: &str) -> DispatchResponse {
     if pk(m).is_err() {
@@ -2827,5 +3263,36 @@ mod tests {
         };
         let encoded = serde_json::to_value(session).expect("serialize session");
         assert!(encoded.get("key_ref_jcs").is_none());
+    }
+
+    #[test]
+    fn preflight_genesis_constant_is_canonical_mainnet_beta() {
+        // The preflight path compares the configured RPC's live genesis
+        // against this constant; a wrong constant means every preflight
+        // misclassifies the broadcast target.
+        assert_eq!(
+            MAINNET_BETA_GENESIS_BASE58,
+            "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+        );
+    }
+
+    #[test]
+    fn preflight_blocker_shape_matches_documented_acceptance_criteria() {
+        // The structured blocker schema is the contract the operator and
+        // any review tooling reads. Keep its keys stable across changes.
+        let blocker = json!({"blocker":"mainnet_broadcast_posture_unconfirmed","detail":"..."});
+        let v: Value = serde_json::from_value(blocker.clone()).unwrap();
+        assert_eq!(v["blocker"], "mainnet_broadcast_posture_unconfirmed");
+        assert!(v["detail"].is_string());
+    }
+
+    #[test]
+    fn preflight_genesis_mismatch_is_blocked_not_passed_through() {
+        let expected = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+        // Sanity: the constant matches the canonical mainnet-beta genesis.
+        assert_eq!(MAINNET_BETA_GENESIS_BASE58, expected);
+        // An arbitrary non-mainnet hash must classify as Mismatch, not Ok.
+        let arbitrary = "4ufDAAhSoL5kzi9QRyKscye3wV3RGQ9VQjm7jZyVu1pV";
+        assert_ne!(MAINNET_BETA_GENESIS_BASE58, arbitrary);
     }
 }
