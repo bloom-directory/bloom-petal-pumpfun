@@ -12,9 +12,12 @@ secret namespace, simulates before sending, and never retries after recording a
 broadcast attempt. Read `operations/<operationId>.json` for durable build,
 approval, broadcast, confirmation, failure, and finalization status. A failed
 pre-broadcast simulation can be retried with the same request and operation ID;
-the Petal rebuilds it with a fresh blockhash and requires a fresh approval.
-Operation projections publish the SHA-256 of the staged Solana message so a
-canary-capable Machine can bind its one-shot authorization to the exact bytes.
+the Petal rebuilds it with a fresh blockhash. After the user approves an action,
+Bloom may reuse that one-shot approval only when the independently parsed
+transaction template is unchanged and the recent blockhash is the sole changed
+message field. Any other change is rejected. Operation projections publish the
+request-intent digest, exact message digest, and blockhash-normalized message
+template digest for a canary-capable Machine to verify independently.
 
 Pump's builder and the public RPC are treated as untrusted input: only Solana v0 transactions with
 the session key as fee payer, the requested mint, valid signer-slot shape, and
@@ -42,6 +45,29 @@ sessions/<wallet>/sessions/<session>/{create,buy,sell,collect_fees,sharing_confi
 sessions/<wallet>/sessions/<session>/operations/<operationId>.json
 sessions/<wallet>/sessions/<session>/stop
 ```
+
+## Build and test
+
+The route components target WASI Preview 2. Build them with the repository
+script, then run the architecture and Rust tests:
+
+```sh
+./scripts/build.sh
+./scripts/check-route-architecture.sh
+cargo test
+```
+
+Install a reviewed package archive into a running Bloom instance:
+
+```sh
+bloom petals install ./bloom-petal-pumpfun.petal.tar
+```
+
+Pump.fun writes target Solana mainnet. Keep the Petal package, wallet policy,
+session key, transaction caps, and Bloom's mainnet-canary authorization bound to
+the exact reviewed release before funding a session.
+
+## Session workflow
 
 Create a session by writing `{"id":"agent-1","duration_ms":3600000}` to
 `new.json`, then fund the `address` exposed by its `session.json`. Create bodies
