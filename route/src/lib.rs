@@ -388,6 +388,7 @@ fn pumpfun_buy_canary_facts(
     key_ref_jcs: &[u8],
     request: &Map<String, Value>,
     message: &Msg,
+    message_bytes: &[u8],
     pending: &Pending,
 ) -> Result<Value, DispatchResponse> {
     let key_ref: Value = serde_json::from_slice(key_ref_jcs)
@@ -439,7 +440,33 @@ fn pumpfun_buy_canary_facts(
         "slippage_bps": slippage_bps as u32,
         "operation_class": "pumpfun.buy",
         "message_sha256": pending.message_sha256,
+        "intent_sha256": pending.digest,
+        "message_template_sha256": message_template_sha256(message_bytes).map_err(fail)?,
     }))
+}
+
+fn message_template_sha256(message: &[u8]) -> Result<String, String> {
+    let mut normalized = message.to_vec();
+    let mut offset = usize::from(normalized.first() == Some(&128));
+    offset = offset.checked_add(3).ok_or("message header overflow")?;
+    if offset > normalized.len() {
+        return Err("message header missing".into());
+    }
+    let key_count = short(&normalized, &mut offset)?;
+    offset = offset
+        .checked_add(key_count.checked_mul(32).ok_or("message key overflow")?)
+        .ok_or("message key overflow")?;
+    let blockhash = normalized
+        .get_mut(offset..offset + 32)
+        .ok_or("message blockhash missing")?;
+    blockhash.fill(0);
+    Ok(hex::encode(Sha256::digest(
+        [
+            b"bloom-solana-message-template/v1\0".as_slice(),
+            &normalized,
+        ]
+        .concat(),
+    )))
 }
 fn active_session(w: &str, s: &str) -> Result<Session, DispatchResponse> {
     let session =
@@ -839,6 +866,21 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
     ) {
         return DispatchResponse::Write;
     }
+    if p.status == "approval_pending" && p.approval.is_some() {
+        let approval = p.approval.clone();
+        p = match build_pending(a, &sess.address, &r, p.digest.clone()) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        p.status = "approval_pending".into();
+        p.approval = approval;
+        if let Err(error) = put(&key, &p, true) {
+            return error;
+        }
+        if let Err(error) = publish(&w, &s, &op, a, &p) {
+            return error;
+        }
+    }
     let raw = match B64.decode(&p.tx) {
         Ok(v) => v,
         Err(_) => return fail("stored transaction invalid"),
@@ -878,6 +920,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             &session_secret.key_ref_jcs,
             &r,
             &parsed_message,
+            env.message,
             &p,
         ) {
             Ok(value) => Some(value),
@@ -2966,6 +3009,25 @@ pub fn static_list(e: &[(&str, bool, bool)]) -> Vec<petal::RouteChild> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_template_allows_only_the_recent_blockhash_to_change() {
+        let mut first = vec![0x80, 1, 0, 0, 1];
+        first.extend_from_slice(&[7; 32]);
+        first.extend_from_slice(&[8; 32]);
+        first.extend_from_slice(&[0, 0]);
+        let mut refreshed = first.clone();
+        refreshed[37..69].fill(9);
+        assert_eq!(
+            message_template_sha256(&first).unwrap(),
+            message_template_sha256(&refreshed).unwrap()
+        );
+        refreshed[5] ^= 1;
+        assert_ne!(
+            message_template_sha256(&first).unwrap(),
+            message_template_sha256(&refreshed).unwrap()
+        );
+    }
     const USER: &str = "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7";
     const BOND_MINT: &str = "C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump";
     const AMM_MINT: &str = "H3m3TD2mwmU5zkUTHRDoLU7RdxbWp6BEgoQa3s9wpump";
