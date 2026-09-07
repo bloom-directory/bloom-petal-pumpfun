@@ -1506,8 +1506,12 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     //    transaction can be staged; the user would burn a session key
     //    with no way to spend it.
     match probe_builder() {
-        BuilderCheck::Ok { endpoint } => {
-            checks.push(json!({"check":"builder_reachable","endpoint":endpoint}));
+        BuilderCheck::Ok { endpoint, status } => {
+            checks.push(json!({
+                "check":"builder_reachable",
+                "endpoint":endpoint,
+                "probe_status":status
+            }));
         }
         BuilderCheck::Unreachable { endpoint, error } => {
             blockers.push(json!({
@@ -1702,8 +1706,12 @@ fn verify_mainnet_genesis() -> GenesisCheck {
 }
 
 enum BuilderCheck {
-    Ok { endpoint: String },
+    Ok { endpoint: String, status: u16 },
     Unreachable { endpoint: String, error: String },
+}
+
+fn builder_probe_status_reachable(status: u16) -> bool {
+    (200..300).contains(&status) || status == 400 || status == 422
 }
 
 fn probe_builder() -> BuilderCheck {
@@ -1729,15 +1737,30 @@ fn probe_builder() -> BuilderCheck {
             };
         }
     };
-    // The builder's preflight is the request that returns an unsigned
-    // transaction; we ignore the body but require a 2xx response. Any
-    // 4xx/5xx is reported as an unreachable probe so the operator can see
-    // the builder is genuinely down rather than misconfigured.
-    match fetch("POST", endpoint.clone(), body) {
-        Ok(_) => BuilderCheck::Ok { endpoint },
+    // This deliberately invalid, non-signing request must never create a
+    // coin. A 400/422 validation response proves the exact builder route is
+    // live without asking it to produce a transaction. Authentication,
+    // routing, and server failures remain blockers.
+    match petal::sdk::http_fetch(
+        &HttpRequest {
+            method: "POST".into(),
+            url: endpoint.clone(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body,
+        },
+        MAX,
+    ) {
+        Ok(response) if builder_probe_status_reachable(response.status) => BuilderCheck::Ok {
+            endpoint,
+            status: response.status,
+        },
+        Ok(response) => BuilderCheck::Unreachable {
+            endpoint,
+            error: format!("builder probe returned HTTP {}", response.status),
+        },
         Err(e) => BuilderCheck::Unreachable {
             endpoint,
-            error: dispatch_message(&e),
+            error: sdk_message(&e),
         },
     }
 }
@@ -3284,6 +3307,16 @@ mod tests {
         let v: Value = serde_json::from_value(blocker.clone()).unwrap();
         assert_eq!(v["blocker"], "mainnet_broadcast_posture_unconfirmed");
         assert!(v["detail"].is_string());
+    }
+
+    #[test]
+    fn builder_probe_accepts_only_success_or_validation_responses() {
+        for status in [200, 204, 299, 400, 422] {
+            assert!(builder_probe_status_reachable(status), "{status}");
+        }
+        for status in [300, 401, 403, 404, 429, 500, 503] {
+            assert!(!builder_probe_status_reachable(status), "{status}");
+        }
     }
 
     #[test]
