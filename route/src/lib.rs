@@ -935,15 +935,20 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             ));
         }
         Err(e) => {
-            // A host that answers "denied" or "invalid" decided against this
-            // message, and no signature exists. Every other failure — a
-            // backend fault, a dropped response, an unreadable reply — leaves
-            // it unknown whether the Signer produced one. Those two outcomes
-            // need different retries, so they get different statuses: a
-            // refusal is rebuilt from scratch under a fresh approval, while an
-            // unknown outcome keeps this exact message and approval so a retry
-            // reconciles the same signature instead of authorizing a second
-            // payment for the same intent.
+            // Only two host classes mean the message was decided against and
+            // no signature exists: `denied`, which the host reserves for a
+            // Broker failure whose own error contract says it can never be
+            // retried and left no durable effect, and `invalid`, which the
+            // host raises before the request reaches the Broker at all.
+            //
+            // Everything else — a backend fault, a dropped response, an
+            // unreadable reply — leaves it unknown whether the Signer produced
+            // a signature, so it must not be rebuilt. This is a contract with
+            // the host, not a guess about it: a host that collapsed an
+            // ambiguous Broker outcome into `denied` would license a second
+            // signature for one payment here. `route_to_host_contract` below
+            // pins which classes mean which, and the Machine's own
+            // `petal_signing_host_error` is the other half.
             let refused = matches!(
                 e,
                 SdkError::Host(HostStatus::Denied) | SdkError::Host(HostStatus::Invalid)
@@ -1606,14 +1611,29 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
         }
     }
 
-    // 5d. The scoped signing key's real deadline lives in the Signer grant,
+    // 5d. Funding is not the only destination wallet policy has to allow.
+    // Every write declares the protocol program it routes through, and the
+    // exit declares the return address; Bloom checks each against the wallet's
+    // allowed destinations as a flat set. Listing them here is the difference
+    // between one policy ceremony and discovering the gaps one refused trade
+    // at a time. Tips are omitted: a write declares one only when the caller
+    // sets `frontRunningProtection`.
+    operator_checks.push(json!({
+        "operator_check":"wallet_policy_lists_cycle_destinations",
+        "required_for_trading": PROGRAMS[5..],
+        "required_for_exit":"the owner address named as `destination` by close_token_account and sweep",
+        "conditional":"the selected Jito tip account, only for writes that set frontRunningProtection",
+        "detail":"every destination a write declares is checked against wallet policy, not just the funding address. Which of the two Pump programs a mint routes through depends on whether it has migrated, and the builder chooses — allow both, or read coins/<mint>.json first. Prepare one policy update covering the whole cycle."
+    }));
+
+    // 5e. The scoped signing key's real deadline lives in the Signer grant,
     // not in this Petal. The session record's `expires_ms` is what the Petal
     // asked for when it derived the key, so report it as the Petal's own
-    // deadline and tell the reader where the authoritative one is.
+    // deadline and name where the authoritative one can be read.
     if session_block.is_some() {
         operator_checks.push(json!({
             "operator_check":"signing_scope_deadline_is_host_side",
-            "detail":"the session `expires_ms` below is the lifetime this Petal requested, not the Signer's grant expiry. Read the host's view of the scoped key before funding, and leave enough time to sell, close the token account, and sweep."
+            "detail":"the session `expires_ms` below is the lifetime this Petal requested, not the Signer's grant expiry. Bloom sets the session's reusable approval to expire exactly with the scoped key, so read that approval's expiry, take the earlier of the two, and leave enough time to sell, close the token account, and sweep."
         }));
     }
 
@@ -3749,6 +3769,93 @@ mod tests {
         });
     }
 
+    /// Which host error classes may rebuild a payment, and which may not.
+    ///
+    /// The host collapses a whole Broker error registry into these few
+    /// classes, so this is the entire contract the retry logic above rests on.
+    /// The Machine's `petal_signing_host_error` is the other half: it sends
+    /// `denied` only for a Broker failure that can never be retried and left
+    /// no durable effect, and `backend` for everything less certain —
+    /// `AMBIGUOUS_PROVIDER_EFFECT`, `SERVICE_UNAVAILABLE`,
+    /// `OPERATION_ID_CONFLICT`, rate limits, clock faults. If that mapping
+    /// ever widens `denied`, this test still passes and the Petal starts
+    /// rebuilding payments whose signing outcome is unknown, so the two have
+    /// to be changed together.
+    #[test]
+    fn route_to_host_contract() {
+        for (index, (class, expected)) in [
+            // The Broker decided against this message. Nothing was signed.
+            (HostStatus::Denied, "approval_failed"),
+            // The host refused it before the Broker ever saw it.
+            (HostStatus::Invalid, "approval_failed"),
+            // A fault. The Signer may hold a signature over this message.
+            (HostStatus::Backend, "signing_uncertain"),
+            (HostStatus::NotFound, "signing_uncertain"),
+            (
+                HostStatus::BufferTooSmall { needed: 1 },
+                "signing_uncertain",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let operation = format!("buy-class-{index}");
+            let mut host = host_serving_a_buy();
+            host.sign_outcome(Err(SdkError::Host(class.clone())));
+            fake_host::install(host);
+
+            let response = run_buy(&operation, false);
+            assert!(
+                matches!(response, DispatchResponse::Error { .. }),
+                "{class:?} did not sign: {response:?}"
+            );
+            assert_eq!(
+                public_operation(&operation)["status"],
+                json!(expected),
+                "host class {class:?}"
+            );
+            fake_host::with(|host| {
+                assert!(
+                    host.calls_for("sendTransaction").is_empty(),
+                    "{class:?} must not broadcast"
+                );
+            });
+        }
+    }
+
+    /// The exact case the contract above exists for: a Broker outcome that may
+    /// already have produced a signature reaches the guest as a backend fault,
+    /// and the Petal must keep the message rather than quote a new one.
+    #[test]
+    fn an_ambiguous_broker_outcome_keeps_the_message_and_the_approval() {
+        let mut host = host_serving_a_buy();
+        // What the Machine sends for AMBIGUOUS_PROVIDER_EFFECT.
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        fake_host::install(host);
+
+        let response = run_buy("buy-ambiguous", false);
+        assert!(matches!(response, DispatchResponse::Error { .. }));
+
+        let staged = fake_host::with(|host| {
+            assert_eq!(
+                host.calls
+                    .iter()
+                    .filter(|call| call.url == SWAP_URL)
+                    .count(),
+                1,
+                "an unknown outcome must not ask the builder for a fresh quote"
+            );
+            assert!(host.calls_for("sendTransaction").is_empty());
+            host.secret_json(&sec(WALLET, SESSION, "buy-ambiguous"))
+                .expect("pending operation stored")
+        });
+        assert_eq!(staged["status"], json!("signing_uncertain"));
+        assert_eq!(
+            public_operation("buy-ambiguous")["status"],
+            json!("signing_uncertain")
+        );
+    }
+
     #[test]
     fn a_lost_signing_response_is_recorded_as_uncertain_not_as_a_refusal() {
         let mut host = host_serving_a_buy();
@@ -3988,6 +4095,25 @@ mod tests {
             "the unverifiable wallet-policy fact is an operator check, not a blocker: {names:?}"
         );
         assert!(names.contains(&"signing_scope_deadline_is_host_side"));
+        assert!(
+            names.contains(&"wallet_policy_lists_cycle_destinations"),
+            "the exit and the protocol programs need policy entries too, not just funding: {names:?}"
+        );
+        let destinations = operator_checks
+            .iter()
+            .find(|check| {
+                check["operator_check"] == json!("wallet_policy_lists_cycle_destinations")
+            })
+            .expect("the destination check");
+        for program in &PROGRAMS[5..] {
+            assert!(
+                destinations["required_for_trading"]
+                    .as_array()
+                    .expect("program list")
+                    .contains(&json!(program)),
+                "{program} is declared by a write and must be named"
+            );
+        }
         assert_eq!(
             operator_checks[0]["session_address"],
             json!(USER),

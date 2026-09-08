@@ -29,14 +29,16 @@ A complete setup looks like:
    that one too, and the next retry of step 2 returns `Ready` with the
    session address.
 
-4. Add the session address to the wallet's Solana allowed destinations and
-   complete that policy ceremony. Funding a Petal-controlled derived key is
-   a transfer to a destination the wallet has not approved, and Bloom
-   refuses it until policy names the address. A shared seed does not make
-   this unnecessary: `bloom-broker#40` proposed exempting a wallet's own
-   derived accounts and was closed for that reason. The address cannot be
-   added before step 3, because the derivation index is allocated inside
-   the derive ceremony.
+4. Update the wallet's Solana allowed destinations to cover the whole cycle,
+   and complete that policy ceremony. **The session address alone is not
+   enough**, and getting this wrong is only discovered when a trade is
+   refused. See "What wallet policy has to allow" below for the full list.
+   Prepare one policy diff covering every entry the cycle needs and spend one
+   ceremony on it, rather than discovering them one refusal at a time.
+
+   None of it can be prepared before step 3: the derivation index is
+   allocated inside the derive ceremony, so the session address does not
+   exist until that ceremony has completed.
 
 5. Fund the session address from the owner wallet, and approve that
    transfer. Fund only what the cycle needs — the buy, plus the network and
@@ -48,18 +50,56 @@ A complete setup looks like:
    amount, minOutputAmount, ...}` — stage and run the buy. No further
    ceremony: it signs under the reusable approval from step 3.
 
+## What wallet policy has to allow
+
+Bloom compares every destination a claim declares against
+`allowed_destinations` as a flat set — one membership test per entry, on both
+the native transfer path and the Petal claim path. The Petal declares more
+than the funding address:
+
+| Destination | Declared by | Needed for |
+| --- | --- | --- |
+| the session address | the native funding transfer | funding (step 5) |
+| `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump bonding curve | a buy or sell before the coin migrates |
+| `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
+| `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` | Pump Fees | `collect_fees`, `sharing_config` |
+| `AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7` | Agent Payments | a tokenized-agent `create` |
+| the owner return address | `close_token_account` and `sweep` | the exit |
+| the selected Jito tip account | a protected write | only with `frontRunningProtection` |
+
+Which Pump program a given mint routes through depends on whether it has
+migrated, and the Petal does not choose — the builder does. Allow both, or
+read `coins/<mint>.json` first and allow the one that mint actually uses.
+
+The eight Jito tip accounts the Petal accepts are listed in
+`route/src/lib.rs`. A write only declares the one it selects, and only when
+`frontRunningProtection` is set, so leave them out unless you intend to use
+protected writes.
+
+Read the current policy before assuming any of this is missing:
+
+```sh
+bloom policy read <wallet>
+```
+
 ## What the owner is prompted for
 
-Running one bounded session end to end costs five passkey ceremonies, and
-four of those are setup:
+For a wallet that already allows this Petal package and already allows the
+protocol programs and the return address, one bounded session costs **four**
+passkey ceremonies, and none of them are per trade:
 
-| # | Ceremony | What the owner is deciding |
-| --- | --- | --- |
-| 1 | package eligibility | allow this Petal package version (once per version, not per session) |
-| 2 | `KeyDerive` | mint the session key, with its routes, operation classes and lifetime |
-| 3 | `SealedApproval` | activate the session's reusable approval for that key |
-| 4 | `PolicyUpdate` | allow the wallet to send to the session address |
-| 5 | `SealedApproval` | the funding transfer, for an exact amount |
+| # | Ceremony | What the owner is deciding | When it is skipped |
+| --- | --- | --- | --- |
+| 1 | package eligibility | allow this Petal package version | already allowed, or the same version was used before |
+| 2 | `KeyDerive` | mint the session key, with its routes, operation classes and lifetime | never — one per session |
+| 3 | `SealedApproval` | activate the session's reusable approval for that key | never — one per session key |
+| 4 | `PolicyUpdate` | add the session address, and any protocol or return destination policy still lacks | never — the session address is new every time |
+| 5 | `SealedApproval` | the funding transfer, for an exact amount | never |
+
+So: five on a wallet meeting this Petal for the first time, four for each
+later session of the same package version. The count is a function of the
+wallet's starting policy, not a property of the Petal — check the policy
+before quoting it to anyone.
 
 Buy, sell, `close_token_account` and sweep add none. They all sign under
 the approval from ceremony 3, whose scope is this package's declared routes
@@ -82,11 +122,20 @@ view of the grant: the pinned SDK's `PetalKeyOutcome::Ready` carries no
 expiry, so the Petal cannot read the authoritative one. If a ceremony sat
 waiting for a while, the real scope is older than the recorded deadline.
 
-Treat the recorded deadline as an estimate and check the host's view before
-funding. Sell, close and sweep while the scope is still live. An expired
-scoped key cannot sign, and there is no recovery path that gets assets out
-of a session whose key has expired — so do not fund a session that does not
-have time left for the whole cycle.
+Treat the recorded deadline as an estimate, and read the authoritative one
+before funding. It is not hidden: when Bloom prepares the session's reusable
+approval it sets that approval's `expires_at_ms` to the Signer's scoped-key
+expiry exactly, and refuses to prepare at all if the scope has already
+lapsed. **So the expiry shown on the ceremony in step 3, and on the approval
+afterwards, is the Signer's own deadline** — not the Petal's estimate. Read
+it there, compare it against the Petal's `expires_ms`, and use the earlier of
+the two.
+
+If those two are far apart, the ceremony sat waiting and the session has less
+time than it claims. Sell, close and sweep while the scope is still live. An
+expired scoped key cannot sign, and there is no recovery path that gets
+assets out of a session whose key has expired — so do not fund a session that
+does not have time left for the whole cycle.
 
 ## Approval and retry continuation
 

@@ -16,7 +16,11 @@ that one approval and asks the owner for nothing further. What each individual
 transaction is allowed to do is decided by the checks below, by wallet policy,
 and by the key's own scope, not by a per-transaction approval.
 
-Read `SETUP.md` for what the owner is actually prompted for, and when.
+Wallet policy is a real gate and covers more than the funding address: every
+destination a write declares — the Pump protocol program it routes through,
+the return address for `close_token_account` and `sweep`, a Jito tip when one
+is selected — is checked against the wallet's allowed destinations. `SETUP.md`
+lists all of them, and what the owner is actually prompted for.
 
 ## Operations and retries
 
