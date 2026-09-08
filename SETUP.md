@@ -19,7 +19,7 @@ A complete setup looks like:
    either way — they are not failures, and an empty `blockers` list does
    not mean somebody did them.
 
-2. `POST sessions/<wallet>/new.json {id, duration_ms}` — derive the
+2. `POST sessions/<wallet>/new.json {id, duration_ms, max_lamports, token_limits}` — derive the
    session key. The Petal returns `approval required: {...}` with an
    `operation_id` and `scope_digest`.
 
@@ -36,9 +36,9 @@ A complete setup looks like:
    Prepare one policy diff covering every entry the cycle needs and spend one
    ceremony on it, rather than discovering them one refusal at a time.
 
-   None of it can be prepared before step 3: the derivation index is
-   allocated inside the derive ceremony, so the session address does not
-   exist until that ceremony has completed.
+   The session address is only known after step 3. The protocol and return
+   addresses can be reviewed earlier; combine the missing entries once the
+   session address is available.
 
 5. Fund the session address from the owner wallet, and approve that
    transfer. Fund only what the cycle needs — the buy, plus the network and
@@ -49,6 +49,33 @@ A complete setup looks like:
 6. `POST sessions/<wallet>/sessions/<session>/buy.json {operationId, mint,
    amount, minOutputAmount, ...}` — stage and run the buy. No further
    ceremony: it signs under the reusable approval from step 3.
+
+## Session budgets and installer provenance
+
+`new.json` requires `max_lamports`, a positive decimal string limiting the
+**cumulative declared native value** over the session. This includes network
+fees, buys, rent allowances, close-account returns, and the final sweep.
+It is not a funding amount or a net-loss limit: returning funds also consumes
+this budget. Leave enough budget for the exit before funding the session.
+
+`token_limits` is an optional object mapping mint addresses to positive
+raw-token decimal strings. Include every mint the session may sell, with a
+ceiling covering the total amount it may sell. An omitted mint has no debit
+allowance. Decide these budgets before the two key/approval ceremonies;
+changing them under the same session id is rejected. A different budget
+requires a new session. `session.json` records the requested limits.
+
+These limits enter the separate owner-approved reusable terms through the
+host's `approval_value_limits` key-request field. They do not enlarge the
+key's routes, operation classes, or lifetime. Older Bloom builds without this
+field cannot run budgeted sessions. No SDK or WIT upgrade is needed: the
+pinned SDK exposes `request_key` for canonical JSON requests.
+
+Installer provenance must also declare `{chain:"solana", asset:"native"}`
+as the fee asset for all seven Pump.fun operation classes. A catalog that
+marks them fee-free causes Broker to reject a correct trade claim. Bloom's
+updated developer enrollment supplies these declarations; release enrollment
+must carry the same facts in its signed catalog.
 
 ## What wallet policy has to allow
 
@@ -79,7 +106,7 @@ protected writes.
 Read the current policy before assuming any of this is missing:
 
 ```sh
-bloom policy read <wallet>
+bloom vfs cat /wallets/<wallet>/policy.json
 ```
 
 ## What the owner is prompted for
@@ -139,9 +166,11 @@ authority it activates, so the countdown on the passkey page tells you how long
 you have to finish clicking, and nothing at all about how long the session key
 lives. Reading it as the key deadline understates the session's life by hours.
 
-No VFS route projects the terms expiry today — the projections carry the
-ceremony one. Read it from the Petal key state record on the host, compare it
-against the Petal's `expires_ms`, and use the earlier of the two.
+List `/petal-key-requests` with `bloom vfs ls`, then read the matching JSON
+record with `bloom vfs cat /petal-key-requests/<record>.json`. Match its wallet,
+package and key slot, and use `public_key.petal_scope_expires_at_ms` as the
+key deadline. Compare it with the Petal's `expires_ms` and use the earlier
+one. The sibling `ceremony_expires_at_ms` field is only the browser deadline.
 
 If those two are far apart, the ceremony sat waiting and the session has less
 time than it claims. Sell, close and sweep while the scope is still live. An
@@ -182,13 +211,14 @@ there before spending a ceremony on it:
 
 1. Read the current policy:
    ```sh
-   bloom policy read main
+   bloom vfs cat /wallets/main/policy.json
    ```
 2. If the address is absent, there is nothing to do.
 3. Otherwise prepare an updated policy that omits it, and run
-   `bloom policy update main --file policy.json --assurance user_verified`.
-4. Complete the passkey ceremony; the new policy lands on commit.
-5. Verify with `bloom policy read main` that the address is gone.
+   `bloom wallet update-policy main --file policy.json`.
+4. Complete the passkey ceremony, then run
+   `bloom wallet commit-policy <operation_id>` using the returned operation id.
+5. Verify with `bloom vfs cat /wallets/main/policy.json` that the address is gone.
 
 Fold this into the next policy update the session needs rather than
 spending a ceremony on it alone.

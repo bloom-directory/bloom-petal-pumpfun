@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub use serde_json::json;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX: usize = 131072;
 const MAX_TX: usize = 1232;
@@ -96,8 +96,7 @@ mod fake_host;
 mod host {
     #[cfg(not(test))]
     use petal::{
-        HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest, SdkError,
-        SignOutcome,
+        HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError, SignOutcome,
     };
 
     #[cfg(not(test))]
@@ -125,8 +124,10 @@ mod host {
         petal::sdk::store_list(prefix, max_bytes)
     }
     #[cfg(not(test))]
-    pub fn derive_key(request: &PetalKeyRequest) -> Result<PetalKeyOutcome, SdkError> {
-        petal::sdk::derive_key(request)
+    pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
+        let outcome = petal::sdk::request_key(request_jcs)?;
+        serde_json::from_slice(&outcome)
+            .map_err(|error| SdkError::Message(format!("decode Petal key outcome: {error}")))
     }
     #[cfg(not(test))]
     pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
@@ -272,6 +273,8 @@ pub struct Session {
     id: String,
     pub address: String,
     duration_ms: u64,
+    #[serde(default)]
+    approval_value_limits: Vec<Value>,
     created_ms: u64,
     expires_ms: u64,
     pub stopped: bool,
@@ -286,6 +289,9 @@ struct New {
     id: String,
     #[serde(default)]
     duration_ms: Option<u64>,
+    max_lamports: String,
+    #[serde(default)]
+    token_limits: BTreeMap<String, String>,
 }
 pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
     let r: New = match serde_json::from_slice(b) {
@@ -300,14 +306,38 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
     if !(60_000..=MAX_SESSION_MS).contains(&life) {
         return bad("duration_ms must be between 60000 and 86400000");
     }
+    let mut value_limits = Vec::new();
+    for (asset, amount) in
+        std::iter::once(("native".to_owned(), r.max_lamports)).chain(r.token_limits)
+    {
+        if asset != "native" && pk(&asset).is_err() {
+            return bad("token_limits keys must be Solana mint addresses");
+        }
+        let amount = match amount.parse::<u64>() {
+            Ok(amount) if amount > 0 => amount,
+            _ => return bad("session budgets must be positive decimal strings fitting u64"),
+        };
+        if value_limits
+            .iter()
+            .any(|value: &Value| value["asset"]["asset"] == asset)
+        {
+            return bad("duplicate session budget asset");
+        }
+        value_limits.push(json!({"asset":{"chain":"solana","asset":asset},
+            "lifetime":amount.to_string(),"rolling_windows":[]}));
+    }
     let public_key = sk(&w, &id, "session.json");
     match get::<Session>(&public_key) {
-        Ok(Some(existing)) if existing.duration_ms == life => return DispatchResponse::Write,
-        Ok(Some(_)) => return bad("session id already used with a different duration"),
+        Ok(Some(existing))
+            if existing.duration_ms == life && existing.approval_value_limits == value_limits =>
+        {
+            return DispatchResponse::Write;
+        }
+        Ok(Some(_)) => return bad("session id already used with different duration or budgets"),
         Ok(None) => {}
         Err(e) => return e,
     }
-    let out = match host::derive_key(&petal::PetalKeyRequest {
+    let request = petal::PetalKeyRequest {
         wallet_id: w.clone(),
         key_slot: format!(
             "pumpfun-{}",
@@ -317,7 +347,19 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
         allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
         allowed_crypto_suites: vec!["ed25519-message".into()],
         maximum_lifetime_ms: life,
-    }) {
+    };
+    // The pinned SDK exposes canonical key-request JSON. This host extension
+    // adds Broker approval budgets without changing the custody scope or WIT.
+    let mut request = match serde_json::to_value(request) {
+        Ok(request) => request,
+        Err(error) => return fail(error.to_string()),
+    };
+    request["approval_value_limits"] = json!(value_limits);
+    let request = match serde_jcs::to_vec(&request) {
+        Ok(request) => request,
+        Err(error) => return fail(error.to_string()),
+    };
+    let out = match host::derive_key(&request) {
         Ok(v) => v,
         Err(e) => return fail(sdk_message(&e)),
     };
@@ -349,6 +391,7 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
         id: id.clone(),
         address,
         duration_ms: life,
+        approval_value_limits: value_limits,
         created_ms: now,
         expires_ms: now + life,
         stopped: false,
@@ -894,7 +937,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())),"claim_assurance":{"kind":"machine_asserted"}});
+    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
@@ -3290,6 +3333,7 @@ mod tests {
             id: "session".into(),
             address: USER.into(),
             duration_ms: 60_000,
+            approval_value_limits: Vec::new(),
             created_ms: 1,
             expires_ms: 60_001,
             stopped: false,
@@ -3340,6 +3384,7 @@ mod tests {
             id: SESSION.into(),
             address: USER.into(),
             duration_ms: 3_600_000,
+            approval_value_limits: Vec::new(),
             created_ms: NOW_MS,
             expires_ms: NOW_MS + 3_600_000,
             stopped: false,
@@ -3679,6 +3724,12 @@ mod tests {
             );
             let claim: Value =
                 serde_json::from_slice(&request.petal_use_claim_jcs).expect("claim is JSON");
+            // bloom-rpc-wire RequestNonce is 16 bytes encoded as lowercase
+            // hex. A 32-byte digest is valid JSON but the real host rejects it
+            // before Broker signing; the recording host alone cannot catch it.
+            let nonce = claim["nonce"].as_str().expect("claim nonce is a string");
+            assert_eq!(hex::decode(nonce).expect("hex nonce").len(), 16);
+            assert_eq!(nonce, nonce.to_ascii_lowercase());
             assert_eq!(claim["operation_class"], json!("pumpfun.buy"));
             assert_eq!(claim["route"], json!("ROUTE_BUY"));
             assert_eq!(claim["package_hash"], json!("pumpfun-test-package"));
@@ -3689,6 +3740,30 @@ mod tests {
                 "the claim must declare what the transaction spends"
             );
         });
+    }
+
+    #[test]
+    fn a_session_requires_explicit_positive_asset_budgets() {
+        fake_host::install(FakeHost::new(NOW_MS));
+        for body in [
+            json!({"id":"agent-1"}),
+            json!({"id":"agent-1","max_lamports":"0"}),
+            json!({"id":"agent-1","max_lamports":"-1"}),
+            json!({"id":"agent-1","max_lamports":"18446744073709551616"}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{"invalid":"1"}}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{"native":"1"}}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{USER:"0"}}),
+        ] {
+            assert_ne!(
+                new_session(
+                    &ctx(&[("wallet", WALLET)]),
+                    WALLET.into(),
+                    &serde_json::to_vec(&body).unwrap()
+                ),
+                DispatchResponse::Write
+            );
+        }
+        fake_host::with(|host| assert!(host.key_requests.is_empty()));
     }
 
     #[test]
@@ -3703,7 +3778,7 @@ mod tests {
         let response = new_session(
             &ctx(&[("wallet", WALLET)]),
             WALLET.into(),
-            br#"{"id":"agent-1","duration_ms":3600000}"#,
+            br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#,
         );
         let message = dispatch_message(&response);
         assert!(
@@ -3717,6 +3792,13 @@ mod tests {
                 "a session must not exist before its key does"
             );
             assert!(host.secret_json(&session_sec(WALLET, SESSION)).is_none());
+            assert_eq!(
+                host.key_requests[0]["approval_value_limits"],
+                json!([
+                    {"asset":{"chain":"solana","asset":"native"},
+                     "lifetime":"20000000","rolling_windows":[]}
+                ])
+            );
         });
     }
 
@@ -3740,7 +3822,7 @@ mod tests {
         let response = new_session(
             &ctx(&[("wallet", WALLET)]),
             WALLET.into(),
-            br#"{"id":"agent-1","duration_ms":3600000}"#,
+            br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#,
         );
         assert_eq!(
             response,
@@ -3753,6 +3835,17 @@ mod tests {
             host.state_json(&sk(WALLET, SESSION, "session.json"))
                 .expect("session recorded")
         });
+        assert_ne!(
+            new_session(
+                &ctx(&[("wallet", WALLET)]),
+                WALLET.into(),
+                br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000001"}"#
+            ),
+            DispatchResponse::Write,
+            "a retry cannot increase the session budget"
+        );
+        fake_host::with(|host| assert_eq!(host.key_requests.len(), 1));
+        assert_eq!(stored["approval_value_limits"][0]["lifetime"], "20000000");
         assert_eq!(stored["address"], json!(USER));
         assert_eq!(stored["created_ms"], json!(derive_completed_ms));
         assert_eq!(

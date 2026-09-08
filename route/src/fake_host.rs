@@ -12,8 +12,8 @@
 //! about changing.
 
 use petal::{
-    HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest,
-    SdkError, SignOutcome,
+    HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError,
+    SignOutcome,
 };
 use serde_json::Value;
 use std::cell::RefCell;
@@ -47,6 +47,7 @@ pub struct FakeHost {
     pub calls: Vec<Call>,
     /// Every signing request the route made, in order.
     pub sign_requests: Vec<PayloadSignRequest>,
+    pub key_requests: Vec<Value>,
     state: BTreeMap<String, Vec<u8>>,
     secrets: BTreeMap<String, Vec<u8>>,
     replies: BTreeMap<String, Vec<Value>>,
@@ -284,8 +285,10 @@ pub fn store_list(prefix: &str, max_bytes: usize) -> Result<Vec<String>, SdkErro
     })
 }
 
-pub fn derive_key(_request: &PetalKeyRequest) -> Result<PetalKeyOutcome, SdkError> {
+pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
     with(|host| {
+        host.key_requests
+            .push(serde_json::from_slice(request_jcs).expect("canonical key request"));
         if host.derivations.is_empty() {
             return Err(SdkError::Message(
                 "fake host: no key derivation scripted".into(),

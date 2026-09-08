@@ -110,8 +110,13 @@ funding a session.
 
 ## Session workflow
 
-Create a session by writing `{"id":"agent-1","duration_ms":3600000}` to
-`new.json`, then fund the `address` exposed by its `session.json`. Create bodies
+Create a session by writing `id`, `duration_ms`, `max_lamports`, and optional
+`token_limits` to `new.json`, then fund the `address` exposed by `session.json`.
+`max_lamports` is a positive decimal string for cumulative native debits and
+fees, including the exit. `token_limits` maps each mint the session may sell
+to its cumulative raw-token debit ceiling. See [SETUP.md](SETUP.md) before
+choosing these budgets; they are sealed by the reusable approval ceremony.
+Create bodies
 require `name`, `symbol`, `uri`, positive decimal-string `solLamports`, and a
 positive decimal-string `minOutputAmount`. Buy and sell bodies require `mint`,
 a positive decimal-string `amount`, and `minOutputAmount` in raw output units.
