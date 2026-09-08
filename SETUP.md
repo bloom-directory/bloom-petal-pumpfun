@@ -123,13 +123,25 @@ expiry, so the Petal cannot read the authoritative one. If a ceremony sat
 waiting for a while, the real scope is older than the recorded deadline.
 
 Treat the recorded deadline as an estimate, and read the authoritative one
-before funding. It is not hidden: when Bloom prepares the session's reusable
-approval it sets that approval's `expires_at_ms` to the Signer's scoped-key
-expiry exactly, and refuses to prepare at all if the scope has already
-lapsed. **So the expiry shown on the ceremony in step 3, and on the approval
-afterwards, is the Signer's own deadline** — not the Petal's estimate. Read
-it there, compare it against the Petal's `expires_ms`, and use the earlier of
-the two.
+before funding. **Three different expiries are in play during setup, and only
+one of them is the key's deadline.** Confusing them is easy and expensive, so
+be exact about which you are looking at:
+
+| Expiry | What it is | Where |
+| --- | --- | --- |
+| the session's `expires_ms` | what this Petal asked for, timed from when the derive returned `Ready` | `session.json`, and preflight |
+| the reusable approval's **terms** `expires_at_ms` | **the scoped key's deadline.** Bloom sets it to the Signer's `petal_scope_expires_at_ms` exactly, and refuses to prepare the approval at all if the scope has already lapsed | the Machine's Petal key state record, under `public_key.petal_scope_expires_at_ms` |
+| the **ceremony** expiry | how long the passkey page stays usable — `min(now + ceremony TTL, the terms expiry)`, normally about five minutes | the ceremony URL, and `ceremony_expires_at_ms` in the approval projections |
+
+The middle row is the one that matters. The last row is not a shorter view of
+it: the Signer deliberately clamps a browser ceremony so it cannot outlive the
+authority it activates, so the countdown on the passkey page tells you how long
+you have to finish clicking, and nothing at all about how long the session key
+lives. Reading it as the key deadline understates the session's life by hours.
+
+No VFS route projects the terms expiry today — the projections carry the
+ceremony one. Read it from the Petal key state record on the host, compare it
+against the Petal's `expires_ms`, and use the earlier of the two.
 
 If those two are far apart, the ceremony sat waiting and the session has less
 time than it claims. Sell, close and sweep while the scope is still live. An

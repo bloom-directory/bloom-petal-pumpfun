@@ -1627,13 +1627,16 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     }));
 
     // 5e. The scoped signing key's real deadline lives in the Signer grant,
-    // not in this Petal. The session record's `expires_ms` is what the Petal
-    // asked for when it derived the key, so report it as the Petal's own
-    // deadline and name where the authoritative one can be read.
+    // not in this Petal. Three expiries are visible during setup and only one
+    // of them is that deadline, so name the right one rather than telling the
+    // reader to "check the host": the ceremony countdown is clamped to the
+    // browser TTL and is normally minutes, which badly understates the key.
     if session_block.is_some() {
         operator_checks.push(json!({
             "operator_check":"signing_scope_deadline_is_host_side",
-            "detail":"the session `expires_ms` below is the lifetime this Petal requested, not the Signer's grant expiry. Bloom sets the session's reusable approval to expire exactly with the scoped key, so read that approval's expiry, take the earlier of the two, and leave enough time to sell, close the token account, and sweep."
+            "authoritative_source":"the reusable approval's terms expires_at_ms, which Bloom sets to the Signer's petal_scope_expires_at_ms exactly",
+            "not_this":"the ceremony expiry on the passkey page, which is min(now + browser ceremony TTL, the terms expiry) and says nothing about how long the key lives",
+            "detail":"the session `expires_ms` below is the lifetime this Petal requested, timed from when the derive returned Ready — not the Signer's grant. Read the approval terms expiry, take the earlier of the two, and leave enough time to sell, close the token account, and sweep."
         }));
     }
 
