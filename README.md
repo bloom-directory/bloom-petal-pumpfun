@@ -43,7 +43,7 @@ sessions/<wallet>/new.json
 sessions/<wallet>/sessions/<session>/session.json
 sessions/<wallet>/sessions/<session>/{create,buy,sell,collect_fees,sharing_config,close_token_account,sweep}.json
 sessions/<wallet>/sessions/<session>/operations/<operationId>.json
-sessions/<wallet>/sessions/<session>/stop
+sessions/<wallet>/sessions/<session>/stop (local stop marker; Bloom core stop coming)
 ```
 
 ## Build and test
@@ -79,6 +79,8 @@ Fee collection requires `mint` plus `feeKind` set to `cashback`, `creator`, or
 `shareholders` whose integer `bps` values total 10,000. Every action body also
 requires `operationId`.
 
+The Petal-local `stop` route only marks the session stopped locally; Bloom itself
+is landing a core stop control that revokes the session's approvals by key.
 Before stopping a session, sell any remaining token balance. Then write
 `{"operationId":"close-1","mint":"<mint>","tokenAccount":"<session token account>","destination":"<owner Solana address>","maxLamports":"2100000"}`
 to `close_token_account.json`. The Petal independently verifies through two
@@ -88,5 +90,7 @@ declared `maxLamports`. It then builds one exact SPL Token `CloseAccount`
 instruction to return that native balance. Finally write
 `{"operationId":"return-1","destination":"<owner Solana address>"}` to
 `sweep.json`. The Petal builds one exact System transfer for the full native
-SOL balance minus the quoted fee. Sweep while the session scope is still
-active; expired signing scopes cannot recover assets.
+SOL balance minus the quoted fee. `close_token_account.json` and `sweep.json`
+remain usable after the session is stopped or expired so remaining assets can
+be recovered; they sign with an exact owner approval that does not depend on
+the session's reusable signing scope.

@@ -358,6 +358,14 @@ impl Action {
             Self::CloseTokenAccount | Self::Sweep => "",
         }
     }
+    fn selector(self) -> SignSelector {
+        match self {
+            Self::CloseTokenAccount | Self::Sweep => SignSelector::Exact,
+            Self::Create | Self::Buy | Self::Sell | Self::Fees | Self::Sharing => {
+                SignSelector::Reusable
+            }
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Pending {
@@ -468,14 +476,15 @@ fn message_template_sha256(message: &[u8]) -> Result<String, String> {
         .concat(),
     )))
 }
-fn active_session(w: &str, s: &str) -> Result<Session, DispatchResponse> {
+fn active_session(w: &str, s: &str, a: Action) -> Result<Session, DispatchResponse> {
     let session =
         get::<Session>(&sk(w, s, "session.json"))?.ok_or_else(|| bad("session not found"))?;
-    if session.stopped || session.expires_ms <= petal::sdk::now_ms() {
-        Err(deny("session stopped or expired"))
-    } else {
-        Ok(session)
+    if (session.stopped || session.expires_ms <= petal::sdk::now_ms())
+        && !matches!(a, Action::CloseTokenAccount | Action::Sweep)
+    {
+        return Err(deny("session stopped or expired"));
     }
+    Ok(session)
 }
 fn build_pending(
     a: Action,
@@ -796,7 +805,7 @@ fn build_close_token_account_pending(
     })
 }
 pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchResponse {
-    let sess = match active_session(&w, &s) {
+    let sess = match active_session(&w, &s, a) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -960,7 +969,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
     };
-    if let Err(e) = active_session(&w, &s) {
+    if let Err(e) = active_session(&w, &s, a) {
         return e;
     }
     let sig = match petal::sdk::sign_payload(&PayloadSignRequest {
@@ -974,7 +983,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         approval_hint: p.approval.clone(),
         action: None,
         advisory: None,
-        selector: SignSelector::Reusable,
+        selector: a.selector(),
         key_ref_jcs: Some(session_secret.key_ref_jcs),
     }) {
         Ok(SignOutcome::Signature(v)) => v,
@@ -1025,7 +1034,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         }
         return e;
     }
-    if let Err(e) = active_session(&w, &s) {
+    if let Err(e) = active_session(&w, &s, a) {
         return e;
     }
     p.status = "broadcast_attempted".into();
@@ -3077,6 +3086,20 @@ mod tests {
         assert!(ident("op-1", "id").is_ok());
         assert!(ident("../x", "id").is_err());
         assert!(ident("..", "id").is_err())
+    }
+    #[test]
+    fn recovery_actions_request_exact_signing() {
+        assert_eq!(Action::CloseTokenAccount.selector(), SignSelector::Exact);
+        assert_eq!(Action::Sweep.selector(), SignSelector::Exact);
+        for a in [
+            Action::Create,
+            Action::Buy,
+            Action::Sell,
+            Action::Fees,
+            Action::Sharing,
+        ] {
+            assert_eq!(a.selector(), SignSelector::Reusable);
+        }
     }
     #[test]
     fn current_pump_builder_transactions_pass_policy() {
