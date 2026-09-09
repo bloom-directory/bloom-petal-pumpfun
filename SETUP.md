@@ -23,11 +23,11 @@ A complete setup looks like:
    session key. The Petal returns `approval required: {...}` with an
    `operation_id` and `scope_digest`.
 
-3. The operator opens the ceremony URL in Chromium and completes the
-   passkey flow. Retry step 2 afterwards: Bloom then prepares the
-   session's reusable approval and returns a second ceremony URL. Complete
-   that one too, and the next retry of step 2 returns `Ready` with the
-   session address.
+3. Complete the key-derivation ceremony, then retry step 2 once. Bloom
+   records `key_derived` under `/petal-key-requests/<record>.json`, with
+   the session address in `public_key.addresses`. This is still `Pending`
+   to the Petal: the reusable approval has not been prepared yet. Use the
+   record matching this wallet and key slot for the next step.
 
 4. Update the wallet's Solana allowed destinations to cover the whole cycle,
    and complete that policy ceremony. **The session address alone is not
@@ -40,7 +40,12 @@ A complete setup looks like:
    addresses can be reviewed earlier; combine the missing entries once the
    session address is available.
 
-5. Fund the session address from the owner wallet, and approve that
+5. After the policy update is committed, retry step 2 to prepare the
+   reusable approval. Complete that ceremony and retry once more to receive
+   `Ready`. Do not change wallet policy after activating this approval:
+   Broker binds it to that exact policy snapshot.
+
+   Fund the session address from the owner wallet, and approve that
    transfer. Fund only what the cycle needs — the buy, plus the network and
    priority fees for four transactions, plus rent for any token account the
    buy creates — and only when the key's remaining lifetime comfortably
@@ -119,8 +124,8 @@ passkey ceremonies, and none of them are per trade:
 | --- | --- | --- | --- |
 | 1 | package eligibility | allow this Petal package version | already allowed, or the same version was used before |
 | 2 | `KeyDerive` | mint the session key, with its routes, operation classes and lifetime | never — one per session |
-| 3 | `SealedApproval` | activate the session's reusable approval for that key | never — one per session key |
-| 4 | `PolicyUpdate` | add the session address, and any protocol or return destination policy still lacks | never — the session address is new every time |
+| 3 | `PolicyUpdate` | add the session address, and any protocol or return destination policy still lacks | never — the session address is new every time |
+| 4 | `SealedApproval` | activate the session's reusable approval for that key and its budgets | never — one per session key |
 | 5 | `SealedApproval` | the funding transfer, for an exact amount | never |
 
 So: five on a wallet meeting this Petal for the first time, four for each
@@ -129,14 +134,14 @@ wallet's starting policy, not a property of the Petal — check the policy
 before quoting it to anyone.
 
 Buy, sell, `close_token_account` and sweep add none. They all sign under
-the approval from ceremony 3, whose scope is this package's declared routes
+the approval from ceremony 4, whose scope is this package's declared routes
 and operation classes, bounded at 256 operations and 256 signatures and
-expiring with the scoped key. It carries no monetary limit of its own —
-what a given transaction may spend is bounded by wallet policy, by the
-key's scope, and by the Petal's own transaction checks.
+expiring with the scoped key. Broker enforces its cumulative native and
+per-mint value limits in addition to wallet policy and the Petal's transaction
+checks.
 
-Ceremonies 3 and 4 both have to follow 2, because neither the key nor its
-address exists until the derive ceremony has completed.
+Ceremony 3 follows key derivation, and ceremony 4 must follow the policy
+commit. Reversing those last two invalidates the approval's policy snapshot.
 
 Reducing this further means widening what a single approval authorizes.
 That is tracked in `bloom-directory/bloom#171`; do not assume it has landed.
