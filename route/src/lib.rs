@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub use serde_json::json;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX: usize = 131072;
 const MAX_TX: usize = 1232;
@@ -84,6 +84,67 @@ fn sdk_message(e: &petal::SdkError) -> String {
     e.message()
 }
 
+#[cfg(test)]
+mod fake_host;
+
+/// This crate's only boundary to the Bloom host.
+///
+/// Every host call goes through one of these functions. A release build
+/// forwards straight to the pinned SDK; a test build dispatches to the
+/// recording fake host in `fake_host`, which is what lets a test drive a real
+/// route flow and then assert on the requests that actually left the Petal.
+mod host {
+    #[cfg(not(test))]
+    use petal::{
+        HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError, SignOutcome,
+    };
+
+    #[cfg(not(test))]
+    pub fn http(request: &HttpRequest, max_bytes: usize) -> Result<HttpResponse, SdkError> {
+        petal::sdk::http_fetch(request, max_bytes)
+    }
+    #[cfg(not(test))]
+    pub fn store_get(key: &str, max_bytes: usize) -> Result<Vec<u8>, SdkError> {
+        petal::sdk::store_get(key, max_bytes)
+    }
+    #[cfg(not(test))]
+    pub fn store_get_secret(key: &str) -> Result<Option<Vec<u8>>, String> {
+        petal::bindings::bloom::store::kv::get("secrets", key)
+    }
+    #[cfg(not(test))]
+    pub fn store_put(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> {
+        petal::sdk::store_put(key, value, secret)
+    }
+    #[cfg(not(test))]
+    pub fn store_put_new(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> {
+        petal::sdk::store_put_new(key, value, secret)
+    }
+    #[cfg(not(test))]
+    pub fn store_list(prefix: &str, max_bytes: usize) -> Result<Vec<String>, SdkError> {
+        petal::sdk::store_list(prefix, max_bytes)
+    }
+    #[cfg(not(test))]
+    pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
+        let outcome = petal::sdk::request_key(request_jcs)?;
+        serde_json::from_slice(&outcome)
+            .map_err(|error| SdkError::Message(format!("decode Petal key outcome: {error}")))
+    }
+    #[cfg(not(test))]
+    pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
+        petal::sdk::sign_payload(request)
+    }
+    #[cfg(not(test))]
+    pub fn now_ms() -> u64 {
+        petal::sdk::now_ms()
+    }
+
+    #[cfg(test)]
+    pub use crate::fake_host::{
+        derive_key, http, now_ms, sign_payload, store_get, store_get_secret, store_list, store_put,
+        store_put_new,
+    };
+}
+
 pub fn body(b: &[u8]) -> Result<(), DispatchResponse> {
     if b.len() <= MAX {
         Ok(())
@@ -120,17 +181,65 @@ fn pk(s: &str) -> Result<[u8; 32], String> {
         .try_into()
         .map_err(|_| "pubkey is not 32 bytes".to_string())
 }
-fn sk(w: &str, s: &str, x: &str) -> String {
-    format!("state/sessions/{w}/{s}/{x}")
+/// Where a session's records live and its key slot derives from. A dispatch
+/// under `wallets/<w>/<n>/petals/` scopes records and the slot to the
+/// mounted account's owner fingerprint; account 0 falls back to the legacy
+/// wallet-scoped records. The flat mount keeps the wallet records.
+#[derive(Clone, Debug)]
+pub struct SessionOwner {
+    wallet: String,
+    account: Option<(u32, String)>,
 }
-fn sec(w: &str, s: &str, o: &str) -> String {
-    format!("sessions/{w}/{s}/operations/{o}.json")
+
+impl SessionOwner {
+    pub fn scope(ctx: &Ctx, wallet: &str) -> Self {
+        Self {
+            wallet: wallet.to_owned(),
+            account: petal::account_ctx(ctx)
+                .ok()
+                .map(|account| (account.account, account.owner_key_fingerprint)),
+        }
+    }
+
+    fn record_segment(&self) -> &str {
+        match &self.account {
+            Some((_, fingerprint)) => fingerprint,
+            None => &self.wallet,
+        }
+    }
+
+    fn legacy_segment(&self) -> Option<&str> {
+        match &self.account {
+            Some((0, _)) => Some(self.wallet.as_str()),
+            _ => None,
+        }
+    }
+
+    fn key_slot_owner(&self) -> Option<&str> {
+        self.account.as_ref().map(|(_, f)| f.as_str())
+    }
 }
-fn session_sec(w: &str, s: &str) -> String {
-    format!("sessions/{w}/{s}/session.json")
+
+fn sk(owner: &SessionOwner, s: &str, x: &str) -> String {
+    format!("state/sessions/{}/{s}/{x}", owner.record_segment())
+}
+fn sk_legacy(owner: &SessionOwner, s: &str, x: &str) -> Option<String> {
+    owner
+        .legacy_segment()
+        .filter(|legacy| *legacy != owner.record_segment())
+        .map(|legacy| format!("state/sessions/{legacy}/{s}/{x}"))
+}
+fn sec(owner: &SessionOwner, s: &str, o: &str) -> String {
+    format!(
+        "sessions/{}/{s}/operations/{o}.json",
+        owner.record_segment()
+    )
+}
+fn session_sec(owner: &SessionOwner, s: &str) -> String {
+    format!("sessions/{}/{s}/session.json", owner.record_segment())
 }
 fn put<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), DispatchResponse> {
-    petal::sdk::store_put(
+    host::store_put(
         k,
         &serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
         secret,
@@ -138,7 +247,7 @@ fn put<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), Dispat
     .map_err(|e| fail(sdk_message(&e)))
 }
 fn put_new<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), DispatchResponse> {
-    petal::sdk::store_put_new(
+    host::store_put_new(
         k,
         &serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
         secret,
@@ -146,7 +255,7 @@ fn put_new<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), Di
     .map_err(|e| fail(sdk_message(&e)))
 }
 fn get<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchResponse> {
-    match petal::sdk::store_get(k, MAX) {
+    match host::store_get(k, MAX) {
         Ok(b) => serde_json::from_slice(&b)
             .map(Some)
             .map_err(|e| fail(e.to_string())),
@@ -155,7 +264,7 @@ fn get<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchRespons
     }
 }
 fn get_secret<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, DispatchResponse> {
-    match petal::bindings::bloom::store::kv::get("secrets", k) {
+    match host::store_get_secret(k) {
         Ok(Some(b)) => serde_json::from_slice(&b)
             .map(Some)
             .map_err(|e| fail(e.to_string())),
@@ -164,7 +273,7 @@ fn get_secret<T: for<'a> Deserialize<'a>>(k: &str) -> Result<Option<T>, Dispatch
     }
 }
 fn fetch(method: &str, url: String, body: Vec<u8>) -> Result<Value, DispatchResponse> {
-    let r = petal::sdk::http_fetch(
+    let r = host::http(
         &HttpRequest {
             method: method.into(),
             url,
@@ -212,6 +321,8 @@ pub struct Session {
     id: String,
     pub address: String,
     duration_ms: u64,
+    #[serde(default)]
+    approval_value_limits: Vec<Value>,
     created_ms: u64,
     expires_ms: u64,
     pub stopped: bool,
@@ -226,8 +337,11 @@ struct New {
     id: String,
     #[serde(default)]
     duration_ms: Option<u64>,
+    max_lamports: String,
+    #[serde(default)]
+    token_limits: BTreeMap<String, String>,
 }
-pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
+pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
     let r: New = match serde_json::from_slice(b) {
         Ok(v) => v,
         Err(e) => return bad(e.to_string()),
@@ -240,24 +354,65 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
     if !(60_000..=MAX_SESSION_MS).contains(&life) {
         return bad("duration_ms must be between 60000 and 86400000");
     }
-    let public_key = sk(&w, &id, "session.json");
+    let mut value_limits = Vec::new();
+    for (asset, amount) in
+        std::iter::once(("native".to_owned(), r.max_lamports)).chain(r.token_limits)
+    {
+        if asset != "native" && pk(&asset).is_err() {
+            return bad("token_limits keys must be Solana mint addresses");
+        }
+        let amount = match amount.parse::<u64>() {
+            Ok(amount) if amount > 0 => amount,
+            _ => return bad("session budgets must be positive decimal strings fitting u64"),
+        };
+        if value_limits
+            .iter()
+            .any(|value: &Value| value["asset"]["asset"] == asset)
+        {
+            return bad("duplicate session budget asset");
+        }
+        value_limits.push(json!({"asset":{"chain":"solana","asset":asset},
+            "lifetime":amount.to_string(),"rolling_windows":[]}));
+    }
+    let public_key = sk(&owner, &id, "session.json");
     match get::<Session>(&public_key) {
-        Ok(Some(existing)) if existing.duration_ms == life => return DispatchResponse::Write,
-        Ok(Some(_)) => return bad("session id already used with a different duration"),
+        Ok(Some(existing))
+            if existing.duration_ms == life && existing.approval_value_limits == value_limits =>
+        {
+            return DispatchResponse::Write;
+        }
+        Ok(Some(_)) => return bad("session id already used with different duration or budgets"),
         Ok(None) => {}
         Err(e) => return e,
     }
-    let out = match petal::sdk::derive_key(&petal::PetalKeyRequest {
-        wallet_id: w.clone(),
-        key_slot: format!(
-            "pumpfun-{}",
-            &hex::encode(Sha256::digest(id.as_bytes()))[..40]
-        ),
+    let request = petal::PetalKeyRequest {
+        wallet_id: owner.wallet.clone(),
+        key_slot: {
+            let mut input = id.as_bytes().to_vec();
+            input.push(0);
+            if let Some(fingerprint) = owner.key_slot_owner() {
+                input.extend_from_slice(fingerprint.as_bytes());
+                input.push(0);
+            }
+            format!("pumpfun-{}", &hex::encode(Sha256::digest(&input))[..40])
+        },
         allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
         allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
         allowed_crypto_suites: vec!["ed25519-message".into()],
         maximum_lifetime_ms: life,
-    }) {
+    };
+    // The pinned SDK exposes canonical key-request JSON. This host extension
+    // adds Broker approval budgets without changing the custody scope or WIT.
+    let mut request = match serde_json::to_value(request) {
+        Ok(request) => request,
+        Err(error) => return fail(error.to_string()),
+    };
+    request["approval_value_limits"] = json!(value_limits);
+    let request = match serde_jcs::to_vec(&request) {
+        Ok(request) => request,
+        Err(error) => return fail(error.to_string()),
+    };
+    let out = match host::derive_key(&request) {
         Ok(v) => v,
         Err(e) => return fail(sdk_message(&e)),
     };
@@ -282,18 +437,19 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
             (key_ref_jcs, a)
         }
     };
-    let now = petal::sdk::now_ms();
+    let now = host::now_ms();
     let v = Session {
         schema: "bloom.pumpfun_session.v1".into(),
-        wallet: w.clone(),
+        wallet: owner.wallet.clone(),
         id: id.clone(),
         address,
         duration_ms: life,
+        approval_value_limits: value_limits,
         created_ms: now,
         expires_ms: now + life,
         stopped: false,
     };
-    let secret_key = session_sec(&w, &id);
+    let secret_key = session_sec(&owner, &id);
     let secret = SessionSecret { key_ref_jcs };
     if let Err(e) = put_new(&secret_key, &secret, true) {
         match get_secret::<SessionSecret>(&secret_key) {
@@ -306,27 +462,29 @@ pub fn new_session(_c: &Ctx, w: String, b: &[u8]) -> DispatchResponse {
         Err(e) => e,
     }
 }
-pub fn read_session(w: &str, s: &str) -> DispatchResponse {
-    match get::<Session>(&sk(w, s, "session.json")) {
+/// Read one public session record: the owner-scoped key first, then the
+/// legacy wallet-scoped key when this is account 0.
+fn get_session_fallback<T: for<'a> Deserialize<'a>>(
+    owner: &SessionOwner,
+    s: &str,
+    x: &str,
+) -> Result<Option<T>, DispatchResponse> {
+    if let Some(value) = get::<T>(&sk(owner, s, x))? {
+        return Ok(Some(value));
+    }
+    match sk_legacy(owner, s, x) {
+        Some(legacy) => get::<T>(&legacy),
+        None => Ok(None),
+    }
+}
+
+pub fn read_session(owner: &SessionOwner, s: &str) -> DispatchResponse {
+    match get_session_fallback::<Session>(owner, s, "session.json") {
         Ok(Some(v)) => petal::read_json_value(&v),
         Ok(None) => bad("session not found"),
         Err(e) => e,
     }
 }
-pub fn stop(w: &str, s: &str) -> DispatchResponse {
-    let k = sk(w, s, "session.json");
-    let mut v = match get::<Session>(&k) {
-        Ok(Some(v)) => v,
-        Ok(None) => return bad("session not found"),
-        Err(e) => return e,
-    };
-    v.stopped = true;
-    match put(&k, &v, false) {
-        Ok(()) => DispatchResponse::Write,
-        Err(e) => e,
-    }
-}
-
 #[derive(Clone, Copy)]
 pub enum Action {
     Create,
@@ -358,6 +516,9 @@ impl Action {
             Self::CloseTokenAccount | Self::Sweep => "",
         }
     }
+    /// Recovery actions sign with a fresh payload-specific Exact approval,
+    /// which survives the session's stop or expiry; trading actions reuse
+    /// the session key's approval.
     fn selector(self) -> SignSelector {
         match self {
             Self::CloseTokenAccount | Self::Sweep => SignSelector::Exact,
@@ -390,96 +551,10 @@ struct Public {
     updated_ms: u64,
 }
 
-fn pumpfun_buy_canary_facts(
-    wallet: &str,
-    session: &Session,
-    key_ref_jcs: &[u8],
-    request: &Map<String, Value>,
-    message: &Msg,
-    message_bytes: &[u8],
-    pending: &Pending,
-) -> Result<Value, DispatchResponse> {
-    let key_ref: Value = serde_json::from_slice(key_ref_jcs)
-        .map_err(|error| fail(format!("session signing reference is invalid: {error}")))?;
-    let key_fingerprint = key_ref
-        .get("public_key_fingerprint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("session signing reference omitted its key fingerprint"))?;
-    let derivation_path = key_ref
-        .pointer("/derivation/path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("session signing reference omitted its derivation path"))?;
-    let amount = request_u64(request, "amount").map_err(fail)?;
-    let minimum = request_u64(request, "minOutputAmount").map_err(fail)?;
-    let mint = request
-        .get("outputMint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| fail("normalized buy mint is missing"))?;
-    let maximum_sol_cost = message
-        .instructions
-        .iter()
-        .find(|instruction| has_discriminator(instruction, IX_BUY))
-        .ok_or_else(|| fail("approved buy instruction is missing"))
-        .and_then(|instruction| instruction_u64(instruction, 16).map_err(fail))?;
-    let protocol_and_slippage = maximum_sol_cost
-        .checked_sub(amount)
-        .ok_or_else(|| fail("buy maximum SOL cost is below the requested amount"))?;
-    let slippage = request
-        .get("slippagePct")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| fail("normalized slippage is missing"))?;
-    let slippage_bps = (slippage * 100.0).round();
-    if (slippage_bps / 100.0 - slippage).abs() > 0.000_000_1
-        || !(0.0..=u32::MAX as f64).contains(&slippage_bps)
-    {
-        return Err(fail("slippage cannot be represented in basis points"));
-    }
-    Ok(json!({
-        "wallet": wallet,
-        "key_fingerprint": key_fingerprint,
-        "derivation_path": derivation_path,
-        "source_address": session.address,
-        "mint": mint,
-        "transfer_lamports": amount,
-        "min_token_out": minimum,
-        "protocol_fee_lamports": protocol_and_slippage,
-        "tip_lamports": tip_lamports(request)?,
-        "fee_lamports": pending.network_fee_lamports,
-        "slippage_bps": slippage_bps as u32,
-        "operation_class": "pumpfun.buy",
-        "message_sha256": pending.message_sha256,
-        "intent_sha256": pending.digest,
-        "message_template_sha256": message_template_sha256(message_bytes).map_err(fail)?,
-    }))
-}
-
-fn message_template_sha256(message: &[u8]) -> Result<String, String> {
-    let mut normalized = message.to_vec();
-    let mut offset = usize::from(normalized.first() == Some(&128));
-    offset = offset.checked_add(3).ok_or("message header overflow")?;
-    if offset > normalized.len() {
-        return Err("message header missing".into());
-    }
-    let key_count = short(&normalized, &mut offset)?;
-    offset = offset
-        .checked_add(key_count.checked_mul(32).ok_or("message key overflow")?)
-        .ok_or("message key overflow")?;
-    let blockhash = normalized
-        .get_mut(offset..offset + 32)
-        .ok_or("message blockhash missing")?;
-    blockhash.fill(0);
-    Ok(hex::encode(Sha256::digest(
-        [
-            b"bloom-solana-message-template/v1\0".as_slice(),
-            &normalized,
-        ]
-        .concat(),
-    )))
-}
-fn active_session(w: &str, s: &str, a: Action) -> Result<Session, DispatchResponse> {
-    let session =
-        get::<Session>(&sk(w, s, "session.json"))?.ok_or_else(|| bad("session not found"))?;
-    if (session.stopped || session.expires_ms <= petal::sdk::now_ms())
+fn active_session(owner: &SessionOwner, s: &str, a: Action) -> Result<Session, DispatchResponse> {
+    let session = get_session_fallback::<Session>(owner, s, "session.json")?
+        .ok_or_else(|| bad("session not found"))?;
+    if (session.stopped || session.expires_ms <= host::now_ms())
         && !matches!(a, Action::CloseTokenAccount | Action::Sweep)
     {
         return Err(deny("session stopped or expired"));
@@ -804,12 +879,12 @@ fn build_close_token_account_pending(
         approval: None,
     })
 }
-pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchResponse {
-    let sess = match active_session(&w, &s, a) {
+pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> DispatchResponse {
+    let sess = match active_session(&owner, &s, a) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let session_secret = match get_secret::<SessionSecret>(&session_sec(&w, &s)) {
+    let session_secret = match get_secret::<SessionSecret>(&session_sec(&owner, &s)) {
         Ok(Some(value)) => value,
         Ok(None) => return fail("session signing reference is unavailable"),
         Err(e) => return e,
@@ -834,12 +909,19 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Err(e) => return bad(format!("request cannot be canonicalized: {e}")),
     };
     let digest = hex::encode(Sha256::digest([a.class().as_bytes(), &canonical].concat()));
-    let key = sec(&w, &s, &op);
+    let key = sec(&owner, &s, &op);
     let mut p = match get_secret::<Pending>(&key) {
         Ok(Some(mut v)) => {
             if v.digest != digest {
                 return bad("operationId already bound");
             };
+            // Only outcomes that are certainly dead are rebuilt. A refused
+            // signature and a failed simulation both mean nothing was signed
+            // that anyone could still broadcast, so a fresh transaction under
+            // the same economic intent is safe. `signing_uncertain` is
+            // deliberately absent: that message may already be signed, so a
+            // retry re-enters signing with the stored message and approval
+            // rather than creating a second one.
             if matches!(v.status.as_str(), "simulation_failed" | "approval_failed") {
                 v = match build_pending(a, &sess.address, &r, digest.clone()) {
                     Ok(value) => value,
@@ -848,7 +930,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
                 if let Err(e) = put(&key, &v, true) {
                     return e;
                 }
-                if let Err(e) = publish(&w, &s, &op, a, &v) {
+                if let Err(e) = publish(&owner, &s, &op, a, &v) {
                     return e;
                 }
             }
@@ -862,7 +944,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             if let Err(e) = put_new(&key, &p, true) {
                 return e;
             }
-            if let Err(e) = publish(&w, &s, &op, a, &p) {
+            if let Err(e) = publish(&owner, &s, &op, a, &p) {
                 return e;
             }
             p
@@ -886,7 +968,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         if let Err(error) = put(&key, &p, true) {
             return error;
         }
-        if let Err(error) = publish(&w, &s, &op, a, &p) {
+        if let Err(error) = publish(&owner, &s, &op, a, &p) {
             return error;
         }
     }
@@ -922,58 +1004,16 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let pumpfun_canary = if matches!(a, Action::Buy) {
-        match pumpfun_buy_canary_facts(
-            &w,
-            &sess,
-            &session_secret.key_ref_jcs,
-            &r,
-            &parsed_message,
-            env.message,
-            &p,
-        ) {
-            Ok(value) => Some(value),
-            Err(error) => return error,
-        }
-    } else {
-        None
-    };
-    if pumpfun_canary.is_some() {
-        let status = match post(
-            RPC_VERIFY,
-            &rpc(
-                "bloomPumpfunCanaryStatus",
-                json!([pumpfun_canary.as_ref().expect("buy canary facts")]),
-            ),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return deny(format!(
-                    "exact Pump.fun canary authorization could not be verified before signing: {}",
-                    dispatch_message(&error)
-                ));
-            }
-        };
-        if status
-            .pointer("/result/authorization_loaded")
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
-            return deny(
-                "exact Pump.fun canary authorization is not loaded; review the published message_sha256 and install its single-use authorization before passkey approval",
-            );
-        }
-    }
-    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())),"claim_assurance":{"kind":"machine_asserted"}});
+    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
     };
-    if let Err(e) = active_session(&w, &s, a) {
+    if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
-    let sig = match petal::sdk::sign_payload(&PayloadSignRequest {
-        wallet: w.clone(),
+    let sig = match host::sign_payload(&PayloadSignRequest {
+        wallet: owner.wallet.clone(),
         preimage: env.message.to_vec(),
         claimed_hash: hash,
         signature_algorithm: "ed25519-message".into(),
@@ -996,7 +1036,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             if let Err(e) = put(&key, &p, true) {
                 return e;
             }
-            if let Err(e) = publish(&w, &s, &op, a, &p) {
+            if let Err(e) = publish(&owner, &s, &op, a, &p) {
                 return e;
             }
             return deny(format!(
@@ -1005,15 +1045,43 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             ));
         }
         Err(e) => {
-            p.status = "approval_failed".into();
-            p.approval = None;
+            // Only two host classes mean the message was decided against and
+            // no signature exists: `denied`, which the host reserves for a
+            // Broker failure whose own error contract says it can never be
+            // retried and left no durable effect, and `invalid`, which the
+            // host raises before the request reaches the Broker at all.
+            //
+            // Everything else — a backend fault, a dropped response, an
+            // unreadable reply — leaves it unknown whether the Signer produced
+            // a signature, so it must not be rebuilt. This is a contract with
+            // the host, not a guess about it: a host that collapsed an
+            // ambiguous Broker outcome into `denied` would license a second
+            // signature for one payment here. `route_to_host_contract` below
+            // pins which classes mean which, and the Machine's own
+            // `petal_signing_host_error` is the other half.
+            let refused = matches!(
+                e,
+                SdkError::Host(HostStatus::Denied) | SdkError::Host(HostStatus::Invalid)
+            );
+            if refused {
+                p.status = "approval_failed".into();
+                p.approval = None;
+            } else {
+                p.status = "signing_uncertain".into();
+            }
             if let Err(store_error) = put(&key, &p, true) {
                 return store_error;
             }
-            if let Err(store_error) = publish(&w, &s, &op, a, &p) {
+            if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
                 return store_error;
             }
-            return deny(sdk_message(&e));
+            if refused {
+                return deny(sdk_message(&e));
+            }
+            return fail(format!(
+                "signing did not return an outcome and may already have produced a signature; retry the same operationId with the same request to reconcile it: {}",
+                sdk_message(&e)
+            ));
         }
     };
     if sig.len() != 64 {
@@ -1029,12 +1097,12 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
         if let Err(store_error) = put(&key, &p, true) {
             return store_error;
         }
-        if let Err(store_error) = publish(&w, &s, &op, a, &p) {
+        if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
             return store_error;
         }
         return e;
     }
-    if let Err(e) = active_session(&w, &s, a) {
+    if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
     p.status = "broadcast_attempted".into();
@@ -1043,24 +1111,22 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
     if let Err(e) = put(&key, &p, true) {
         return e;
     }
-    if let Err(e) = publish(&w, &s, &op, a, &p) {
+    if let Err(e) = publish(&owner, &s, &op, a, &p) {
         return e;
     }
     let result = if p.front {
-        let mut request = rpc("sendTransaction", json!([tx, {"encoding":"base64"}]));
-        if let (Some(object), Some(canary)) = (request.as_object_mut(), pumpfun_canary.clone()) {
-            object.insert("bloom_canary".into(), canary);
-        }
-        post(JITO, &request)
+        post(
+            JITO,
+            &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
+        )
     } else {
-        let mut request = rpc(
-            "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
-        );
-        if let (Some(object), Some(canary)) = (request.as_object_mut(), pumpfun_canary) {
-            object.insert("bloom_canary".into(), canary);
-        }
-        post(RPC, &request)
+        post(
+            RPC,
+            &rpc(
+                "sendTransaction",
+                json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
+            ),
+        )
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
@@ -1068,7 +1134,7 @@ pub fn execute(c: &Ctx, a: Action, w: String, s: String, b: &[u8]) -> DispatchRe
             if let Err(e) = put(&key, &p, true) {
                 return e;
             }
-            if let Err(e) = publish(&w, &s, &op, a, &p) {
+            if let Err(e) = publish(&owner, &s, &op, a, &p) {
                 return e;
             }
             DispatchResponse::Write
@@ -1421,9 +1487,15 @@ fn destinations(action: Action, message: &Msg) -> Vec<Value> {
         .map(|destination| json!({"chain":"solana","destination":destination}))
         .collect()
 }
-fn publish(w: &str, s: &str, o: &str, a: Action, p: &Pending) -> Result<(), DispatchResponse> {
+fn publish(
+    owner: &SessionOwner,
+    s: &str,
+    o: &str,
+    a: Action,
+    p: &Pending,
+) -> Result<(), DispatchResponse> {
     put(
-        &sk(w, s, &format!("operations/{o}.json")),
+        &sk(owner, s, &format!("operations/{o}.json")),
         &Public {
             schema: "bloom.pumpfun_operation.v1".into(),
             action: a.class().into(),
@@ -1431,18 +1503,18 @@ fn publish(w: &str, s: &str, o: &str, a: Action, p: &Pending) -> Result<(), Disp
             signature: p.signature.clone(),
             api: p.api.clone(),
             message_sha256: p.message_sha256.clone(),
-            updated_ms: petal::sdk::now_ms(),
+            updated_ms: host::now_ms(),
         },
         false,
     )
 }
-pub fn read_operation(w: &str, s: &str, o: &str) -> DispatchResponse {
-    let key = sk(w, s, &format!("operations/{o}.json"));
-    let mut operation = match get::<Public>(&key) {
-        Ok(Some(value)) => value,
-        Ok(None) => return bad("operation not found"),
-        Err(e) => return e,
-    };
+pub fn read_operation(owner: &SessionOwner, s: &str, o: &str) -> DispatchResponse {
+    let mut operation =
+        match get_session_fallback::<Public>(owner, s, &format!("operations/{o}.json")) {
+            Ok(Some(value)) => value,
+            Ok(None) => return bad("operation not found"),
+            Err(e) => return e,
+        };
     if matches!(
         operation.status.as_str(),
         "broadcast_attempted" | "submitted"
@@ -1468,8 +1540,12 @@ pub fn read_operation(w: &str, s: &str, o: &str) -> DispatchResponse {
         };
         if next != operation.status {
             operation.status = next.into();
-            operation.updated_ms = petal::sdk::now_ms();
-            if let Err(e) = put(&key, &operation, false) {
+            operation.updated_ms = host::now_ms();
+            if let Err(e) = put(
+                &sk(owner, s, &format!("operations/{o}.json")),
+                &operation,
+                false,
+            ) {
                 return e;
             }
         }
@@ -1493,16 +1569,23 @@ const MAINNET_BETA_GENESIS_BASE58: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc14
 
 /// Read-only, ceremony-free preflight for the Pump.fun setup path.
 ///
-/// Returns a structured blocker list and never derives a session key,
-/// creates an approval, or changes policy. Every blocker corresponds to
-/// one of the seven acceptance-criteria gates in the Pump.fun handoff;
-/// a successful preflight means one user approval can drive the staged
-/// transaction to broadcast without further ceremony.
+/// Never derives a session key, creates an approval, or changes policy. The
+/// response separates three different things, and a reader should not confuse
+/// them:
+///
+/// - `checks` — facts the Petal verified itself, and they held;
+/// - `blockers` — checks the Petal ran and that failed;
+/// - `operator_checks` — facts the Petal cannot see from inside the sandbox,
+///   which a person has to confirm before funding. These are not failures.
+///
+/// `ok` reflects `blockers` only. An empty `blockers` list does not mean the
+/// operator checks were done.
 pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     let mut blockers: Vec<Value> = Vec::new();
     let mut checks: Vec<Value> = Vec::new();
+    let mut operator_checks: Vec<Value> = Vec::new();
 
-    let now = petal::sdk::now_ms();
+    let now = host::now_ms();
 
     // 1. The running Machine artifact is bound to the canonical Pump.fun
     //    Petal package. A missing or wrong hash means the host cannot reach
@@ -1585,7 +1668,7 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     if let Some(sid) = session_id.as_deref() {
         match ident(sid, "session") {
             Ok(_) => {
-                let key = sk(&w, sid, "session.json");
+                let key = sk(&SessionOwner::scope(c, &w), sid, "session.json");
                 match get::<Session>(&key) {
                     Ok(Some(s)) => {
                         let expired = s.expires_ms <= now || s.stopped;
@@ -1633,55 +1716,48 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
         }
     }
 
-    // 5c. Remind the operator to verify the wallet policy lists the
-    // session address as an allowed Solana destination. The Petal cannot
-    // query the host's wallet policy from inside the sandbox; it surfaces
-    // the session address it just loaded and tells the operator to
-    // confirm their policy update landed before they attempt to fund the
-    // session.
+    // 5c. The Petal cannot see the host's wallet policy from inside the
+    // sandbox, so it cannot tell whether the session address is an allowed
+    // Solana destination. That is a fact for a person to confirm, not a check
+    // this code ran and failed, so it is reported as an operator check.
     if let Some(block) = session_block.as_ref() {
         let session_address = block["address"].as_str().unwrap_or("").to_string();
         if !session_address.is_empty() {
-            blockers.push(json!({
-                "blocker":"verify_wallet_policy_includes_session_address",
+            operator_checks.push(json!({
+                "operator_check":"wallet_policy_lists_session_address",
                 "session_address":session_address,
-                "detail":"the host wallet policy must list this session address under chain \"solana\" before the funding transfer is attempted, otherwise the transfer is refused with CLAIM_INVALID and the ceremony is wasted"
+                "detail":"confirm the host wallet policy lists this session address under chain \"solana\" before funding it; the Petal cannot read wallet policy and has not checked this either way. An unlisted destination makes the funding transfer fail as an invalid claim after the ceremony is spent."
             }));
         }
     }
 
-    // 6. Ask the Machine for its compile-time posture. This is a host-local
-    //    RPC handled at the mediated HTTP boundary; it never reaches the
-    //    public Solana endpoint. The exact authorization is expected to be
-    //    absent until a buy has been staged and its message digest reviewed.
-    match post(
-        RPC_VERIFY,
-        &rpc("bloomPumpfunCanaryStatus", json!([])),
-    ) {
-        Ok(status)
-            if status
-                .pointer("/result/compiled")
-                .and_then(Value::as_bool)
-                == Some(true) =>
-        {
-            checks.push(json!({
-                "check":"mainnet_broadcast_capability",
-                "compiled":true,
-                "authorization_loaded":status
-                    .pointer("/result/authorization_loaded")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                "package_hash":status.pointer("/result/package_hash")
-            }));
-        }
-        Ok(_) => blockers.push(json!({
-            "blocker":"mainnet_broadcast_capability_missing",
-            "detail":"the running Machine is an ordinary build and cannot broadcast a Pump.fun mainnet transaction"
-        })),
-        Err(error) => blockers.push(json!({
-            "blocker":"mainnet_broadcast_posture_unavailable",
-            "detail":dispatch_message(&error)
-        })),
+    // 5d. Funding is not the only destination wallet policy has to allow.
+    // Every write declares the protocol program it routes through, and the
+    // exit declares the return address; Bloom checks each against the wallet's
+    // allowed destinations as a flat set. Listing them here is the difference
+    // between one policy ceremony and discovering the gaps one refused trade
+    // at a time. Tips are omitted: a write declares one only when the caller
+    // sets `frontRunningProtection`.
+    operator_checks.push(json!({
+        "operator_check":"wallet_policy_lists_cycle_destinations",
+        "required_for_trading": PROGRAMS[5..],
+        "required_for_exit":"the owner address named as `destination` by close_token_account and sweep",
+        "conditional":"the selected Jito tip account, only for writes that set frontRunningProtection",
+        "detail":"every destination a write declares is checked against wallet policy, not just the funding address. Which of the two Pump programs a mint routes through depends on whether it has migrated, and the builder chooses — allow both, or read coins/<mint>.json first. Prepare one policy update covering the whole cycle."
+    }));
+
+    // 5e. The scoped signing key's real deadline lives in the Signer grant,
+    // not in this Petal. Three expiries are visible during setup and only one
+    // of them is that deadline, so name the right one rather than telling the
+    // reader to "check the host": the ceremony countdown is clamped to the
+    // browser TTL and is normally minutes, which badly understates the key.
+    if session_block.is_some() {
+        operator_checks.push(json!({
+            "operator_check":"signing_scope_deadline_is_host_side",
+            "authoritative_source":"the reusable approval's terms expires_at_ms, which Bloom sets to the Signer's petal_scope_expires_at_ms exactly",
+            "not_this":"the ceremony expiry on the passkey page, which is min(now + browser ceremony TTL, the terms expiry) and says nothing about how long the key lives",
+            "detail":"the session `expires_ms` below is the lifetime this Petal requested, timed from when the derive returned Ready — not the Signer's grant. Read the approval terms expiry, take the earlier of the two, and leave enough time to sell, close the token account, and sweep."
+        }));
     }
 
     let ok = blockers.is_empty();
@@ -1694,6 +1770,7 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
         "now_ms":now,
         "checks":checks,
         "blockers":blockers,
+        "operator_checks":operator_checks,
         "session":session_block,
     });
     petal::read_json_value(&body)
@@ -1793,7 +1870,7 @@ fn probe_builder() -> BuilderCheck {
     // coin. A 400/422 validation response proves the exact builder route is
     // live without asking it to produce a transaction. Authentication,
     // routing, and server failures remain blockers.
-    match petal::sdk::http_fetch(
+    match host::http(
         &HttpRequest {
             method: "POST".into(),
             url: endpoint.clone(),
@@ -1826,7 +1903,7 @@ pub fn coin(m: &str) -> DispatchResponse {
     }
 }
 fn stored_children(prefix: &str, suffix: Option<&str>) -> Result<Vec<String>, DispatchResponse> {
-    let keys = petal::sdk::store_list(prefix, MAX).map_err(|error| fail(error.message()))?;
+    let keys = host::store_list(prefix, MAX).map_err(|error| fail(error.message()))?;
     let mut children = keys
         .into_iter()
         .filter_map(|key| key.strip_prefix(prefix).map(str::to_owned))
@@ -2963,7 +3040,7 @@ pub fn route_action(c: &Ctx, b: &[u8], a: Action) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    execute(c, a, w, s, b)
+    execute(c, a, SessionOwner::scope(c, &w), s, b)
 }
 pub fn route_session(c: &Ctx) -> DispatchResponse {
     let w = match wallet(c) {
@@ -2974,18 +3051,7 @@ pub fn route_session(c: &Ctx) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    read_session(&w, &s)
-}
-pub fn route_stop(c: &Ctx) -> DispatchResponse {
-    let w = match wallet(c) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let s = match session(c) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    stop(&w, &s)
+    read_session(&SessionOwner::scope(c, &w), &s)
 }
 pub fn route_operation(c: &Ctx) -> DispatchResponse {
     let w = match wallet(c) {
@@ -3000,7 +3066,7 @@ pub fn route_operation(c: &Ctx) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    read_operation(&w, &s, &o)
+    read_operation(&SessionOwner::scope(c, &w), &s, &o)
 }
 pub fn static_list(e: &[(&str, bool, bool)]) -> Vec<petal::RouteChild> {
     e.iter()
@@ -3019,24 +3085,6 @@ pub fn static_list(e: &[(&str, bool, bool)]) -> Vec<petal::RouteChild> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn message_template_allows_only_the_recent_blockhash_to_change() {
-        let mut first = vec![0x80, 1, 0, 0, 1];
-        first.extend_from_slice(&[7; 32]);
-        first.extend_from_slice(&[8; 32]);
-        first.extend_from_slice(&[0, 0]);
-        let mut refreshed = first.clone();
-        refreshed[37..69].fill(9);
-        assert_eq!(
-            message_template_sha256(&first).unwrap(),
-            message_template_sha256(&refreshed).unwrap()
-        );
-        refreshed[5] ^= 1;
-        assert_ne!(
-            message_template_sha256(&first).unwrap(),
-            message_template_sha256(&refreshed).unwrap()
-        );
-    }
     const USER: &str = "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7";
     const BOND_MINT: &str = "C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump";
     const AMM_MINT: &str = "H3m3TD2mwmU5zkUTHRDoLU7RdxbWp6BEgoQa3s9wpump";
@@ -3076,16 +3124,43 @@ mod tests {
     }
 
     #[test]
-    fn keys() {
-        assert!(pk(SOL).is_ok());
-        assert!(PROGRAMS.iter().all(|p| pk(p).is_ok()));
-        assert!(pk("bad").is_err())
-    }
-    #[test]
-    fn ids() {
-        assert!(ident("op-1", "id").is_ok());
-        assert!(ident("../x", "id").is_err());
-        assert!(ident("..", "id").is_err())
+    fn the_same_session_id_on_two_accounts_yields_two_slots() {
+        let legacy = SessionOwner {
+            wallet: WALLET.to_owned(),
+            account: None,
+        };
+        let one = SessionOwner {
+            wallet: WALLET.to_owned(),
+            account: Some((1, "a".repeat(64))),
+        };
+        let two = SessionOwner {
+            wallet: WALLET.to_owned(),
+            account: Some((2, "b".repeat(64))),
+        };
+        fn slot(owner: &SessionOwner, id: &str) -> String {
+            let mut input = id.as_bytes().to_vec();
+            input.push(0);
+            if let Some(fingerprint) = owner.key_slot_owner() {
+                input.extend_from_slice(fingerprint.as_bytes());
+                input.push(0);
+            }
+            format!("pumpfun-{}", &hex::encode(Sha256::digest(&input))[..40])
+        }
+        assert_ne!(slot(&legacy, "agent-1"), slot(&one, "agent-1"));
+        assert_ne!(slot(&one, "agent-1"), slot(&two, "agent-1"));
+        assert_eq!(
+            sk(&one, "agent-1", "session.json"),
+            format!("state/sessions/{}/agent-1/session.json", "a".repeat(64))
+        );
+        assert_eq!(sk_legacy(&one, "agent-1", "session.json"), None);
+        let zero = SessionOwner {
+            wallet: WALLET.to_owned(),
+            account: Some((0, "c".repeat(64))),
+        };
+        assert_eq!(
+            sk_legacy(&zero, "agent-1", "session.json"),
+            Some(format!("state/sessions/{WALLET}/agent-1/session.json"))
+        );
     }
     #[test]
     fn recovery_actions_request_exact_signing() {
@@ -3100,6 +3175,18 @@ mod tests {
         ] {
             assert_eq!(a.selector(), SignSelector::Reusable);
         }
+    }
+    #[test]
+    fn keys() {
+        assert!(pk(SOL).is_ok());
+        assert!(PROGRAMS.iter().all(|p| pk(p).is_ok()));
+        assert!(pk("bad").is_err())
+    }
+    #[test]
+    fn ids() {
+        assert!(ident("op-1", "id").is_ok());
+        assert!(ident("../x", "id").is_err());
+        assert!(ident("..", "id").is_err())
     }
     #[test]
     fn current_pump_builder_transactions_pass_policy() {
@@ -3365,12 +3452,928 @@ mod tests {
             id: "session".into(),
             address: USER.into(),
             duration_ms: 60_000,
+            approval_value_limits: Vec::new(),
             created_ms: 1,
             expires_ms: 60_001,
             stopped: false,
         };
         let encoded = serde_json::to_value(session).expect("serialize session");
         assert!(encoded.get("key_ref_jcs").is_none());
+    }
+
+    // --- route-to-host tests --------------------------------------------
+    //
+    // These run a real route flow against the recording fake host in
+    // `fake_host`, so they observe the requests that actually leave the Petal
+    // rather than searching the source for strings.
+
+    use crate::fake_host::{self, FakeHost};
+    use petal::{HostStatus, RouteIdentity};
+
+    const WALLET: &str = "main";
+
+    fn legacy_owner() -> SessionOwner {
+        SessionOwner {
+            wallet: WALLET.to_owned(),
+            account: None,
+        }
+    }
+    const SESSION: &str = "agent-1";
+    const NOW_MS: u64 = 1_757_000_000_000;
+    const SWAP_URL: &str = "https://fun-block.pump.fun/agents/swap";
+    const PROBE_URL: &str = "https://fun-block.pump.fun/agents/create-coin";
+
+    struct TestRoute;
+    impl RouteIdentity for TestRoute {
+        const PATH: &'static str = "sessions/[wallet]/sessions/[session]/buy.json";
+        const CANONICAL_PATH: &'static str = "sessions/[wallet]/sessions/[session]/buy.json";
+        const PARAMS: &'static [(&'static str, usize)] = &[];
+    }
+
+    fn ctx(params: &[(&str, &str)]) -> Ctx {
+        Ctx::bind::<TestRoute>(petal::RawCtx {
+            petal_root: "/petals/pumpfun".into(),
+            package_hash: "pumpfun-test-package".into(),
+            path: "sessions/main/sessions/agent-1/buy.json".into(),
+            params: params
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            actor: None,
+        })
+    }
+
+    fn live_session() -> Session {
+        Session {
+            schema: "bloom.pumpfun_session.v1".into(),
+            wallet: WALLET.into(),
+            id: SESSION.into(),
+            address: USER.into(),
+            duration_ms: 3_600_000,
+            approval_value_limits: Vec::new(),
+            created_ms: NOW_MS,
+            expires_ms: NOW_MS + 3_600_000,
+            stopped: false,
+        }
+    }
+
+    fn test_signature() -> Vec<u8> {
+        vec![7u8; 64]
+    }
+
+    fn test_signature_base58() -> String {
+        bs58::encode(test_signature()).into_string()
+    }
+
+    /// A fake host holding a live session and able to serve one whole buy:
+    /// builder quote, fee quote, successful simulation, accepted broadcast.
+    fn host_serving_a_buy() -> FakeHost {
+        let mut host = FakeHost::new(NOW_MS);
+        host.seed_state(
+            &sk(&legacy_owner(), SESSION, "session.json"),
+            &live_session(),
+        );
+        host.seed_secret(
+            &session_sec(&legacy_owner(), SESSION),
+            &SessionSecret {
+                key_ref_jcs: br#"{"public_key_fingerprint":"test-fingerprint"}"#.to_vec(),
+            },
+        );
+        host.reply(SWAP_URL, fixture("buy_bond"));
+        host.reply(
+            &format!("{RPC} getFeeForMessage"),
+            json!({"result":{"value":5_000}}),
+        );
+        host.reply(
+            &format!("{RPC} simulateTransaction"),
+            json!({"result":{"value":{"err":null}}}),
+        );
+        let accepted = json!({ "result": test_signature_base58() });
+        host.reply(&format!("{RPC} sendTransaction"), accepted.clone());
+        host.reply(&format!("{JITO} sendTransaction"), accepted);
+        host
+    }
+
+    fn buy_body(operation: &str, protected: bool) -> Vec<u8> {
+        let mut request = json!({
+            "operationId": operation,
+            "mint": BOND_MINT,
+            "amount": "1000000",
+            "minOutputAmount": "1",
+            "slippagePct": 2,
+        });
+        if protected {
+            request["frontRunningProtection"] = json!(true);
+        }
+        serde_json::to_vec(&request).expect("request serializes")
+    }
+
+    fn run_buy(operation: &str, protected: bool) -> DispatchResponse {
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_BUY")]),
+            Action::Buy,
+            legacy_owner(),
+            SESSION.into(),
+            &buy_body(operation, protected),
+        )
+    }
+
+    fn public_operation(operation: &str) -> Value {
+        fake_host::with(|host| {
+            host.state_json(&sk(
+                &legacy_owner(),
+                SESSION,
+                &format!("operations/{operation}.json"),
+            ))
+            .expect("operation projection was published")
+        })
+    }
+
+    #[test]
+    fn a_buy_reaches_the_host_as_an_ordinary_send_transaction() {
+        fake_host::install(host_serving_a_buy());
+        let response = run_buy("buy-1", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+
+        fake_host::with(|host| {
+            assert!(
+                !host.rpc_methods().contains(&"bloomPumpfunCanaryStatus"),
+                "the Petal must not ask any host for a canary status: {:?}",
+                host.rpc_methods()
+            );
+            let sends = host.calls_for("sendTransaction");
+            assert_eq!(sends.len(), 1, "exactly one broadcast attempt");
+            let send = sends[0];
+            assert_eq!(send.url, RPC, "an unprotected buy uses the public RPC");
+            assert_eq!(send.method, "POST");
+            assert_eq!(
+                send.body.get("jsonrpc").and_then(Value::as_str),
+                Some("2.0")
+            );
+            assert!(
+                send.body.get("bloom_canary").is_none(),
+                "sendTransaction must be a standard JSON-RPC request: {}",
+                send.body
+            );
+            assert_eq!(
+                send.body
+                    .as_object()
+                    .expect("request object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![
+                    "id".to_string(),
+                    "jsonrpc".into(),
+                    "method".into(),
+                    "params".into()
+                ]
+            );
+            let params = send.rpc_params().expect("params");
+            assert!(
+                params[0].as_str().is_some_and(|tx| !tx.is_empty()),
+                "the signed transaction is the first parameter"
+            );
+            assert_eq!(params[1]["encoding"], json!("base64"));
+            assert_eq!(params[1]["skipPreflight"], json!(false));
+        });
+
+        assert_eq!(public_operation("buy-1")["status"], json!("submitted"));
+        assert_eq!(
+            public_operation("buy-1")["signature"],
+            json!(test_signature_base58())
+        );
+    }
+
+    #[test]
+    fn a_protected_buy_is_sent_to_jito_as_the_same_standard_request() {
+        fake_host::install(host_serving_a_buy());
+        let response = run_buy("buy-jito", true);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+
+        fake_host::with(|host| {
+            let sends = host.calls_for("sendTransaction");
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].url, JITO);
+            assert!(sends[0].body.get("bloom_canary").is_none());
+            assert!(!host.rpc_methods().contains(&"bloomPumpfunCanaryStatus"));
+        });
+    }
+
+    #[test]
+    fn a_refused_signature_never_reaches_the_network() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Denied)));
+        fake_host::install(host);
+
+        let response = run_buy("buy-denied", false);
+        assert!(
+            matches!(response, DispatchResponse::Error { code: -2, .. }),
+            "a refused signature is a denial: {response:?}"
+        );
+
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("sendTransaction").is_empty(),
+                "nothing may be broadcast when signing was refused"
+            );
+            assert!(host.calls_for("simulateTransaction").is_empty());
+        });
+        assert_eq!(
+            public_operation("buy-denied")["status"],
+            json!("approval_failed")
+        );
+        assert_eq!(public_operation("buy-denied")["signature"], Value::Null);
+    }
+
+    #[test]
+    fn a_pending_approval_records_the_action_and_broadcasts_nothing() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "action-42".into(),
+            expires_ms: NOW_MS + 600_000,
+        }));
+        fake_host::install(host);
+
+        let response = run_buy("buy-pending", false);
+        let message = dispatch_message(&response);
+        assert!(
+            message.contains("approval required") && message.contains("action-42"),
+            "{message}"
+        );
+
+        fake_host::with(|host| {
+            assert!(host.calls_for("sendTransaction").is_empty());
+            let pending = host
+                .secret_json(&sec(&legacy_owner(), SESSION, "buy-pending"))
+                .expect("pending operation stored");
+            assert_eq!(pending["status"], json!("approval_pending"));
+            assert_eq!(pending["approval"], json!("action-42"));
+        });
+        assert_eq!(
+            public_operation("buy-pending")["status"],
+            json!("approval_pending")
+        );
+    }
+
+    #[test]
+    fn a_failed_simulation_never_broadcasts_and_the_same_request_can_be_retried() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} simulateTransaction"),
+            json!({"result":{"value":{"err":{"InstructionError":[0,{"Custom":1}]}}}}),
+        );
+        fake_host::install(host);
+
+        let first = run_buy("buy-retry", false);
+        assert!(
+            dispatch_message(&first).contains("simulation failed"),
+            "{}",
+            dispatch_message(&first)
+        );
+        fake_host::with(|host| {
+            assert!(host.calls_for("sendTransaction").is_empty());
+        });
+        assert_eq!(
+            public_operation("buy-retry")["status"],
+            json!("simulation_failed")
+        );
+
+        // The same operation id and the same request rebuild and go through
+        // once the cluster stops rejecting the transaction.
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":null}}}),
+            );
+        });
+        let second = run_buy("buy-retry", false);
+        assert_eq!(
+            second,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&second)
+        );
+        assert_eq!(
+            public_operation("buy-retry")["status"],
+            json!("submitted"),
+            "a safe pre-broadcast retry completes under the same operation id"
+        );
+        fake_host::with(|host| {
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    #[test]
+    fn the_same_operation_id_with_changed_economics_is_refused() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-bound", false), DispatchResponse::Write);
+
+        let changed = serde_json::to_vec(&json!({
+            "operationId":"buy-bound",
+            "mint":BOND_MINT,
+            "amount":"2000000",
+            "minOutputAmount":"1",
+            "slippagePct":2,
+        }))
+        .expect("request serializes");
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_BUY")]),
+            Action::Buy,
+            legacy_owner(),
+            SESSION.into(),
+            &changed,
+        );
+        assert!(
+            dispatch_message(&response).contains("operationId already bound"),
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| {
+            assert_eq!(
+                host.calls_for("sendTransaction").len(),
+                1,
+                "a changed request under a used id must not produce a second payment"
+            );
+        });
+    }
+
+    #[test]
+    fn a_recorded_broadcast_is_never_rebuilt_into_a_second_payment() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-once", false), DispatchResponse::Write);
+
+        // Replaying the identical write — the shape a retry after a lost
+        // response takes — must reconcile the recorded attempt, not build and
+        // sign a second transaction.
+        assert_eq!(run_buy("buy-once", false), DispatchResponse::Write);
+        assert_eq!(run_buy("buy-once", false), DispatchResponse::Write);
+
+        fake_host::with(|host| {
+            assert_eq!(
+                host.calls_for("sendTransaction").len(),
+                1,
+                "one economic intent, one broadcast"
+            );
+            assert_eq!(
+                host.sign_requests.len(),
+                1,
+                "a settled operation must not be signed again"
+            );
+        });
+    }
+
+    #[test]
+    fn signing_asks_for_the_session_key_under_its_reusable_grant() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-claim", false), DispatchResponse::Write);
+
+        fake_host::with(|host| {
+            let request = host.sign_requests.first().expect("one signing request");
+            assert_eq!(request.wallet, WALLET);
+            assert_eq!(request.operation_class, "pumpfun.buy");
+            assert_eq!(request.signature_algorithm, "ed25519-message");
+            assert!(
+                matches!(request.selector, SignSelector::Reusable),
+                "Pump.fun signs under the session's reusable grant"
+            );
+            assert!(
+                request.key_ref_jcs.is_some(),
+                "the scoped session key must be named explicitly"
+            );
+            let claim: Value =
+                serde_json::from_slice(&request.petal_use_claim_jcs).expect("claim is JSON");
+            // bloom-rpc-wire RequestNonce is 16 bytes encoded as lowercase
+            // hex. A 32-byte digest is valid JSON but the real host rejects it
+            // before Broker signing; the recording host alone cannot catch it.
+            let nonce = claim["nonce"].as_str().expect("claim nonce is a string");
+            assert_eq!(hex::decode(nonce).expect("hex nonce").len(), 16);
+            assert_eq!(nonce, nonce.to_ascii_lowercase());
+            assert_eq!(claim["operation_class"], json!("pumpfun.buy"));
+            assert_eq!(claim["route"], json!("ROUTE_BUY"));
+            assert_eq!(claim["package_hash"], json!("pumpfun-test-package"));
+            assert!(
+                claim["declared_debits"]
+                    .as_array()
+                    .is_some_and(|debits| !debits.is_empty()),
+                "the claim must declare what the transaction spends"
+            );
+        });
+    }
+
+    #[test]
+    fn a_session_requires_explicit_positive_asset_budgets() {
+        fake_host::install(FakeHost::new(NOW_MS));
+        for body in [
+            json!({"id":"agent-1"}),
+            json!({"id":"agent-1","max_lamports":"0"}),
+            json!({"id":"agent-1","max_lamports":"-1"}),
+            json!({"id":"agent-1","max_lamports":"18446744073709551616"}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{"invalid":"1"}}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{"native":"1"}}),
+            json!({"id":"agent-1","max_lamports":"1","token_limits":{USER:"0"}}),
+        ] {
+            assert_ne!(
+                new_session(legacy_owner(), &serde_json::to_vec(&body).unwrap()),
+                DispatchResponse::Write
+            );
+        }
+        fake_host::with(|host| assert!(host.key_requests.is_empty()));
+    }
+
+    #[test]
+    fn a_pending_key_ceremony_creates_no_session_and_no_deadline() {
+        let mut host = FakeHost::new(NOW_MS);
+        host.derivation(Ok(petal::PetalKeyOutcome::Pending {
+            operation_id: "key-op-1".into(),
+            scope_digest: "scope-digest-1".into(),
+        }));
+        fake_host::install(host);
+
+        let response = new_session(
+            legacy_owner(),
+            br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#,
+        );
+        let message = dispatch_message(&response);
+        assert!(
+            message.contains("key approval required") && message.contains("key-op-1"),
+            "{message}"
+        );
+        fake_host::with(|host| {
+            assert!(
+                host.state_json(&sk(&legacy_owner(), SESSION, "session.json"))
+                    .is_none(),
+                "a session must not exist before its key does"
+            );
+            assert!(
+                host.secret_json(&session_sec(&legacy_owner(), SESSION))
+                    .is_none()
+            );
+            assert_eq!(
+                host.key_requests[0]["approval_value_limits"],
+                json!([
+                    {"asset":{"chain":"solana","asset":"native"},
+                     "lifetime":"20000000","rolling_windows":[]}
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn a_session_deadline_is_the_lifetime_this_petal_asked_for() {
+        // The pinned SDK's `PetalKeyOutcome::Ready` carries no expiry, so the
+        // Petal can only record `now + requested lifetime`. When the ceremony
+        // takes a while, the Signer's grant is already older than that. This
+        // test pins the current behaviour so the gap is visible; preflight
+        // reports it as an operator check rather than pretending otherwise.
+        let derive_completed_ms = NOW_MS + 900_000;
+        let mut host = FakeHost::new(derive_completed_ms);
+        host.derivation(Ok(petal::PetalKeyOutcome::Ready {
+            operation_id: "key-op-2".into(),
+            scope_digest: "scope-digest-2".into(),
+            key_ref_jcs: br#"{"public_key_fingerprint":"test-fingerprint"}"#.to_vec(),
+            addresses: vec![USER.into()],
+        }));
+        fake_host::install(host);
+
+        let response = new_session(
+            legacy_owner(),
+            br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#,
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+
+        let stored = fake_host::with(|host| {
+            host.state_json(&sk(&legacy_owner(), SESSION, "session.json"))
+                .expect("session recorded")
+        });
+        assert_ne!(
+            new_session(
+                legacy_owner(),
+                br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000001"}"#
+            ),
+            DispatchResponse::Write,
+            "a retry cannot increase the session budget"
+        );
+        fake_host::with(|host| assert_eq!(host.key_requests.len(), 1));
+        assert_eq!(stored["approval_value_limits"][0]["lifetime"], "20000000");
+        assert_eq!(stored["address"], json!(USER));
+        assert_eq!(stored["created_ms"], json!(derive_completed_ms));
+        assert_eq!(
+            stored["expires_ms"],
+            json!(derive_completed_ms + 3_600_000),
+            "the recorded deadline starts when the ceremony finished, not when it began"
+        );
+        assert!(
+            stored.get("key_ref_jcs").is_none(),
+            "the signing reference must stay out of the readable record"
+        );
+        fake_host::with(|host| {
+            assert!(
+                host.secret_json(&session_sec(&legacy_owner(), SESSION))
+                    .is_some(),
+                "the signing reference belongs in the secret namespace"
+            );
+        });
+    }
+
+    /// Which host error classes may rebuild a payment, and which may not.
+    ///
+    /// The host collapses a whole Broker error registry into these few
+    /// classes, so this is the entire contract the retry logic above rests on.
+    /// The Machine's `petal_signing_host_error` is the other half: it sends
+    /// `denied` only for a Broker failure that can never be retried and left
+    /// no durable effect, and `backend` for everything less certain —
+    /// `AMBIGUOUS_PROVIDER_EFFECT`, `SERVICE_UNAVAILABLE`,
+    /// `OPERATION_ID_CONFLICT`, rate limits, clock faults. If that mapping
+    /// ever widens `denied`, this test still passes and the Petal starts
+    /// rebuilding payments whose signing outcome is unknown, so the two have
+    /// to be changed together.
+    #[test]
+    fn route_to_host_contract() {
+        for (index, (class, expected)) in [
+            // The Broker decided against this message. Nothing was signed.
+            (HostStatus::Denied, "approval_failed"),
+            // The host refused it before the Broker ever saw it.
+            (HostStatus::Invalid, "approval_failed"),
+            // A fault. The Signer may hold a signature over this message.
+            (HostStatus::Backend, "signing_uncertain"),
+            (HostStatus::NotFound, "signing_uncertain"),
+            (
+                HostStatus::BufferTooSmall { needed: 1 },
+                "signing_uncertain",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let operation = format!("buy-class-{index}");
+            let mut host = host_serving_a_buy();
+            host.sign_outcome(Err(SdkError::Host(class.clone())));
+            fake_host::install(host);
+
+            let response = run_buy(&operation, false);
+            assert!(
+                matches!(response, DispatchResponse::Error { .. }),
+                "{class:?} did not sign: {response:?}"
+            );
+            assert_eq!(
+                public_operation(&operation)["status"],
+                json!(expected),
+                "host class {class:?}"
+            );
+            fake_host::with(|host| {
+                assert!(
+                    host.calls_for("sendTransaction").is_empty(),
+                    "{class:?} must not broadcast"
+                );
+            });
+        }
+    }
+
+    /// The exact case the contract above exists for: a Broker outcome that may
+    /// already have produced a signature reaches the guest as a backend fault,
+    /// and the Petal must keep the message rather than quote a new one.
+    #[test]
+    fn an_ambiguous_broker_outcome_keeps_the_message_and_the_approval() {
+        let mut host = host_serving_a_buy();
+        // What the Machine sends for AMBIGUOUS_PROVIDER_EFFECT.
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        fake_host::install(host);
+
+        let response = run_buy("buy-ambiguous", false);
+        assert!(matches!(response, DispatchResponse::Error { .. }));
+
+        let staged = fake_host::with(|host| {
+            assert_eq!(
+                host.calls
+                    .iter()
+                    .filter(|call| call.url == SWAP_URL)
+                    .count(),
+                1,
+                "an unknown outcome must not ask the builder for a fresh quote"
+            );
+            assert!(host.calls_for("sendTransaction").is_empty());
+            host.secret_json(&sec(&legacy_owner(), SESSION, "buy-ambiguous"))
+                .expect("pending operation stored")
+        });
+        assert_eq!(staged["status"], json!("signing_uncertain"));
+        assert_eq!(
+            public_operation("buy-ambiguous")["status"],
+            json!("signing_uncertain")
+        );
+    }
+
+    #[test]
+    fn a_lost_signing_response_is_recorded_as_uncertain_not_as_a_refusal() {
+        let mut host = host_serving_a_buy();
+        // The Signer may or may not have signed; the answer never came back.
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        fake_host::install(host);
+
+        let response = run_buy("buy-lost", false);
+        let message = dispatch_message(&response);
+        assert!(
+            message.contains("may already have produced a signature"),
+            "an unknown signing outcome must be reported as unknown: {message}"
+        );
+
+        fake_host::with(|host| {
+            assert!(host.calls_for("sendTransaction").is_empty());
+            assert_eq!(host.sign_requests.len(), 1);
+        });
+        assert_eq!(
+            public_operation("buy-lost")["status"],
+            json!("signing_uncertain"),
+            "an unknown outcome must not be published as a refusal"
+        );
+    }
+
+    #[test]
+    fn retrying_an_uncertain_signature_reuses_the_same_message_and_approval() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        fake_host::install(host);
+
+        assert!(matches!(
+            run_buy("buy-recover", false),
+            DispatchResponse::Error { .. }
+        ));
+        let staged = fake_host::with(|host| {
+            host.secret_json(&sec(&legacy_owner(), SESSION, "buy-recover"))
+                .expect("pending operation stored")
+        });
+
+        // Restart shape: the same request under the same operation id.
+        let response = run_buy("buy-recover", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2, "the retry re-enters signing");
+            let (first, second) = (&host.sign_requests[0], &host.sign_requests[1]);
+            assert_eq!(
+                first.preimage, second.preimage,
+                "the retry must ask for a signature over the same message, not a new payment"
+            );
+            assert_eq!(first.claimed_hash, second.claimed_hash);
+            assert_eq!(first.petal_use_claim_jcs, second.petal_use_claim_jcs);
+            assert_eq!(
+                host.calls
+                    .iter()
+                    .filter(|call| call.url == SWAP_URL)
+                    .count(),
+                1,
+                "the builder must not be asked to quote a second transaction"
+            );
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+
+        let settled = fake_host::with(|host| {
+            host.secret_json(&sec(&legacy_owner(), SESSION, "buy-recover"))
+                .expect("pending operation stored")
+        });
+        assert_eq!(
+            staged["digest"], settled["digest"],
+            "the economic intent is unchanged across the recovery"
+        );
+        assert_eq!(staged["message_sha256"], settled["message_sha256"]);
+        assert_eq!(
+            public_operation("buy-recover")["status"],
+            json!("submitted")
+        );
+    }
+
+    #[test]
+    fn a_definite_refusal_starts_a_fresh_approval_for_the_same_intent() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Denied)));
+        fake_host::install(host);
+
+        assert!(matches!(
+            run_buy("buy-refused", false),
+            DispatchResponse::Error { code: -2, .. }
+        ));
+        let refused = fake_host::with(|host| {
+            host.secret_json(&sec(&legacy_owner(), SESSION, "buy-refused"))
+                .expect("pending operation stored")
+        });
+        assert_eq!(refused["approval"], Value::Null, "the hint is dropped");
+
+        let response = run_buy("buy-refused", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let settled = fake_host::with(|host| {
+            host.secret_json(&sec(&legacy_owner(), SESSION, "buy-refused"))
+                .expect("pending operation stored")
+        });
+        assert_eq!(
+            refused["digest"], settled["digest"],
+            "a refusal does not change the economic intent that is retried"
+        );
+        fake_host::with(|host| {
+            assert!(
+                host.sign_requests[1].approval_hint.is_none(),
+                "a refused operation asks for a new approval, not the dead one"
+            );
+        });
+    }
+
+    #[test]
+    fn a_crash_before_the_durable_broadcast_record_never_broadcasts() {
+        let mut host = host_serving_a_buy();
+        // Let the two writes that stage the operation land, then fail the
+        // write that records the broadcast attempt. The send must not happen.
+        host.fail_store_after = Some(2);
+        fake_host::install(host);
+
+        let response = run_buy("buy-crash", false);
+        assert!(
+            matches!(response, DispatchResponse::Error { .. }),
+            "a store failure must surface, not be swallowed: {response:?}"
+        );
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("sendTransaction").is_empty(),
+                "a broadcast may not precede its durable record"
+            );
+        });
+    }
+
+    #[test]
+    fn a_submitted_operation_polls_to_a_definite_chain_outcome() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-poll", false), DispatchResponse::Write);
+
+        // A lost status response leaves the recorded attempt alone.
+        fake_host::with(|host| {
+            host.reply(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"error":{"code":-32000,"message":"node behind"}}),
+            );
+        });
+        let _ = read_operation(&legacy_owner(), SESSION, "buy-poll");
+        assert_eq!(
+            public_operation("buy-poll")["status"],
+            json!("submitted"),
+            "a lost status response cannot unwind a recorded submission"
+        );
+
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"result":{"value":[{"err":null,"confirmationStatus":"finalized"}]}}),
+            );
+        });
+        let _ = read_operation(&legacy_owner(), SESSION, "buy-poll");
+        assert_eq!(public_operation("buy-poll")["status"], json!("finalized"));
+
+        fake_host::with(|host| {
+            assert_eq!(
+                host.calls_for("sendTransaction").len(),
+                1,
+                "polling never re-broadcasts"
+            );
+        });
+    }
+
+    #[test]
+    fn an_expired_session_cannot_sign_or_broadcast() {
+        let mut host = host_serving_a_buy();
+        let mut expired = live_session();
+        expired.expires_ms = NOW_MS - 1;
+        host.seed_state(&sk(&legacy_owner(), SESSION, "session.json"), &expired);
+        fake_host::install(host);
+
+        let response = run_buy("buy-expired", false);
+        assert!(
+            matches!(response, DispatchResponse::Error { code: -2, .. }),
+            "{response:?}"
+        );
+        fake_host::with(|host| {
+            assert!(host.sign_requests.is_empty());
+            assert!(host.calls_for("sendTransaction").is_empty());
+        });
+    }
+
+    #[test]
+    fn preflight_reports_what_it_cannot_check_separately_from_what_failed() {
+        let mut host = FakeHost::new(NOW_MS);
+        host.seed_state(
+            &sk(&legacy_owner(), SESSION, "session.json"),
+            &live_session(),
+        );
+        host.reply(
+            &format!("{RPC_VERIFY} getGenesisHash"),
+            json!({ "result": MAINNET_BETA_GENESIS_BASE58 }),
+        );
+        host.reply(PROBE_URL, json!({"statusCode":400,"message":"invalid"}));
+        fake_host::install(host);
+
+        let response = preflight(
+            &ctx(&[("wallet", WALLET), ("session", SESSION)]),
+            WALLET.into(),
+        );
+        let DispatchResponse::Read(body) = response else {
+            panic!("preflight is a read: {response:?}");
+        };
+        let body: Value = serde_json::from_slice(&body).expect("preflight body is JSON");
+
+        assert_eq!(
+            body["blockers"],
+            json!([]),
+            "every check the Petal actually ran passed"
+        );
+        assert_eq!(body["ok"], json!(true));
+
+        let operator_checks = body["operator_checks"]
+            .as_array()
+            .expect("operator_checks array");
+        let names: Vec<&str> = operator_checks
+            .iter()
+            .filter_map(|check| check["operator_check"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"wallet_policy_lists_session_address"),
+            "the unverifiable wallet-policy fact is an operator check, not a blocker: {names:?}"
+        );
+        assert!(names.contains(&"signing_scope_deadline_is_host_side"));
+        assert!(
+            names.contains(&"wallet_policy_lists_cycle_destinations"),
+            "the exit and the protocol programs need policy entries too, not just funding: {names:?}"
+        );
+        let destinations = operator_checks
+            .iter()
+            .find(|check| {
+                check["operator_check"] == json!("wallet_policy_lists_cycle_destinations")
+            })
+            .expect("the destination check");
+        for program in &PROGRAMS[5..] {
+            assert!(
+                destinations["required_for_trading"]
+                    .as_array()
+                    .expect("program list")
+                    .contains(&json!(program)),
+                "{program} is declared by a write and must be named"
+            );
+        }
+        assert_eq!(
+            operator_checks[0]["session_address"],
+            json!(USER),
+            "the operator is told exactly which address to look for"
+        );
+
+        fake_host::with(|host| {
+            assert!(
+                !host.rpc_methods().contains(&"bloomPumpfunCanaryStatus"),
+                "preflight must not probe for a removed host method: {:?}",
+                host.rpc_methods()
+            );
+        });
+    }
+
+    #[test]
+    fn preflight_still_fails_closed_on_the_facts_it_can_check() {
+        let mut host = FakeHost::new(NOW_MS);
+        host.reply(
+            &format!("{RPC_VERIFY} getGenesisHash"),
+            json!({"result":"4ufDAAhSoL5kzi9QRyKscye3wV3RGQ9VQjm7jZyVu1pV"}),
+        );
+        host.reply(PROBE_URL, json!({"statusCode":400}));
+        fake_host::install(host);
+
+        let response = preflight(&ctx(&[("wallet", WALLET)]), WALLET.into());
+        let DispatchResponse::Read(body) = response else {
+            panic!("preflight is a read: {response:?}");
+        };
+        let body: Value = serde_json::from_slice(&body).expect("preflight body is JSON");
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(
+            body["blockers"][0]["blocker"],
+            json!("rpc_genesis_mismatch")
+        );
     }
 
     #[test]
@@ -3385,16 +4388,6 @@ mod tests {
     }
 
     #[test]
-    fn preflight_blocker_shape_matches_documented_acceptance_criteria() {
-        // The structured blocker schema is the contract the operator and
-        // any review tooling reads. Keep its keys stable across changes.
-        let blocker = json!({"blocker":"mainnet_broadcast_posture_unconfirmed","detail":"..."});
-        let v: Value = serde_json::from_value(blocker.clone()).unwrap();
-        assert_eq!(v["blocker"], "mainnet_broadcast_posture_unconfirmed");
-        assert!(v["detail"].is_string());
-    }
-
-    #[test]
     fn builder_probe_accepts_only_success_or_validation_responses() {
         for status in [200, 204, 299, 400, 422] {
             assert!(builder_probe_status_reachable(status), "{status}");
@@ -3402,15 +4395,5 @@ mod tests {
         for status in [300, 401, 403, 404, 429, 500, 503] {
             assert!(!builder_probe_status_reachable(status), "{status}");
         }
-    }
-
-    #[test]
-    fn preflight_genesis_mismatch_is_blocked_not_passed_through() {
-        let expected = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
-        // Sanity: the constant matches the canonical mainnet-beta genesis.
-        assert_eq!(MAINNET_BETA_GENESIS_BASE58, expected);
-        // An arbitrary non-mainnet hash must classify as Mismatch, not Ok.
-        let arbitrary = "4ufDAAhSoL5kzi9QRyKscye3wV3RGQ9VQjm7jZyVu1pV";
-        assert_ne!(MAINNET_BETA_GENESIS_BASE58, arbitrary);
     }
 }
