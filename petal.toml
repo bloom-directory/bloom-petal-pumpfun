@@ -9,6 +9,9 @@ repository = "bloom-directory/bloom-petal-pumpfun"
 command = "scripts/build.sh"
 outputs = ["petal/pumpfun"]
 
+[account]
+aware = true
+
 [consent]
 summary = "Inspect Pump.fun coins; create and trade coins; collect fees or cashback; and manage fee sharing with a scoped Bloom Solana key."
 
