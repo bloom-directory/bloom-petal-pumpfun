@@ -1671,9 +1671,8 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     let mut session_block: Option<Value> = None;
     if let Some(sid) = session_id.as_deref() {
         match ident(sid, "session") {
-            Ok(_) => {
-                let key = SessionOwner::scope(c, &w).map(|owner| sk(&owner, sid, "session.json"));
-                match key.and_then(|key| get::<Session>(&key)) {
+            Ok(_) => match SessionOwner::scope(c, &w) {
+                Ok(owner) => match get::<Session>(&sk(&owner, sid, "session.json")) {
                     Ok(Some(s)) => {
                         let expired = s.expires_ms <= now || s.stopped;
                         session_block = Some(json!({
@@ -1688,10 +1687,10 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
                         }));
                         if expired {
                             blockers.push(json!({
-                                "blocker":"session_expired",
-                                "session":sid,
-                                "detail":"named session is stopped or past its expiry; start a new session"
-                            }));
+                                    "blocker":"session_expired",
+                                    "session":sid,
+                                    "detail":"named session is stopped or past its expiry; start a new session"
+                                }));
                         }
                     }
                     Ok(None) => {
@@ -1708,8 +1707,15 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
                             "detail":format!("session store error: {}", dispatch_message(&e))
                         }));
                     }
+                },
+                Err(e) => {
+                    blockers.push(json!({
+                        "blocker":"session_scope_invalid",
+                        "session":sid,
+                        "detail":dispatch_message(&e)
+                    }));
                 }
-            }
+            },
             Err(e) => {
                 blockers.push(json!({
                     "blocker":"invalid_session_id",
@@ -4401,6 +4407,40 @@ mod tests {
         assert_eq!(
             body["blockers"][0]["blocker"],
             json!("rpc_genesis_mismatch")
+        );
+    }
+
+    #[test]
+    fn preflight_labels_a_bad_session_scope_as_a_scope_blocker() {
+        let mut host = FakeHost::new(NOW_MS);
+        host.reply(
+            &format!("{RPC_VERIFY} getGenesisHash"),
+            json!({ "result": MAINNET_BETA_GENESIS_BASE58 }),
+        );
+        host.reply(PROBE_URL, json!({"statusCode":200}));
+        fake_host::install(host);
+
+        let response = preflight(
+            &ctx(&[
+                ("wallet", WALLET),
+                ("session", SESSION),
+                ("bloom.wallet", "other"),
+                ("bloom.account", "1"),
+            ]),
+            WALLET.into(),
+        );
+        let DispatchResponse::Read(body) = response else {
+            panic!("preflight is a read: {response:?}");
+        };
+        let body: Value = serde_json::from_slice(&body).expect("preflight body is JSON");
+        assert_eq!(
+            body["blockers"],
+            json!([{
+                "blocker": "session_scope_invalid",
+                "session": SESSION,
+                "detail": format!("session wallet {WALLET:?} is not the mounted wallet {:?}", "other")
+            }]),
+            "a dispatch naming another wallet's tree is a scope mistake, not a store failure"
         );
     }
 
