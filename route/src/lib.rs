@@ -181,62 +181,91 @@ fn pk(s: &str) -> Result<[u8; 32], String> {
         .try_into()
         .map_err(|_| "pubkey is not 32 bytes".to_string())
 }
-/// Where a session's records live and its key slot derives from. A dispatch
-/// under `wallets/<w>/<n>/petals/` scopes records and the slot to the
-/// mounted account's owner fingerprint; account 0 falls back to the legacy
-/// wallet-scoped records. The flat mount keeps the wallet records.
-#[derive(Clone, Debug)]
+/// Which account a session belongs to: where its records live and which key
+/// slot it derives. The flat `/petals/…` mount and `wallets/<w>/0/petals/…`
+/// are the same owner and share the wallet-scoped records and slots. A
+/// numbered account `n > 0` keeps its own record tree and hashes `n` into its
+/// slot, so one session id on two accounts is two sessions with two keys.
+///
+/// The scope is the account number because Bloom injects `bloom.account` on
+/// every account-mounted route, whereas `bloom.owner_key_fingerprint` is
+/// omitted from routes that derive no key when the account holds more than
+/// one key family — every route here except `new.json`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionOwner {
     wallet: String,
-    account: Option<(u32, String)>,
+    account: u32,
 }
 
 impl SessionOwner {
-    pub fn scope(ctx: &Ctx, wallet: &str) -> Self {
-        Self {
+    pub fn scope(ctx: &Ctx, wallet: &str) -> Result<Self, DispatchResponse> {
+        Self::from_params(
+            wallet,
+            petal::route_param(ctx, "bloom.wallet"),
+            petal::route_param(ctx, "bloom.account"),
+        )
+        .map_err(bad)
+    }
+
+    fn from_params(
+        wallet: &str,
+        mounted_wallet: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(mounted) = mounted_wallet
+            && mounted != wallet
+        {
+            return Err(format!(
+                "session wallet {wallet:?} is not the mounted wallet {mounted:?}"
+            ));
+        }
+        let account = match account {
+            None => 0,
+            Some(raw) => raw
+                .parse::<u32>()
+                .map_err(|error| format!("bloom.account must be a u32: {error}"))?,
+        };
+        Ok(Self {
             wallet: wallet.to_owned(),
-            account: petal::account_ctx(ctx)
-                .ok()
-                .map(|account| (account.account, account.owner_key_fingerprint)),
-        }
-    }
-
-    fn record_segment(&self) -> &str {
-        match &self.account {
-            Some((_, fingerprint)) => fingerprint,
-            None => &self.wallet,
-        }
-    }
-
-    fn legacy_segment(&self) -> Option<&str> {
-        match &self.account {
-            Some((0, _)) => Some(self.wallet.as_str()),
-            _ => None,
-        }
-    }
-
-    fn key_slot_owner(&self) -> Option<&str> {
-        self.account.as_ref().map(|(_, f)| f.as_str())
+            account,
+        })
     }
 }
 
+/// The per-account root under both the public and secret namespaces; its
+/// children are wallets.
+fn sessions_root(account: u32) -> String {
+    if account == 0 {
+        "sessions/".into()
+    } else {
+        format!("account-sessions/{account}/")
+    }
+}
+fn sessions_prefix(owner: &SessionOwner) -> String {
+    format!("{}{}/", sessions_root(owner.account), owner.wallet)
+}
+fn account_number(c: &Ctx) -> Result<u32, DispatchResponse> {
+    petal::route_param(c, "bloom.account")
+        .map_or(Ok(0), |raw| raw.parse::<u32>())
+        .map_err(|error| bad(format!("bloom.account must be a u32: {error}")))
+}
+fn session_key_slot(owner: &SessionOwner, id: &str) -> String {
+    let mut input = id.as_bytes().to_vec();
+    input.push(0);
+    if owner.account != 0 {
+        input.extend_from_slice(owner.account.to_string().as_bytes());
+        input.push(0);
+    }
+    format!("pumpfun-{}", &hex::encode(Sha256::digest(&input))[..40])
+}
 fn sk(owner: &SessionOwner, s: &str, x: &str) -> String {
-    format!("state/sessions/{}/{s}/{x}", owner.record_segment())
-}
-fn sk_legacy(owner: &SessionOwner, s: &str, x: &str) -> Option<String> {
-    owner
-        .legacy_segment()
-        .filter(|legacy| *legacy != owner.record_segment())
-        .map(|legacy| format!("state/sessions/{legacy}/{s}/{x}"))
+    format!("state/{}{s}/{x}", sessions_prefix(owner))
 }
 fn sec(owner: &SessionOwner, s: &str, o: &str) -> String {
-    format!(
-        "sessions/{}/{s}/operations/{o}.json",
-        owner.record_segment()
-    )
+    format!("{}{s}/operations/{o}.json", sessions_prefix(owner))
 }
 fn session_sec(owner: &SessionOwner, s: &str) -> String {
-    format!("sessions/{}/{s}/session.json", owner.record_segment())
+    format!("{}{s}/session.json", sessions_prefix(owner))
 }
 fn put<T: Serialize + ?Sized>(k: &str, v: &T, secret: bool) -> Result<(), DispatchResponse> {
     host::store_put(
@@ -387,15 +416,7 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
     }
     let request = petal::PetalKeyRequest {
         wallet_id: owner.wallet.clone(),
-        key_slot: {
-            let mut input = id.as_bytes().to_vec();
-            input.push(0);
-            if let Some(fingerprint) = owner.key_slot_owner() {
-                input.extend_from_slice(fingerprint.as_bytes());
-                input.push(0);
-            }
-            format!("pumpfun-{}", &hex::encode(Sha256::digest(&input))[..40])
-        },
+        key_slot: session_key_slot(&owner, &id),
         allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
         allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
         allowed_crypto_suites: vec!["ed25519-message".into()],
@@ -462,24 +483,8 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
         Err(e) => e,
     }
 }
-/// Read one public session record: the owner-scoped key first, then the
-/// legacy wallet-scoped key when this is account 0.
-fn get_session_fallback<T: for<'a> Deserialize<'a>>(
-    owner: &SessionOwner,
-    s: &str,
-    x: &str,
-) -> Result<Option<T>, DispatchResponse> {
-    if let Some(value) = get::<T>(&sk(owner, s, x))? {
-        return Ok(Some(value));
-    }
-    match sk_legacy(owner, s, x) {
-        Some(legacy) => get::<T>(&legacy),
-        None => Ok(None),
-    }
-}
-
 pub fn read_session(owner: &SessionOwner, s: &str) -> DispatchResponse {
-    match get_session_fallback::<Session>(owner, s, "session.json") {
+    match get::<Session>(&sk(owner, s, "session.json")) {
         Ok(Some(v)) => petal::read_json_value(&v),
         Ok(None) => bad("session not found"),
         Err(e) => e,
@@ -552,8 +557,8 @@ struct Public {
 }
 
 fn active_session(owner: &SessionOwner, s: &str, a: Action) -> Result<Session, DispatchResponse> {
-    let session = get_session_fallback::<Session>(owner, s, "session.json")?
-        .ok_or_else(|| bad("session not found"))?;
+    let session =
+        get::<Session>(&sk(owner, s, "session.json"))?.ok_or_else(|| bad("session not found"))?;
     if (session.stopped || session.expires_ms <= host::now_ms())
         && !matches!(a, Action::CloseTokenAccount | Action::Sweep)
     {
@@ -1509,12 +1514,11 @@ fn publish(
     )
 }
 pub fn read_operation(owner: &SessionOwner, s: &str, o: &str) -> DispatchResponse {
-    let mut operation =
-        match get_session_fallback::<Public>(owner, s, &format!("operations/{o}.json")) {
-            Ok(Some(value)) => value,
-            Ok(None) => return bad("operation not found"),
-            Err(e) => return e,
-        };
+    let mut operation = match get::<Public>(&sk(owner, s, &format!("operations/{o}.json"))) {
+        Ok(Some(value)) => value,
+        Ok(None) => return bad("operation not found"),
+        Err(e) => return e,
+    };
     if matches!(
         operation.status.as_str(),
         "broadcast_attempted" | "submitted"
@@ -1668,8 +1672,8 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
     if let Some(sid) = session_id.as_deref() {
         match ident(sid, "session") {
             Ok(_) => {
-                let key = sk(&SessionOwner::scope(c, &w), sid, "session.json");
-                match get::<Session>(&key) {
+                let key = SessionOwner::scope(c, &w).map(|owner| sk(&owner, sid, "session.json"));
+                match key.and_then(|key| get::<Session>(&key)) {
                     Ok(Some(s)) => {
                         let expired = s.expires_ms <= now || s.stopped;
                         session_block = Some(json!({
@@ -1917,20 +1921,23 @@ fn stored_children(prefix: &str, suffix: Option<&str>) -> Result<Vec<String>, Di
     children.dedup();
     Ok(children)
 }
-pub fn list_wallets() -> Result<Vec<petal::RouteChild>, DispatchResponse> {
-    stored_children("state/sessions/", None)
-        .map(|children| children.into_iter().map(petal::dir).collect())
+pub fn list_wallets(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
+    stored_children(
+        &format!("state/{}", sessions_root(account_number(c)?)),
+        None,
+    )
+    .map(|children| children.into_iter().map(petal::dir).collect())
 }
 pub fn list_sessions(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
-    let wallet = wallet(c)?;
-    stored_children(&format!("state/sessions/{wallet}/"), None)
+    let owner = SessionOwner::scope(c, &wallet(c)?)?;
+    stored_children(&format!("state/{}", sessions_prefix(&owner)), None)
         .map(|children| children.into_iter().map(petal::dir).collect())
 }
 pub fn list_operations(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
-    let wallet = wallet(c)?;
+    let owner = SessionOwner::scope(c, &wallet(c)?)?;
     let session = session(c)?;
     stored_children(
-        &format!("state/sessions/{wallet}/{session}/operations/"),
+        &format!("state/{}{session}/operations/", sessions_prefix(&owner)),
         Some(".json"),
     )
     .map(|children| {
@@ -3040,7 +3047,11 @@ pub fn route_action(c: &Ctx, b: &[u8], a: Action) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    execute(c, a, SessionOwner::scope(c, &w), s, b)
+    let owner = match SessionOwner::scope(c, &w) {
+        Ok(owner) => owner,
+        Err(e) => return e,
+    };
+    execute(c, a, owner, s, b)
 }
 pub fn route_session(c: &Ctx) -> DispatchResponse {
     let w = match wallet(c) {
@@ -3051,7 +3062,11 @@ pub fn route_session(c: &Ctx) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    read_session(&SessionOwner::scope(c, &w), &s)
+    let owner = match SessionOwner::scope(c, &w) {
+        Ok(owner) => owner,
+        Err(e) => return e,
+    };
+    read_session(&owner, &s)
 }
 pub fn route_operation(c: &Ctx) -> DispatchResponse {
     let w = match wallet(c) {
@@ -3066,7 +3081,11 @@ pub fn route_operation(c: &Ctx) -> DispatchResponse {
         Ok(v) => v,
         Err(e) => return e,
     };
-    read_operation(&SessionOwner::scope(c, &w), &s, &o)
+    let owner = match SessionOwner::scope(c, &w) {
+        Ok(owner) => owner,
+        Err(e) => return e,
+    };
+    read_operation(&owner, &s, &o)
 }
 pub fn static_list(e: &[(&str, bool, bool)]) -> Vec<petal::RouteChild> {
     e.iter()
@@ -3124,43 +3143,55 @@ mod tests {
     }
 
     #[test]
-    fn the_same_session_id_on_two_accounts_yields_two_slots() {
-        let legacy = SessionOwner {
-            wallet: WALLET.to_owned(),
-            account: None,
-        };
-        let one = SessionOwner {
-            wallet: WALLET.to_owned(),
-            account: Some((1, "a".repeat(64))),
-        };
-        let two = SessionOwner {
-            wallet: WALLET.to_owned(),
-            account: Some((2, "b".repeat(64))),
-        };
-        fn slot(owner: &SessionOwner, id: &str) -> String {
-            let mut input = id.as_bytes().to_vec();
-            input.push(0);
-            if let Some(fingerprint) = owner.key_slot_owner() {
-                input.extend_from_slice(fingerprint.as_bytes());
-                input.push(0);
+    fn session_owner_is_the_mounted_account_number() {
+        let account = |n| SessionOwner::from_params(WALLET, Some(WALLET), Some(n)).unwrap();
+        // The flat mount and account 0 are one owner.
+        assert_eq!(legacy_owner(), account("0"));
+        assert_ne!(legacy_owner(), account("1"));
+        // A session wallet other than the mounted one never borrows the
+        // mounted account's scope.
+        assert!(SessionOwner::from_params("other", Some(WALLET), Some("1")).is_err());
+        assert!(SessionOwner::from_params(WALLET, Some(WALLET), Some("-1")).is_err());
+    }
+
+    #[test]
+    fn the_same_session_id_on_two_accounts_yields_two_slots_and_records() {
+        let account = |n| SessionOwner::from_params(WALLET, Some(WALLET), Some(n)).unwrap();
+        let (flat, zero, one, two) = (legacy_owner(), account("0"), account("1"), account("2"));
+        assert_eq!(
+            session_key_slot(&flat, SESSION),
+            session_key_slot(&zero, SESSION)
+        );
+        assert_ne!(
+            session_key_slot(&zero, SESSION),
+            session_key_slot(&one, SESSION)
+        );
+        assert_ne!(
+            session_key_slot(&one, SESSION),
+            session_key_slot(&two, SESSION)
+        );
+        assert_eq!(
+            sk(&flat, SESSION, "session.json"),
+            format!("state/sessions/{WALLET}/{SESSION}/session.json")
+        );
+        assert_eq!(
+            sk(&one, SESSION, "session.json"),
+            format!("state/account-sessions/1/{WALLET}/{SESSION}/session.json")
+        );
+        assert_eq!(
+            session_sec(&two, SESSION),
+            format!("account-sessions/2/{WALLET}/{SESSION}/session.json")
+        );
+        // Each account's listing root holds exactly its own wallet tree.
+        for owner in [&flat, &one, &two] {
+            let root = format!("state/{}", sessions_root(owner.account));
+            for other in [&flat, &one, &two] {
+                assert_eq!(
+                    sk(other, SESSION, "session.json").starts_with(&format!("{root}{WALLET}/")),
+                    owner == other
+                );
             }
-            format!("pumpfun-{}", &hex::encode(Sha256::digest(&input))[..40])
         }
-        assert_ne!(slot(&legacy, "agent-1"), slot(&one, "agent-1"));
-        assert_ne!(slot(&one, "agent-1"), slot(&two, "agent-1"));
-        assert_eq!(
-            sk(&one, "agent-1", "session.json"),
-            format!("state/sessions/{}/agent-1/session.json", "a".repeat(64))
-        );
-        assert_eq!(sk_legacy(&one, "agent-1", "session.json"), None);
-        let zero = SessionOwner {
-            wallet: WALLET.to_owned(),
-            account: Some((0, "c".repeat(64))),
-        };
-        assert_eq!(
-            sk_legacy(&zero, "agent-1", "session.json"),
-            Some(format!("state/sessions/{WALLET}/agent-1/session.json"))
-        );
     }
     #[test]
     fn recovery_actions_request_exact_signing() {
@@ -3473,10 +3504,7 @@ mod tests {
     const WALLET: &str = "main";
 
     fn legacy_owner() -> SessionOwner {
-        SessionOwner {
-            wallet: WALLET.to_owned(),
-            account: None,
-        }
+        SessionOwner::from_params(WALLET, None, None).unwrap()
     }
     const SESSION: &str = "agent-1";
     const NOW_MS: u64 = 1_757_000_000_000;
