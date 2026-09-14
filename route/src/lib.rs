@@ -307,6 +307,15 @@ fn safe(v: &Value) -> String {
             safe.insert(field.into(), value.clone());
         }
     }
+    if let Some(error) = v.get("error").filter(|error| error.is_object()) {
+        for field in ["code", "message"] {
+            if let Some(value) = error.get(field)
+                && (value.is_string() || value.is_number() || value.is_boolean())
+            {
+                safe.insert(field.into(), value.clone());
+            }
+        }
+    }
     if safe.is_empty() {
         "remote request failed".into()
     } else {
@@ -1120,13 +1129,14 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
         )
     } else {
-        post(
-            RPC,
-            &rpc(
-                "sendTransaction",
-                json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
-            ),
-        )
+        let request = rpc(
+            "sendTransaction",
+            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
+        );
+        match post(RPC, &request) {
+            Err(_) => post(RPC_VERIFY, &request),
+            result => result,
+        }
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
@@ -3646,6 +3656,70 @@ mod tests {
         assert_eq!(public_operation("buy-1")["status"], json!("submitted"));
         assert_eq!(
             public_operation("buy-1")["signature"],
+            json!(test_signature_base58())
+        );
+    }
+
+    #[test]
+    fn a_rejected_send_names_the_json_rpc_error_code_and_message() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": "Internal error: blockhash not found"},
+            "id": 73
+        });
+        let kept = safe(&body);
+        let kept: Value = serde_json::from_str(&kept).expect("sanitized body is JSON");
+        assert_eq!(kept["code"], json!(-32000));
+        assert_eq!(
+            kept["message"],
+            json!("Internal error: blockhash not found")
+        );
+        assert!(
+            !kept["error"].is_object(),
+            "the raw error object must not pass through: {kept}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_buy_retries_a_rejected_send_once_on_the_verify_rpc() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} sendTransaction"),
+            json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "Internal error"},
+                "id": 1
+            }),
+        );
+        host.reply(
+            &format!("{RPC_VERIFY} sendTransaction"),
+            json!({"result": test_signature_base58()}),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-verify-retry", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+
+        fake_host::with(|host| {
+            let sends = host.calls_for("sendTransaction");
+            assert_eq!(sends.len(), 2, "one rejected send, one retry");
+            assert_eq!(sends[0].url, RPC);
+            assert_eq!(sends[1].url, RPC_VERIFY);
+            assert_eq!(
+                sends[0].body, sends[1].body,
+                "the retry is the identical request"
+            );
+        });
+        assert_eq!(
+            public_operation("buy-verify-retry")["status"],
+            json!("submitted")
+        );
+        assert_eq!(
+            public_operation("buy-verify-retry")["signature"],
             json!(test_signature_base58())
         );
     }
