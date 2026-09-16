@@ -6,6 +6,7 @@ use petal::{
 use serde::{Deserialize, Serialize};
 pub use serde_json::json;
 use serde_json::{Map, Value};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2187,6 +2188,58 @@ fn require_account(
         Err(format!("{label} account mismatch"))
     }
 }
+/// Solana's `find_program_address`: the first bump, counting down from 255,
+/// whose hash is not an Ed25519 point.
+fn program_address(seeds: &[&[u8]], program: &[u8; 32]) -> Result<[u8; 32], String> {
+    (0..=u8::MAX)
+        .rev()
+        .find_map(|bump| {
+            let mut hasher = Sha256::new();
+            for seed in seeds {
+                hasher.update(seed);
+            }
+            hasher.update([bump]);
+            hasher.update(program);
+            hasher.update(b"ProgramDerivedAddress");
+            let address: [u8; 32] = hasher.finalize().into();
+            CompressedEdwardsY(address)
+                .decompress()
+                .is_none()
+                .then_some(address)
+        })
+        .ok_or_else(|| "no program address exists for these seeds".into())
+}
+/// The session's own token account for `mint`: the associated token account
+/// under the SPL token program the instruction names at `program_position`.
+/// Builder responses are untrusted, so the account that receives or spends a
+/// trade's tokens is derived here rather than taken from the transaction.
+fn require_payer_token_account(
+    m: &Msg,
+    ix: &Ix,
+    position: usize,
+    program_position: usize,
+    payer: &[u8; 32],
+    mint: &[u8; 32],
+    label: &str,
+) -> Result<(), String> {
+    let token_program = account(m, ix, program_position)?;
+    if token_program != &pk(PROGRAMS[3])? && token_program != &pk(PROGRAMS[4])? {
+        return Err(format!("{label} token program is not SPL Token"));
+    }
+    let expected = program_address(&[payer, token_program, mint], &pk(PROGRAMS[2])?)?;
+    require_account(m, ix, position, &expected, label)
+}
+/// The pool Pump creates when a coin graduates: index 0, owned by the Pump
+/// program's pool authority for the mint, quoted in wrapped SOL. Anyone can
+/// create another pool for the same pair, so only this one is accepted.
+fn require_canonical_pool(m: &Msg, ix: &Ix, mint: &[u8; 32]) -> Result<(), String> {
+    let authority = program_address(&[b"pool-authority", mint], &pk(PROGRAMS[5])?)?;
+    let pool = program_address(
+        &[b"pool", &[0, 0], &authority, mint, &pk(SOL)?],
+        &pk(PROGRAMS[6])?,
+    )?;
+    require_account(m, ix, 0, &pool, "AMM pool")
+}
 
 fn validate_sweep_tx(
     transaction: &str,
@@ -2728,6 +2781,7 @@ fn validate_protocol_instructions(
             }
             Action::Create if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "initial-buy mint")?;
+                require_payer_token_account(message, ix, 5, 8, payer, mint, "initial-buy recipient")?;
                 require_account(message, ix, 6, payer, "initial-buy user")?;
                 let requested = request_u64(request, "solLamports")?;
                 let maximum = u128::from(requested) + (u128::from(requested) * 2).div_ceil(100);
@@ -2743,15 +2797,27 @@ fn validate_protocol_instructions(
             }
             Action::Buy if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "buy mint")?;
+                require_payer_token_account(message, ix, 5, 8, payer, mint, "buy recipient")?;
                 require_account(message, ix, 6, payer, "buy user")?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
                 validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Buy if program == &amm && has_discriminator(ix, IX_BUY) => {
+                require_canonical_pool(message, ix, mint)?;
                 require_account(message, ix, 1, payer, "AMM buy user")?;
                 require_account(message, ix, 3, mint, "AMM buy mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM buy quote mint")?;
+                require_payer_token_account(message, ix, 5, 11, payer, mint, "AMM buy recipient")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    6,
+                    12,
+                    payer,
+                    &wrapped_mint,
+                    "AMM buy wrapped SOL source",
+                )?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
                 validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
@@ -2764,9 +2830,20 @@ fn validate_protocol_instructions(
                 primary += 1;
             }
             Action::Sell if program == &amm && has_discriminator(ix, IX_SELL) => {
+                require_canonical_pool(message, ix, mint)?;
                 require_account(message, ix, 1, payer, "AMM sell user")?;
                 require_account(message, ix, 3, mint, "AMM sell mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM sell quote mint")?;
+                require_payer_token_account(message, ix, 5, 11, payer, mint, "AMM sell source")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    6,
+                    12,
+                    payer,
+                    &wrapped_mint,
+                    "AMM sell recipient",
+                )?;
                 validate_sell_amount(ix, request_u64(request, "amount")?)?;
                 validate_minimum_output(ix, 16, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
@@ -3412,6 +3489,72 @@ mod tests {
             json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         (message, request, response)
+    }
+    /// Builder transactions are untrusted, so every account that receives or
+    /// spends a trade's tokens, the AMM pool, and the token program used to
+    /// derive them must be the session's own. Each is swapped for a stranger's
+    /// account in an otherwise valid transaction.
+    #[test]
+    fn verifier_rejects_substituted_trade_accounts_and_pools() {
+        let parsed = |name: &str, action: Action, request: Value| {
+            let response = fixture(name);
+            let raw = B64
+                .decode(response.get("transaction").and_then(Value::as_str).unwrap())
+                .unwrap();
+            let mut message = message(envelope(&raw).unwrap().message).unwrap();
+            assert!(hydrate_lookups(&mut message, &response).is_ok());
+            (message, normalized(action, request), response)
+        };
+        let create = json!({"name":"Bloom Fixture","symbol":"BLMF","uri":"https://example.com/pumpfun-fixture.json","solLamports":"1000000","minOutputAmount":"1"});
+        let buy = |mint| json!({"mint":mint,"amount":"1000000","minOutputAmount":"1","slippagePct":2});
+        let sell = json!({"mint":AMM_MINT,"amount":"1","minOutputAmount":"1","slippagePct":2});
+        let cases = [
+            ("create", Action::Create, create, PROGRAMS[5], vec![5, 8]),
+            ("buy_bond", Action::Buy, buy(BOND_MINT), PROGRAMS[5], vec![5, 8]),
+            ("buy_amm", Action::Buy, buy(AMM_MINT), PROGRAMS[6], vec![0, 5, 6, 11, 12]),
+            ("sell_amm", Action::Sell, sell, PROGRAMS[6], vec![0, 5, 6, 11, 12]),
+        ];
+        for (name, action, request, program, positions) in cases {
+            let response = fixture(name);
+            let mint = pk(response["mintPublicKey"]
+                .as_str()
+                .or(request["mint"].as_str())
+                .unwrap())
+            .unwrap();
+            let program = pk(program).unwrap();
+            let payer = pk(USER).unwrap();
+            let prepared = || {
+                let (mut message, request, response) = parsed(name, action, request.clone());
+                let trade = message
+                    .instructions
+                    .iter()
+                    .position(|ix| {
+                        message.keys.get(ix.program) == Some(&program)
+                            && (has_discriminator(ix, IX_BUY) || has_discriminator(ix, IX_SELL))
+                    })
+                    .unwrap();
+                // The recorded sell quotes zero output, which is refused on its own.
+                if matches!(action, Action::Sell) {
+                    message.instructions[trade].data[16..24].copy_from_slice(&1u64.to_le_bytes());
+                }
+                (message, request, response, trade)
+            };
+            let (message, request, response, _) = prepared();
+            validate_message(&message, &payer, &mint, action, &request, &response)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+
+            for position in positions {
+                let (mut message, request, response, trade) = prepared();
+                message.keys.push([7; 32]);
+                message.instructions[trade].accounts[position] =
+                    u8::try_from(message.keys.len() - 1).unwrap();
+                assert!(
+                    validate_message(&message, &payer, &mint, action, &request, &response)
+                        .is_err(),
+                    "{name}: account {position} was substituted"
+                );
+            }
+        }
     }
     #[test]
     fn verifier_rejects_wrong_action_and_unused_requested_mint() {
