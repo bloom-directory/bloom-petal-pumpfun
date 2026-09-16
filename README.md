@@ -9,12 +9,16 @@ Writes use a short-lived Ed25519 key derived and held by Bloom. Fund the public
 
 ## How a write is authorized
 
-Deriving the session key provisions one reusable Bloom approval for that key.
-Its scope is the routes and operation classes this package declares, and it
-expires with the key. Every later write — buy, sell, close, sweep — signs under
-that one approval and asks the owner for nothing further. What each individual
-transaction is allowed to do is decided by the checks below, by wallet policy,
-and by the key's own scope, not by a per-transaction approval.
+Trading writes — create, buy, sell, collect_fees, sharing_config — sign under
+one reusable Bloom approval for the session key. The owner approves it once,
+with the session's budgets, after admitting the session address to the wallet
+policy. It covers only this package's declared routes and operation classes and
+ends no later than the key. What each trading transaction may do is decided by
+the checks below, the budgets, wallet policy, and the key's scope.
+
+Recovery writes — `close_token_account` and `sweep` — each need the owner's
+approval for that exact transaction, separate from the trading budgets. They
+still work after the session is stopped or expired.
 
 Wallet policy is a real gate and covers more than the funding address: every
 destination a write declares — the Pump protocol program it routes through,
@@ -35,19 +39,19 @@ The same id with different content — a different amount, mint or destination �
 is refused as `operationId already bound`, so a retry can never quietly become
 a different payment. What a retry does depends on where the operation stopped:
 
-- `preflight_failed` or `approval_failed` — nothing was signed that anyone
-  could still broadcast, so the Petal rebuilds the transaction with a fresh
-  blockhash and tries again under the same economic intent.
-- `signing_uncertain` — signing returned no answer and may already have
-  produced a signature. The Petal keeps that exact message and its approval and
-  re-enters signing, so the retry reconciles the same signature rather than
-  authorizing a second payment.
-- `simulation_failed` — written only by earlier versions, which sent the signed
-  transaction to an RPC to simulate it; that transaction may still land. The
-  Petal never rebuilds it and only signs the stored message again.
-- `approval_pending` — the owner has not answered yet. The Petal refreshes the
-  transaction but keeps the same approval, so waiting does not accumulate
-  ceremonies.
+- `approval_failed` or `preflight_failed` — if no signing call could have
+  produced a signature for this transaction, the Petal rebuilds it with a fresh
+  blockhash under the same economic intent.
+- `signing`, `signing_uncertain`, or the earlier versions' `simulation_failed` —
+  a signature may exist. From then on the operation is never rebuilt, whatever
+  later attempts report: every retry signs the same transaction again, which can
+  only reproduce it. If it can no longer land, confirm on the cluster that it did
+  not before using a new `operationId`.
+- `approval_pending` — the owner has not answered yet. A trading approval does
+  not bind the transaction, so the Petal refreshes it while waiting. A close or
+  sweep approval binds the exact transaction, so it is kept; if it can no longer
+  land before the owner approves (a Solana blockhash lasts about a minute), the
+  next retry drops that approval, rebuilds, and asks for a new one.
 - `broadcast_attempted`, `submitted`, `confirmed`, `finalized`, `chain_failed` —
   the attempt is already recorded. A retry reports it and never re-broadcasts.
 
@@ -119,10 +123,11 @@ funding a session.
 
 Create a session by writing `id`, `duration_ms`, `max_lamports`, and optional
 `token_limits` to `new.json`, then fund the `address` exposed by `session.json`.
-`max_lamports` is a positive decimal string for cumulative native debits and
-fees, including the exit. `token_limits` maps each mint the session may sell
+`max_lamports` is a positive decimal string for the cumulative native debits and
+fees of trading writes. `token_limits` maps each mint the session may sell
 to its cumulative raw-token debit ceiling. See [SETUP.md](SETUP.md) before
-choosing these budgets; they are sealed by the reusable approval ceremony.
+choosing these budgets; they are sealed into the trading approval, and close and
+sweep are approved separately.
 Create bodies
 require `name`, `symbol`, `uri`, positive decimal-string `solLamports`, and a
 positive decimal-string `minOutputAmount`. Buy and sell bodies require `mint`,
@@ -152,5 +157,11 @@ instruction to return that native balance. Finally write
 `sweep.json`. The Petal builds one exact System transfer for the full native
 SOL balance minus the quoted fee. `close_token_account.json` and `sweep.json`
 remain usable after the session is stopped or expired so remaining assets can
-be recovered; they sign with an exact owner approval that does not depend on
-the session's reusable signing scope.
+be recovered; each transaction asks the owner for its own exact approval.
+
+## Compatibility
+
+This package needs Bloom with `[sign].fee_asset` (bloom#276), bounded session
+keys (bloom#302) and Exact signing with the session key (bloom#304). No Bloom
+release includes them yet, and Bloom v0.3.0 refuses to install this package.
+See `SETUP.md`.
