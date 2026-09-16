@@ -4900,6 +4900,56 @@ mod tests {
         });
     }
 
+    /// Blockhash expiry settles only an unsigned transaction. A sweep that may
+    /// already be signed could have landed before its blockhash expired, so
+    /// neither a failed simulation nor expiry makes it rebuildable.
+    #[test]
+    fn expiry_never_makes_a_possibly_signed_sweep_rebuildable() {
+        let mut host = host_serving_a_buy();
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":1_000_000}}),
+        );
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.reply(&format!("{RPC} getBlockHeight"), json!({"result": 5000}));
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Denied)));
+        fake_host::install(host);
+        let body =
+            serde_json::to_vec(&json!({"operationId":"sweep-uncertain","destination":AMM_CREATOR}))
+                .unwrap();
+        let run = || {
+            execute(
+                &ctx(&[("bloom.route_id", "ROUTE_SWEEP")]),
+                Action::Sweep,
+                legacy_owner(),
+                SESSION.into(),
+                &body,
+            )
+        };
+        assert!(dispatch_message(&run()).contains("may already have produced a signature"));
+        fake_host::with(|host| simulation_rejects(host, true));
+        assert!(dispatch_message(&run()).contains("may already be signed"));
+        fake_host::with(|host| simulation_rejects(host, false));
+        run();
+        run();
+        fake_host::with(|host| {
+            assert_eq!(
+                host.calls_for("getLatestBlockhash").len(),
+                1,
+                "never rebuilt"
+            );
+            assert!(
+                host.sign_requests
+                    .windows(2)
+                    .all(|pair| pair[0].preimage == pair[1].preimage)
+            );
+        });
+    }
+
     /// An Exact approval is never carried onto new bytes, and a failed
     /// simulation is not proof that its transaction can no longer land. The
     /// approval is kept until the finalized block height passes the
