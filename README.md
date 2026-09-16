@@ -26,7 +26,7 @@ lists all of them, and what the owner is actually prompted for.
 
 Every write requires a caller-selected `operationId`. Bloom binds that id to the
 canonical request, stores unsigned and signed transaction material only in the
-secret namespace, simulates before sending, and records the intent to broadcast
+secret namespace, simulates the unsigned transaction before signing, and records the intent to broadcast
 before broadcasting. Read `operations/<operationId>.json` for durable build,
 approval, broadcast, confirmation, failure and finalization status.
 
@@ -35,13 +35,16 @@ The same id with different content — a different amount, mint or destination �
 is refused as `operationId already bound`, so a retry can never quietly become
 a different payment. What a retry does depends on where the operation stopped:
 
-- `simulation_failed` or `approval_failed` — nothing was signed that anyone
+- `preflight_failed` or `approval_failed` — nothing was signed that anyone
   could still broadcast, so the Petal rebuilds the transaction with a fresh
   blockhash and tries again under the same economic intent.
 - `signing_uncertain` — signing returned no answer and may already have
   produced a signature. The Petal keeps that exact message and its approval and
   re-enters signing, so the retry reconciles the same signature rather than
   authorizing a second payment.
+- `simulation_failed` — written only by earlier versions, which sent the signed
+  transaction to an RPC to simulate it; that transaction may still land. The
+  Petal never rebuilds it and only signs the stored message again.
 - `approval_pending` — the owner has not answered yet. The Petal refreshes the
   transaction but keeps the same approval, so waiting does not accumulate
   ceremonies.
@@ -60,8 +63,11 @@ Associated Token, System, and Compute Budget programs are eligible to sign.
 Address lookup tables are resolved independently through Solana RPC before
 their accounts are checked. Swap requests include a caller-selected
 `minOutputAmount`; the on-chain instruction must preserve at least that many
-raw output units. Bloom also applies a local base and priority fee floor and
-requires an explicit successful simulation result before broadcast.
+raw output units. The token accounts a trade receives into or spends from must
+be the session's own associated token accounts, and PumpSwap trades must use the
+coin's canonical pool; both are derived locally, not taken from the builder.
+Bloom also applies a local base and priority fee floor and requires an explicit
+successful simulation result before signing.
 
 Optional request fields follow Pump's official agent API: `mayhemMode`,
 `cashback`, `tokenizedAgent`, `buybackBps`, `slippagePct`,

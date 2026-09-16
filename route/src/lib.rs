@@ -1,4 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use petal::{
     Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
     SignSelector,
@@ -6,7 +7,6 @@ use petal::{
 use serde::{Deserialize, Serialize};
 pub use serde_json::json;
 use serde_json::{Map, Value};
-use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -931,13 +931,15 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
                 return bad("operationId already bound");
             };
             // Only outcomes that are certainly dead are rebuilt. A refused
-            // signature and a failed simulation both mean nothing was signed
-            // that anyone could still broadcast, so a fresh transaction under
-            // the same economic intent is safe. `signing_uncertain` is
-            // deliberately absent: that message may already be signed, so a
-            // retry re-enters signing with the stored message and approval
-            // rather than creating a second one.
-            if matches!(v.status.as_str(), "simulation_failed" | "approval_failed") {
+            // signature and a failed unsigned simulation both mean nothing was
+            // signed that anyone could still broadcast, so a fresh transaction
+            // under the same economic intent is safe. `signing_uncertain` and
+            // `simulation_failed` are deliberately absent: the first may
+            // already be signed, and the second is only written by earlier
+            // versions, which sent the signed transaction to an RPC to
+            // simulate it. A retry of either re-enters signing with the stored
+            // message, which can only reproduce the same transaction.
+            if matches!(v.status.as_str(), "preflight_failed" | "approval_failed") {
                 v = match build_pending(a, &sess.address, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
@@ -1027,6 +1029,22 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
+    // Simulate before signing: an RPC that receives a signed transaction can
+    // broadcast it, so a signature must never leave until this operation will
+    // not build another transaction.
+    if let Err(e) = simulate(&p.tx) {
+        if p.status != "simulation_failed" {
+            p.status = "preflight_failed".into();
+            p.approval = None;
+        }
+        if let Err(store_error) = put(&key, &p, true) {
+            return store_error;
+        }
+        if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
+            return store_error;
+        }
+        return e;
+    }
     let sig = match host::sign_payload(&PayloadSignRequest {
         wallet: owner.wallet.clone(),
         preimage: env.message.to_vec(),
@@ -1106,17 +1124,6 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     signed[env.sig_offset..env.sig_offset + 64].copy_from_slice(&sig);
     let tx = B64.encode(signed);
     let signature = bs58::encode(sig).into_string();
-    if let Err(e) = simulate(&tx) {
-        p.status = "simulation_failed".into();
-        p.approval = None;
-        if let Err(store_error) = put(&key, &p, true) {
-            return store_error;
-        }
-        if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
-            return store_error;
-        }
-        return e;
-    }
     if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
@@ -1995,7 +2002,7 @@ fn simulate(tx: &str) -> Result<(), DispatchResponse> {
         RPC,
         &rpc(
             "simulateTransaction",
-            json!([tx,{"encoding":"base64","sigVerify":true,"commitment":"processed"}]),
+            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":"processed"}]),
         ),
     )?;
     simulation_result(&v).map_err(fail)
@@ -2781,7 +2788,15 @@ fn validate_protocol_instructions(
             }
             Action::Create if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "initial-buy mint")?;
-                require_payer_token_account(message, ix, 5, 8, payer, mint, "initial-buy recipient")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    5,
+                    8,
+                    payer,
+                    mint,
+                    "initial-buy recipient",
+                )?;
                 require_account(message, ix, 6, payer, "initial-buy user")?;
                 let requested = request_u64(request, "solLamports")?;
                 let maximum = u128::from(requested) + (u128::from(requested) * 2).div_ceil(100);
@@ -3506,13 +3521,32 @@ mod tests {
             (message, normalized(action, request), response)
         };
         let create = json!({"name":"Bloom Fixture","symbol":"BLMF","uri":"https://example.com/pumpfun-fixture.json","solLamports":"1000000","minOutputAmount":"1"});
-        let buy = |mint| json!({"mint":mint,"amount":"1000000","minOutputAmount":"1","slippagePct":2});
+        let buy =
+            |mint| json!({"mint":mint,"amount":"1000000","minOutputAmount":"1","slippagePct":2});
         let sell = json!({"mint":AMM_MINT,"amount":"1","minOutputAmount":"1","slippagePct":2});
         let cases = [
             ("create", Action::Create, create, PROGRAMS[5], vec![5, 8]),
-            ("buy_bond", Action::Buy, buy(BOND_MINT), PROGRAMS[5], vec![5, 8]),
-            ("buy_amm", Action::Buy, buy(AMM_MINT), PROGRAMS[6], vec![0, 5, 6, 11, 12]),
-            ("sell_amm", Action::Sell, sell, PROGRAMS[6], vec![0, 5, 6, 11, 12]),
+            (
+                "buy_bond",
+                Action::Buy,
+                buy(BOND_MINT),
+                PROGRAMS[5],
+                vec![5, 8],
+            ),
+            (
+                "buy_amm",
+                Action::Buy,
+                buy(AMM_MINT),
+                PROGRAMS[6],
+                vec![0, 5, 6, 11, 12],
+            ),
+            (
+                "sell_amm",
+                Action::Sell,
+                sell,
+                PROGRAMS[6],
+                vec![0, 5, 6, 11, 12],
+            ),
         ];
         for (name, action, request, program, positions) in cases {
             let response = fixture(name);
@@ -3549,8 +3583,7 @@ mod tests {
                 message.instructions[trade].accounts[position] =
                     u8::try_from(message.keys.len() - 1).unwrap();
                 assert!(
-                    validate_message(&message, &payer, &mint, action, &request, &response)
-                        .is_err(),
+                    validate_message(&message, &payer, &mint, action, &request, &response).is_err(),
                     "{name}: account {position} was substituted"
                 );
             }
@@ -3938,7 +3971,6 @@ mod tests {
                 host.calls_for("sendTransaction").is_empty(),
                 "nothing may be broadcast when signing was refused"
             );
-            assert!(host.calls_for("simulateTransaction").is_empty());
         });
         assert_eq!(
             public_operation("buy-denied")["status"],
@@ -3977,13 +4009,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_simulation_never_broadcasts_and_the_same_request_can_be_retried() {
-        let mut host = host_serving_a_buy();
+    fn builder_calls(host: &FakeHost) -> usize {
+        host.calls
+            .iter()
+            .filter(|call| call.url == SWAP_URL)
+            .count()
+    }
+
+    fn simulation_rejects(host: &mut FakeHost, rejects: bool) {
+        let err = if rejects {
+            json!({"InstructionError":[0,{"Custom":1}]})
+        } else {
+            Value::Null
+        };
         host.reply_only(
             &format!("{RPC} simulateTransaction"),
-            json!({"result":{"value":{"err":{"InstructionError":[0,{"Custom":1}]}}}}),
+            json!({"result":{"value":{"err":err}}}),
         );
+    }
+
+    #[test]
+    fn a_failed_simulation_signs_nothing_and_the_same_request_can_be_retried() {
+        let mut host = host_serving_a_buy();
+        simulation_rejects(&mut host, true);
         fake_host::install(host);
 
         let first = run_buy("buy-retry", false);
@@ -3993,21 +4041,28 @@ mod tests {
             dispatch_message(&first)
         );
         fake_host::with(|host| {
+            assert!(host.sign_requests.is_empty(), "simulation precedes signing");
             assert!(host.calls_for("sendTransaction").is_empty());
+            let simulation = host.calls_for("simulateTransaction")[0]
+                .rpc_params()
+                .unwrap();
+            assert_eq!(simulation[1]["sigVerify"], json!(false));
+            let simulated = B64.decode(simulation[0].as_str().unwrap()).unwrap();
+            let env = envelope(&simulated).unwrap();
+            assert_eq!(
+                simulated[env.sig_offset..env.sig_offset + 64],
+                [0; 64],
+                "only the unsigned transaction reaches the RPC"
+            );
         });
         assert_eq!(
             public_operation("buy-retry")["status"],
-            json!("simulation_failed")
+            json!("preflight_failed")
         );
 
-        // The same operation id and the same request rebuild and go through
-        // once the cluster stops rejecting the transaction.
-        fake_host::with(|host| {
-            host.reply_only(
-                &format!("{RPC} simulateTransaction"),
-                json!({"result":{"value":{"err":null}}}),
-            );
-        });
+        // Nothing was signed, so the same operation id and request rebuild
+        // and go through once the cluster stops rejecting the transaction.
+        fake_host::with(|host| simulation_rejects(host, false));
         let second = run_buy("buy-retry", false);
         assert_eq!(
             second,
@@ -4015,12 +4070,57 @@ mod tests {
             "{}",
             dispatch_message(&second)
         );
-        assert_eq!(
-            public_operation("buy-retry")["status"],
-            json!("submitted"),
-            "a safe pre-broadcast retry completes under the same operation id"
-        );
+        assert_eq!(public_operation("buy-retry")["status"], json!("submitted"));
         fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 2, "the retry rebuilt the transaction");
+            assert_eq!(host.sign_requests.len(), 1);
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    /// Earlier versions signed before simulating, so a stored
+    /// `simulation_failed` operation may have a signed transaction on an RPC
+    /// that can still land. It must never be rebuilt into a second
+    /// executable transaction; a retry may only sign its stored message again.
+    #[test]
+    fn a_signed_simulation_failure_is_never_rebuilt() {
+        let mut host = host_serving_a_buy();
+        simulation_rejects(&mut host, true);
+        fake_host::install(host);
+        run_buy("buy-legacy", false);
+        let key = sec(&legacy_owner(), SESSION, "buy-legacy");
+        let stored = fake_host::with(|host| {
+            let mut stored = host.secret_json(&key).unwrap();
+            stored["status"] = json!("simulation_failed");
+            host.seed_secret(&key, &stored);
+            stored
+        });
+
+        let retry = run_buy("buy-legacy", false);
+        assert!(dispatch_message(&retry).contains("simulation failed"));
+        fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 1, "a failed retry does not rebuild");
+            assert!(host.sign_requests.is_empty());
+            assert_eq!(
+                host.secret_json(&key).unwrap()["status"],
+                json!("simulation_failed")
+            );
+        });
+
+        fake_host::with(|host| simulation_rejects(host, false));
+        assert_eq!(run_buy("buy-legacy", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(
+                builder_calls(host),
+                1,
+                "a successful retry does not rebuild"
+            );
+            let raw = B64.decode(stored["tx"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                host.sign_requests[0].preimage,
+                envelope(&raw).unwrap().message,
+                "only the stored message is signed"
+            );
             assert_eq!(host.calls_for("sendTransaction").len(), 1);
         });
     }

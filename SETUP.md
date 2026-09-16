@@ -196,7 +196,8 @@ same id and different content is refused as `operationId already bound`.
 | `approval_pending` | a ceremony is still required; `action_id` is in the response | refreshes the transaction, keeps the same approval |
 | `approval_failed` | signing was refused | rebuilds and asks for a new approval |
 | `signing_uncertain` | signing returned no answer and may already have signed | re-signs the same message under the same approval |
-| `simulation_failed` | the simulated transaction failed before any broadcast | rebuilds with a fresh blockhash |
+| `preflight_failed` | the unsigned transaction failed simulation; nothing was signed | rebuilds with a fresh blockhash |
+| `simulation_failed` | earlier versions only: a signed transaction failed simulation on an RPC and may still land | re-signs the same message; never rebuilds |
 | `broadcast_attempted` | sent, with no acknowledgement — outcome unknown | reports it; never re-broadcasts |
 | `submitted` | the RPC returned the signature we sent | reports it |
 | `confirmed` / `finalized` | the cluster observed the transaction | reports it |
