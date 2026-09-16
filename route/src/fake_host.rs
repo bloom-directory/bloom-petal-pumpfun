@@ -54,7 +54,8 @@ pub struct FakeHost {
     served: BTreeMap<String, usize>,
     signatures: Vec<Result<SignOutcome, SdkError>>,
     derivations: Vec<Result<PetalKeyOutcome, SdkError>>,
-    puts: usize,
+    /// Successful store writes so far.
+    pub puts: usize,
     /// Make every store write after this many successful writes fail, to model
     /// a process that dies between a host effect and its durable record.
     pub fail_store_after: Option<usize>,
