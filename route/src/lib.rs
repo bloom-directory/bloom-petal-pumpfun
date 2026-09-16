@@ -992,6 +992,7 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             // signed, every retry signs the stored message again, which can
             // only reproduce the same transaction.
             if !v.may_be_signed
+                && v.approval.is_none()
                 && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
             {
                 v = match build_pending(a, &sess.address, &r, digest.clone()) {
@@ -1096,7 +1097,16 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     // not build another transaction.
     if let Err(e) = simulate(&p.tx) {
         p.status = "preflight_failed".into();
-        if !p.may_be_signed {
+        // A failed simulation says nothing permanent: a state-dependent
+        // failure can clear. An Exact approval binds these bytes, so it is
+        // given up only once their blockhash has provably expired.
+        let keep_exact_approval = p.approval.is_some()
+            && a.selector() == SignSelector::Exact
+            && !match blockhash_expired(&p) {
+                Ok(expired) => expired,
+                Err(error) => return error,
+            };
+        if !p.may_be_signed && !keep_exact_approval {
             p.approval = None;
         }
         if let Err(store_error) = put(&key, &p, true) {
@@ -1108,6 +1118,12 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
         if p.may_be_signed {
             return fail(format!(
                 "{}; this operation may already be signed, so it is never rebuilt: retry to sign the same transaction, or confirm it cannot land before using a new operationId",
+                dispatch_message(&e)
+            ));
+        }
+        if keep_exact_approval {
+            return fail(format!(
+                "{}; the transaction awaiting approval is kept until its blockhash expires, so retry",
                 dispatch_message(&e)
             ));
         }
@@ -2074,6 +2090,22 @@ fn transaction_fee(
         .and_then(Value::as_u64)
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
+}
+/// Whether this transaction's blockhash has provably expired: the cluster's
+/// finalized block height is past the `lastValidBlockHeight` recorded when it
+/// was built. Transactions without that record are never treated as expired.
+fn blockhash_expired(p: &Pending) -> Result<bool, DispatchResponse> {
+    let Some(last_valid) = p.api.get("lastValidBlockHeight").and_then(Value::as_u64) else {
+        return Ok(false);
+    };
+    let height = post(
+        RPC,
+        &rpc("getBlockHeight", json!([{"commitment":"finalized"}])),
+    )?
+    .get("result")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| fail("Solana RPC omitted the finalized block height"))?;
+    Ok(height > last_valid)
 }
 fn simulate(tx: &str) -> Result<(), DispatchResponse> {
     let v = post(
@@ -4868,11 +4900,13 @@ mod tests {
         });
     }
 
-    /// An Exact approval is never carried onto new bytes. When its pending
-    /// transaction can no longer land, the approval is dropped and the retry
-    /// rebuilds and asks for a new one explicitly.
+    /// An Exact approval is never carried onto new bytes, and a failed
+    /// simulation is not proof that its transaction can no longer land. The
+    /// approval is kept until the finalized block height passes the
+    /// transaction's last valid height; only then does a retry rebuild and
+    /// ask for a new approval.
     #[test]
-    fn an_exact_sweep_that_can_no_longer_land_asks_for_a_new_approval() {
+    fn an_exact_sweep_gives_up_its_approval_only_after_its_blockhash_expires() {
         let mut host = host_serving_a_buy();
         host.reply(
             &format!("{RPC} getBalance"),
@@ -4883,12 +4917,16 @@ mod tests {
             json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
         );
         host.sign_outcome(Ok(SignOutcome::ApprovalPending {
-            action_id: "exact-expired-message".into(),
+            action_id: "exact-pending".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "exact-pending".into(),
             expires_ms: NOW_MS + 60_000,
         }));
         fake_host::install(host);
         let body =
-            serde_json::to_vec(&json!({"operationId":"sweep-expired","destination":AMM_CREATOR}))
+            serde_json::to_vec(&json!({"operationId":"sweep-slow","destination":AMM_CREATOR}))
                 .unwrap();
         let run = || {
             execute(
@@ -4899,31 +4937,57 @@ mod tests {
                 &body,
             )
         };
+        let block_height = |height: u64| {
+            fake_host::with(|host| {
+                host.reply_only(&format!("{RPC} getBlockHeight"), json!({"result": height}));
+            });
+        };
         assert!(dispatch_message(&run()).contains("approval required"));
 
+        // A state-dependent failure while the blockhash is still valid keeps
+        // the approval and the exact bytes it binds.
         fake_host::with(|host| simulation_rejects(host, true));
-        assert!(dispatch_message(&run()).contains("simulation failed"));
-        assert_eq!(
-            public_operation("sweep-expired")["status"],
-            json!("preflight_failed")
-        );
-
-        fake_host::with(|host| {
-            simulation_rejects(host, false);
-            host.reply_only(
-                &format!("{RPC} getLatestBlockhash"),
-                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1001}}}),
-            );
-        });
-        run();
+        block_height(1000);
+        assert!(dispatch_message(&run()).contains("kept until its blockhash expires"));
+        fake_host::with(|host| simulation_rejects(host, false));
+        assert!(dispatch_message(&run()).contains("approval required"));
         fake_host::with(|host| {
             assert_eq!(host.sign_requests.len(), 2);
-            assert_ne!(
+            assert_eq!(
                 host.sign_requests[0].preimage,
                 host.sign_requests[1].preimage
             );
             assert_eq!(
-                host.sign_requests[1].approval_hint, None,
+                host.sign_requests[1].approval_hint.as_deref(),
+                Some("exact-pending")
+            );
+        });
+
+        // Once the finalized height passes the last valid height, the bytes
+        // can never land: the approval is dropped and the retry rebuilds.
+        fake_host::with(|host| simulation_rejects(host, true));
+        block_height(1001);
+        assert!(dispatch_message(&run()).contains("simulation failed"));
+        assert_eq!(
+            public_operation("sweep-slow")["status"],
+            json!("preflight_failed")
+        );
+        fake_host::with(|host| {
+            simulation_rejects(host, false);
+            host.reply_only(
+                &format!("{RPC} getLatestBlockhash"),
+                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1200}}}),
+            );
+        });
+        run();
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 3);
+            assert_ne!(
+                host.sign_requests[1].preimage,
+                host.sign_requests[2].preimage
+            );
+            assert_eq!(
+                host.sign_requests[2].approval_hint, None,
                 "a rebuilt Exact payload needs its own approval"
             );
         });

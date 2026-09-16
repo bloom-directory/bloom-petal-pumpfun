@@ -49,9 +49,10 @@ a different payment. What a retry does depends on where the operation stopped:
   not before using a new `operationId`.
 - `approval_pending` — the owner has not answered yet. A trading approval does
   not bind the transaction, so the Petal refreshes it while waiting. A close or
-  sweep approval binds the exact transaction, so it is kept; if it can no longer
-  land before the owner approves (a Solana blockhash lasts about a minute), the
-  next retry drops that approval, rebuilds, and asks for a new one.
+  sweep approval binds the exact transaction, so it is kept, even through a failed
+  simulation. Only once its blockhash has expired (the finalized block height
+  passes its last valid height, about a minute) does a retry drop that approval,
+  rebuild, and ask for a new one.
 - `broadcast_attempted`, `submitted`, `confirmed`, `finalized`, `chain_failed` —
   the attempt is already recorded. A retry reports it and never re-broadcasts.
 

@@ -175,7 +175,7 @@ pay twice.
 | --- | --- | --- |
 | `approval_pending` | an owner ceremony is required; `action_id` is in the response | trading writes: refresh the transaction and keep waiting. close/sweep: keep the exact transaction the owner is approving |
 | `approval_failed` | signing was refused | rebuilds and asks again, unless the transaction may already be signed |
-| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed. A close/sweep whose transaction could no longer land drops its approval and asks for a new one |
+| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed. A close/sweep awaiting approval keeps its transaction and approval, because a failed simulation can clear; only once its blockhash has expired (finalized block height past its last valid height) is the approval dropped and a new one requested |
 | `signing` | a signing call was interrupted before its outcome was recorded | treated as possibly signed: signs the same transaction again |
 | `signing_uncertain` | signing returned no answer and may already have signed | signs the same transaction again |
 | `simulation_failed` | earlier versions only: a signed transaction failed simulation on an RPC and may still land | treated as possibly signed: signs the same transaction again |
