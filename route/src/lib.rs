@@ -818,12 +818,17 @@ fn close_token_account_message(
     Ok(message)
 }
 
+/// Commitment for blockhash, fee, balance and simulation reads and for send
+/// preflight. They must agree: a lagging preflight rejects a blockhash the
+/// simulation accepted, and `processed` blocks can still be dropped.
+const COMMITMENT: &str = "confirmed";
+
 fn quote_message_fee(message: &[u8]) -> Result<u64, DispatchResponse> {
     let response = post(
         RPC,
         &rpc(
             "getFeeForMessage",
-            json!([B64.encode(message), {"commitment":"processed"}]),
+            json!([B64.encode(message), {"commitment":COMMITMENT}]),
         ),
     )?;
     response
@@ -844,14 +849,14 @@ fn build_sweep_pending(
         .ok_or_else(|| bad("destination required"))?;
     let balance = post(
         RPC,
-        &rpc("getBalance", json!([user, {"commitment":"processed"}])),
+        &rpc("getBalance", json!([user, {"commitment":COMMITMENT}])),
     )?
     .pointer("/result/value")
     .and_then(Value::as_u64)
     .ok_or_else(|| fail("Solana RPC omitted the session balance"))?;
     let latest = post(
         RPC,
-        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+        &rpc("getLatestBlockhash", json!([{"commitment":COMMITMENT}])),
     )?;
     let blockhash = latest
         .pointer("/result/value/blockhash")
@@ -932,7 +937,7 @@ fn build_close_token_account_pending(
     }
     let latest = post(
         RPC,
-        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+        &rpc("getLatestBlockhash", json!([{"commitment":COMMITMENT}])),
     )?;
     let blockhash = latest
         .pointer("/result/value/blockhash")
@@ -1267,9 +1272,12 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
         )
     } else {
+        // Preflight at the commitment the blockhash was read and simulated at.
+        // The finalized default lags and reports young blockhashes as
+        // BlockhashNotFound after the transaction is already signed.
         let request = rpc(
             "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
+            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
         );
         match post(RPC, &request) {
             Err(_) => post(RPC_VERIFY, &request),
@@ -2113,7 +2121,7 @@ fn transaction_fee(
         RPC,
         &rpc(
             "getFeeForMessage",
-            json!([B64.encode(env.message), {"commitment":"processed"}]),
+            json!([B64.encode(env.message), {"commitment":COMMITMENT}]),
         ),
     )?;
     let quoted = response
@@ -2143,7 +2151,7 @@ fn simulate(tx: &str) -> Result<(), DispatchResponse> {
         RPC,
         &rpc(
             "simulateTransaction",
-            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":"processed"}]),
+            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":COMMITMENT}]),
         ),
     )?;
     simulation_result(&v).map_err(fail)
@@ -4002,6 +4010,11 @@ mod tests {
             );
             assert_eq!(params[1]["encoding"], json!("base64"));
             assert_eq!(params[1]["skipPreflight"], json!(false));
+            assert_eq!(params[1]["preflightCommitment"], json!("confirmed"));
+            let simulation = host.calls_for("simulateTransaction")[0]
+                .rpc_params()
+                .expect("simulation params");
+            assert_eq!(simulation[1]["commitment"], json!("confirmed"));
         });
 
         assert_eq!(public_operation("buy-1")["status"], json!("submitted"));
