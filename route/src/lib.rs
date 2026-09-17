@@ -97,11 +97,8 @@ mod fake_host;
 mod host {
     #[cfg(not(test))]
     use petal::{
-        HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError,
-        SignOutcome,
+        HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError, SignOutcome,
     };
-    #[cfg(not(test))]
-    use serde_json::Value;
 
     #[cfg(not(test))]
     pub fn http(request: &HttpRequest, max_bytes: usize) -> Result<HttpResponse, SdkError> {
@@ -129,32 +126,9 @@ mod host {
     }
     #[cfg(not(test))]
     pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
-        // The pinned SDK validates through its own 6-field key-request
-        // schema and rejects the host's approval_value_limits extension, so
-        // validate the wallet the same way and call the key/derive host
-        // import directly with the extended request bytes.
-        let wallet = serde_json::from_slice::<Value>(request_jcs)
-            .ok()
-            .and_then(|value| value.get("wallet_id")?.as_str().map(str::to_owned))
-            .unwrap_or_default();
-        petal::validate_wallet_id(&wallet).map_err(SdkError::Message)?;
-        let outcome =
-            petal::bindings::bloom::key::derive::request(request_jcs).map_err(host_message)?;
+        let outcome = petal::sdk::request_key(request_jcs)?;
         serde_json::from_slice(&outcome)
             .map_err(|error| SdkError::Message(format!("decode Petal key outcome: {error}")))
-    }
-    #[cfg(not(test))]
-    fn host_message(message: String) -> SdkError {
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("not found") {
-            SdkError::Host(HostStatus::NotFound)
-        } else if lower.contains("denied") || lower.contains("permission") {
-            SdkError::Host(HostStatus::Denied)
-        } else if lower.contains("invalid") {
-            SdkError::Host(HostStatus::Invalid)
-        } else {
-            SdkError::Message(message)
-        }
     }
     #[cfg(not(test))]
     pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
@@ -560,11 +534,9 @@ fn session_key_request(
         allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
         allowed_crypto_suites: vec!["ed25519-message".into()],
         maximum_lifetime_ms: life,
+        approval_value_limits: serde_json::from_value(json!(value_limits))
+            .map_err(|error| fail(format!("session budgets: {error}")))?,
     };
-    // The pinned SDK exposes canonical key-request JSON. This host extension
-    // adds Broker approval budgets without changing the custody scope or WIT.
-    let mut request = serde_json::to_value(request).map_err(|error| fail(error.to_string()))?;
-    request["approval_value_limits"] = json!(value_limits);
     serde_jcs::to_vec(&request).map_err(|error| fail(error.to_string()))
 }
 
@@ -4615,15 +4587,11 @@ mod tests {
                      "lifetime":"20000000","rolling_windows":[]}
                 ])
             );
-            // The pinned SDK still decodes key requests into its own
-            // 6-field schema and rejects the budgets extension, so the
-            // production path must call the key/derive host import directly
-            // instead of routing through it. Pin that constraint here: if
-            // this ever decodes, the bypass can go away.
-            assert!(
-                serde_json::from_value::<petal::sdk::PetalKeyRequest>(host.key_requests[0].clone())
-                    .is_err()
-            );
+            // The SDK's own request type carries the budgets, so the request
+            // goes through `sdk::request_key` like any other key request.
+            let decoded: petal::sdk::PetalKeyRequest =
+                serde_json::from_value(host.key_requests[0].clone()).unwrap();
+            assert_eq!(decoded.approval_value_limits.len(), 1);
         });
     }
 
