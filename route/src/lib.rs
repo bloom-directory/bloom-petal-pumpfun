@@ -534,10 +534,10 @@ fn session_key_request(
         allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
         allowed_crypto_suites: vec!["ed25519-message".into()],
         maximum_lifetime_ms: life,
-        approval_value_limits: serde_json::from_value(json!(value_limits))
-            .map_err(|error| fail(format!("session budgets: {error}")))?,
     };
-    serde_jcs::to_vec(&request).map_err(|error| fail(error.to_string()))
+    let budgets: Vec<petal::ApprovalValueLimit> = serde_json::from_value(json!(value_limits))
+        .map_err(|error| fail(format!("session budgets: {error}")))?;
+    petal::key_request_jcs(&request, &budgets).map_err(fail)
 }
 
 /// Before a trade calls the builder, ask Bloom whether it still authorizes
@@ -4589,9 +4589,10 @@ mod tests {
             );
             // The SDK's own request type carries the budgets, so the request
             // goes through `sdk::request_key` like any other key request.
-            let decoded: petal::sdk::PetalKeyRequest =
-                serde_json::from_value(host.key_requests[0].clone()).unwrap();
-            assert_eq!(decoded.approval_value_limits.len(), 1);
+            let budgets: Vec<petal::ApprovalValueLimit> =
+                serde_json::from_value(host.key_requests[0]["approval_value_limits"].clone())
+                    .unwrap();
+            assert_eq!(budgets.len(), 1);
         });
     }
 
