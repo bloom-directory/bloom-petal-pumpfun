@@ -291,9 +291,13 @@ pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
         host.key_requests
             .push(serde_json::from_slice(request_jcs).expect("canonical key request"));
         if host.derivations.is_empty() {
-            return Err(SdkError::Message(
-                "fake host: no key derivation scripted".into(),
-            ));
+            // Unscripted: the session's key is live and authorized.
+            return Ok(PetalKeyOutcome::Ready {
+                operation_id: "fake-key-op".into(),
+                scope_digest: "fake-scope-digest".into(),
+                key_ref_jcs: br#"{"public_key_fingerprint":"test-fingerprint"}"#.to_vec(),
+                addresses: Vec::new(),
+            });
         }
         host.derivations.remove(0)
     })

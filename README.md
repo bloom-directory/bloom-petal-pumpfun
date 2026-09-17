@@ -141,12 +141,12 @@ requires `operationId`.
 Stopping a session is Bloom's core control, not a Petal route: writing to
 `wallets/<w>/<n>/sessions/pumpfun/<key-slot>/stop` revokes the session's
 approvals by key through the Broker, and the local `stop` leaf is gone.
-This Petal is `[account] aware`: it also runs under
-`wallets/<wallet>/<n>/petals/pumpfun/…`. Sessions are scoped by account
-number: the flat mount and account 0 are the same owner and share one set of
-sessions, while each numbered account `n > 0` has its own records and hashes
-`n` into its derived key slot, so the same session id on accounts 1 and 2
-yields two sessions with two keys.
+Before calling the builder, a trade asks Bloom whether the session is still
+authorized and refuses a stopped, expired, or exhausted session; the Broker
+refuses its signature regardless.
+Bloom mounts Petals only at `petals/`, so sessions belong to account 0 of the
+wallet in the path. The `[account] aware` declaration has no effect on current
+Bloom, which no longer mounts Petals under `wallets/<wallet>/<n>/`.
 Before stopping a session, sell any remaining token balance. Then write
 `{"operationId":"close-1","mint":"<mint>","tokenAccount":"<session token account>","destination":"<owner Solana address>","maxLamports":"2100000"}`
 to `close_token_account.json`. The Petal independently verifies through two

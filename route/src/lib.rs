@@ -135,12 +135,7 @@ mod host {
         // import directly with the extended request bytes.
         let wallet = serde_json::from_slice::<Value>(request_jcs)
             .ok()
-            .and_then(|value| {
-                value
-                    .get("wallet_id")?
-                    .as_str()
-                    .map(str::to_owned)
-            })
+            .and_then(|value| value.get("wallet_id")?.as_str().map(str::to_owned))
             .unwrap_or_default();
         petal::validate_wallet_id(&wallet).map_err(SdkError::Message)?;
         let outcome =
@@ -483,24 +478,9 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
         }
         Err(e) => return e,
     };
-    let request = petal::PetalKeyRequest {
-        wallet_id: owner.wallet.clone(),
-        key_slot: session_key_slot(&owner, &id),
-        allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
-        allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
-        allowed_crypto_suites: vec!["ed25519-message".into()],
-        maximum_lifetime_ms: life,
-    };
-    // The pinned SDK exposes canonical key-request JSON. This host extension
-    // adds Broker approval budgets without changing the custody scope or WIT.
-    let mut request = match serde_json::to_value(request) {
+    let request = match session_key_request(&owner, &id, life, &value_limits) {
         Ok(request) => request,
-        Err(error) => return fail(error.to_string()),
-    };
-    request["approval_value_limits"] = json!(value_limits);
-    let request = match serde_jcs::to_vec(&request) {
-        Ok(request) => request,
-        Err(error) => return fail(error.to_string()),
+        Err(error) => return error,
     };
     let out = match host::derive_key(&request) {
         Ok(v) => v,
@@ -565,6 +545,56 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
         Err(e) => e,
     }
 }
+/// The session's canonical key request. Repeating it is how a session asks
+/// Bloom for the current state of its authority.
+fn session_key_request(
+    owner: &SessionOwner,
+    id: &str,
+    life: u64,
+    value_limits: &[Value],
+) -> Result<Vec<u8>, DispatchResponse> {
+    let request = petal::PetalKeyRequest {
+        wallet_id: owner.wallet.clone(),
+        key_slot: session_key_slot(owner, id),
+        allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
+        allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
+        allowed_crypto_suites: vec!["ed25519-message".into()],
+        maximum_lifetime_ms: life,
+    };
+    // The pinned SDK exposes canonical key-request JSON. This host extension
+    // adds Broker approval budgets without changing the custody scope or WIT.
+    let mut request = serde_json::to_value(request).map_err(|error| fail(error.to_string()))?;
+    request["approval_value_limits"] = json!(value_limits);
+    serde_jcs::to_vec(&request).map_err(|error| fail(error.to_string()))
+}
+
+/// Before a trade calls the builder, ask Bloom whether it still authorizes
+/// the session. Stopping a session in Bloom does not reach this Petal's own
+/// record, and the Broker refuses the signature anyway; this only saves the
+/// builder call and fails with a clear reason.
+fn session_authority(
+    owner: &SessionOwner,
+    s: &str,
+    session: &Session,
+) -> Result<(), DispatchResponse> {
+    let request = session_key_request(
+        owner,
+        s,
+        session.duration_ms,
+        &session.approval_value_limits,
+    )?;
+    match host::derive_key(&request) {
+        Ok(petal::PetalKeyOutcome::Ready { .. }) => Ok(()),
+        Ok(petal::PetalKeyOutcome::Pending { .. }) => Err(deny(
+            "session authority pending: finish this session's steps in Bloom, then retry",
+        )),
+        Err(SdkError::Host(HostStatus::Denied)) => Err(deny(
+            "Bloom no longer authorizes this session: it was stopped, expired, or used its budget",
+        )),
+        Err(error) => Err(fail(sdk_message(&error))),
+    }
+}
+
 pub fn read_session(owner: &SessionOwner, s: &str) -> DispatchResponse {
     match get::<Session>(&sk(owner, s, "session.json")) {
         Ok(Some(v)) => petal::read_json_value(&v),
@@ -1031,6 +1061,11 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
                 && v.approval.is_none()
                 && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
             {
+                if a.selector() == SignSelector::Reusable
+                    && let Err(e) = session_authority(&owner, &s, &sess)
+                {
+                    return e;
+                }
                 v = match build_pending(a, &sess.address, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
@@ -1045,6 +1080,11 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             v
         }
         Ok(None) => {
+            if a.selector() == SignSelector::Reusable
+                && let Err(e) = session_authority(&owner, &s, &sess)
+            {
+                return e;
+            }
             let p = match build_pending(a, &sess.address, &r, digest) {
                 Ok(value) => value,
                 Err(e) => return e,
@@ -1074,6 +1114,9 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
         && !p.may_be_signed
         && a.selector() == SignSelector::Reusable
     {
+        if let Err(e) = session_authority(&owner, &s, &sess) {
+            return e;
+        }
         let approval = p.approval.clone();
         p = match build_pending(a, &sess.address, &r, p.digest.clone()) {
             Ok(value) => value,
@@ -3958,6 +4001,48 @@ mod tests {
         })
     }
 
+    /// A session Bloom no longer authorizes (stopped, expired, or out of
+    /// budget) or has not finished approving refuses a trade before the
+    /// builder is called, and records nothing.
+    #[test]
+    fn a_trade_asks_bloom_for_session_authority_before_the_builder() {
+        for (outcome, reason) in [
+            (
+                Err(SdkError::Host(HostStatus::Denied)),
+                "no longer authorizes",
+            ),
+            (
+                Ok(petal::PetalKeyOutcome::Pending {
+                    operation_id: "key-op".into(),
+                    scope_digest: "scope".into(),
+                }),
+                "pending",
+            ),
+        ] {
+            let mut host = host_serving_a_buy();
+            host.derivation(outcome);
+            fake_host::install(host);
+            let response = run_buy("buy-refused", false);
+            assert!(
+                dispatch_message(&response).contains(reason),
+                "{}",
+                dispatch_message(&response)
+            );
+            fake_host::with(|host| {
+                assert!(
+                    host.calls.is_empty(),
+                    "no builder or RPC call: {:?}",
+                    host.rpc_methods()
+                );
+                assert_eq!(host.key_requests.len(), 1);
+                assert!(
+                    host.secret_json(&sec(&legacy_owner(), SESSION, "buy-refused"))
+                        .is_none()
+                );
+            });
+        }
+    }
+
     #[test]
     fn a_buy_reaches_the_host_as_an_ordinary_send_transaction() {
         fake_host::install(host_serving_a_buy());
@@ -4536,10 +4621,8 @@ mod tests {
             // instead of routing through it. Pin that constraint here: if
             // this ever decodes, the bypass can go away.
             assert!(
-                serde_json::from_value::<petal::sdk::PetalKeyRequest>(
-                    host.key_requests[0].clone()
-                )
-                .is_err()
+                serde_json::from_value::<petal::sdk::PetalKeyRequest>(host.key_requests[0].clone())
+                    .is_err()
             );
         });
     }
