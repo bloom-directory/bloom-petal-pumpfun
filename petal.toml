@@ -50,6 +50,7 @@ paths = ["/api/v1/transactions"]
 
 [sign]
 allowed_intents = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config", "pumpfun.close_token_account", "pumpfun.sweep"]
+fee_asset = { chain = "solana", asset = "native" }
 
 [[key.derive]]
 route = "sessions/[wallet]/new.json"

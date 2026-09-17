@@ -1,4 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use petal::{
     Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
     SignSelector,
@@ -369,6 +370,12 @@ pub struct Session {
 struct SessionSecret {
     key_ref_jcs: Vec<u8>,
 }
+/// When this session's key was first requested. The host's key scope starts
+/// no earlier, so `requested_ms + duration` never overstates its authority.
+#[derive(Serialize, Deserialize)]
+struct SessionRequest {
+    requested_ms: u64,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct New {
@@ -413,47 +420,57 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
             "lifetime":amount.to_string(),"rolling_windows":[]}));
     }
     let public_key = sk(&owner, &id, "session.json");
-    match get::<Session>(&public_key) {
+    let existing = match get::<Session>(&public_key) {
         Ok(Some(existing))
-            if existing.duration_ms == life && existing.approval_value_limits == value_limits =>
+            if existing.duration_ms != life || existing.approval_value_limits != value_limits =>
         {
-            return DispatchResponse::Write;
+            return bad("session id already used with different duration or budgets");
         }
-        Ok(Some(_)) => return bad("session id already used with different duration or budgets"),
-        Ok(None) => {}
+        Ok(existing) => existing,
         Err(e) => return e,
+    };
+    if existing.as_ref().is_some_and(|session| session.stopped) {
+        return DispatchResponse::Write;
     }
-    let request = petal::PetalKeyRequest {
-        wallet_id: owner.wallet.clone(),
-        key_slot: session_key_slot(&owner, &id),
-        allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
-        allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
-        allowed_crypto_suites: vec!["ed25519-message".into()],
-        maximum_lifetime_ms: life,
+    // An existing session repeats the identical key request too. The host
+    // binds the session's approval to the wallet policy in force, and this is
+    // how a live session picks up a policy change: the same key and lifetime,
+    // Pending while the owner approves again.
+    let request_key = format!("{}{id}/session-request.json", sessions_prefix(&owner));
+    let requested_ms = match get_secret::<SessionRequest>(&request_key) {
+        Ok(Some(request)) => request.requested_ms,
+        Ok(None) => {
+            let request = SessionRequest {
+                requested_ms: host::now_ms(),
+            };
+            if existing.is_none()
+                && let Err(e) = put(&request_key, &request, true)
+            {
+                return e;
+            }
+            request.requested_ms
+        }
+        Err(e) => return e,
     };
-    // The pinned SDK exposes canonical key-request JSON. This host extension
-    // adds Broker approval budgets without changing the custody scope or WIT.
-    let mut request = match serde_json::to_value(request) {
+    let request = match session_key_request(&owner, &id, life, &value_limits) {
         Ok(request) => request,
-        Err(error) => return fail(error.to_string()),
-    };
-    request["approval_value_limits"] = json!(value_limits);
-    let request = match serde_jcs::to_vec(&request) {
-        Ok(request) => request,
-        Err(error) => return fail(error.to_string()),
+        Err(error) => return error,
     };
     let out = match host::derive_key(&request) {
         Ok(v) => v,
         Err(e) => return fail(sdk_message(&e)),
     };
+    let slot = session_key_slot(&owner, &id);
     let (key_ref_jcs, address) = match out {
         petal::PetalKeyOutcome::Pending {
             operation_id,
             scope_digest,
         } => {
             return deny(format!(
-                "key approval required: {}",
-                json!({"operation_id":operation_id,"scope_digest":scope_digest})
+                "session authority pending: the owner must finish this session's steps in Bloom, then retry the same request. The session key's address and any open ceremony are in /wallets/{}/{}/sessions/<pumpfun mount>/{slot}/session.json; if the session will be funded, allow that address as a destination before approving the session. {}",
+                owner.wallet,
+                owner.account,
+                json!({"operation_id":operation_id,"scope_digest":scope_digest,"key_slot":slot})
             ));
         }
         petal::PetalKeyOutcome::Ready {
@@ -467,7 +484,18 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
             (key_ref_jcs, a)
         }
     };
-    let now = host::now_ms();
+    let secret_key = session_sec(&owner, &id);
+    if let Some(existing) = existing {
+        return match get_secret::<SessionSecret>(&secret_key) {
+            Ok(Some(secret))
+                if secret.key_ref_jcs == key_ref_jcs && existing.address == address =>
+            {
+                DispatchResponse::Write
+            }
+            Ok(_) => fail("the host returned a different key for this existing session"),
+            Err(e) => e,
+        };
+    }
     let v = Session {
         schema: "bloom.pumpfun_session.v1".into(),
         wallet: owner.wallet.clone(),
@@ -475,11 +503,10 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
         address,
         duration_ms: life,
         approval_value_limits: value_limits,
-        created_ms: now,
-        expires_ms: now + life,
+        created_ms: host::now_ms(),
+        expires_ms: requested_ms + life,
         stopped: false,
     };
-    let secret_key = session_sec(&owner, &id);
     let secret = SessionSecret { key_ref_jcs };
     if let Err(e) = put_new(&secret_key, &secret, true) {
         match get_secret::<SessionSecret>(&secret_key) {
@@ -492,6 +519,54 @@ pub fn new_session(owner: SessionOwner, b: &[u8]) -> DispatchResponse {
         Err(e) => e,
     }
 }
+/// The session's canonical key request. Repeating it is how a session asks
+/// Bloom for the current state of its authority.
+fn session_key_request(
+    owner: &SessionOwner,
+    id: &str,
+    life: u64,
+    value_limits: &[Value],
+) -> Result<Vec<u8>, DispatchResponse> {
+    let request = petal::PetalKeyRequest {
+        wallet_id: owner.wallet.clone(),
+        key_slot: session_key_slot(owner, id),
+        allowed_routes: ROUTES.iter().map(|x| x.to_string()).collect(),
+        allowed_operation_classes: CLASSES.iter().map(|x| x.to_string()).collect(),
+        allowed_crypto_suites: vec!["ed25519-message".into()],
+        maximum_lifetime_ms: life,
+    };
+    let budgets: Vec<petal::ApprovalValueLimit> = serde_json::from_value(json!(value_limits))
+        .map_err(|error| fail(format!("session budgets: {error}")))?;
+    petal::key_request_jcs(&request, &budgets).map_err(fail)
+}
+
+/// Before a trade calls the builder, ask Bloom whether it still authorizes
+/// the session. Stopping a session in Bloom does not reach this Petal's own
+/// record, and the Broker refuses the signature anyway; this only saves the
+/// builder call and fails with a clear reason.
+fn session_authority(
+    owner: &SessionOwner,
+    s: &str,
+    session: &Session,
+) -> Result<(), DispatchResponse> {
+    let request = session_key_request(
+        owner,
+        s,
+        session.duration_ms,
+        &session.approval_value_limits,
+    )?;
+    match host::derive_key(&request) {
+        Ok(petal::PetalKeyOutcome::Ready { .. }) => Ok(()),
+        Ok(petal::PetalKeyOutcome::Pending { .. }) => Err(deny(
+            "session authority pending: finish this session's steps in Bloom, then retry",
+        )),
+        Err(SdkError::Host(HostStatus::Denied)) => Err(deny(
+            "Bloom no longer authorizes this session: it was stopped, expired, or used its budget",
+        )),
+        Err(error) => Err(fail(sdk_message(&error))),
+    }
+}
+
 pub fn read_session(owner: &SessionOwner, s: &str) -> DispatchResponse {
     match get::<Session>(&sk(owner, s, "session.json")) {
         Ok(Some(v)) => petal::read_json_value(&v),
@@ -553,6 +628,12 @@ struct Pending {
     status: String,
     signature: Option<String>,
     approval: Option<String>,
+    /// Set once any signing call for this message may have produced a
+    /// signature, and never cleared: a later refusal or failed simulation
+    /// says nothing about an earlier call. While set, the operation keeps
+    /// its message and can only sign that message again.
+    #[serde(default)]
+    may_be_signed: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Public {
@@ -627,6 +708,7 @@ fn build_pending(
         status: "built".into(),
         signature: None,
         approval: None,
+        may_be_signed: false,
     })
 }
 
@@ -738,12 +820,17 @@ fn close_token_account_message(
     Ok(message)
 }
 
+/// Commitment for blockhash, fee, balance and simulation reads and for send
+/// preflight. They must agree: a lagging preflight rejects a blockhash the
+/// simulation accepted, and `processed` blocks can still be dropped.
+const COMMITMENT: &str = "confirmed";
+
 fn quote_message_fee(message: &[u8]) -> Result<u64, DispatchResponse> {
     let response = post(
         RPC,
         &rpc(
             "getFeeForMessage",
-            json!([B64.encode(message), {"commitment":"processed"}]),
+            json!([B64.encode(message), {"commitment":COMMITMENT}]),
         ),
     )?;
     response
@@ -764,14 +851,14 @@ fn build_sweep_pending(
         .ok_or_else(|| bad("destination required"))?;
     let balance = post(
         RPC,
-        &rpc("getBalance", json!([user, {"commitment":"processed"}])),
+        &rpc("getBalance", json!([user, {"commitment":COMMITMENT}])),
     )?
     .pointer("/result/value")
     .and_then(Value::as_u64)
     .ok_or_else(|| fail("Solana RPC omitted the session balance"))?;
     let latest = post(
         RPC,
-        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+        &rpc("getLatestBlockhash", json!([{"commitment":COMMITMENT}])),
     )?;
     let blockhash = latest
         .pointer("/result/value/blockhash")
@@ -807,6 +894,7 @@ fn build_sweep_pending(
         status: "built".into(),
         signature: None,
         approval: None,
+        may_be_signed: false,
     })
 }
 
@@ -851,7 +939,7 @@ fn build_close_token_account_pending(
     }
     let latest = post(
         RPC,
-        &rpc("getLatestBlockhash", json!([{"commitment":"processed"}])),
+        &rpc("getLatestBlockhash", json!([{"commitment":COMMITMENT}])),
     )?;
     let blockhash = latest
         .pointer("/result/value/blockhash")
@@ -891,6 +979,7 @@ fn build_close_token_account_pending(
         status: "built".into(),
         signature: None,
         approval: None,
+        may_be_signed: false,
     })
 }
 pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> DispatchResponse {
@@ -929,14 +1018,26 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             if v.digest != digest {
                 return bad("operationId already bound");
             };
-            // Only outcomes that are certainly dead are rebuilt. A refused
-            // signature and a failed simulation both mean nothing was signed
-            // that anyone could still broadcast, so a fresh transaction under
-            // the same economic intent is safe. `signing_uncertain` is
-            // deliberately absent: that message may already be signed, so a
-            // retry re-enters signing with the stored message and approval
-            // rather than creating a second one.
-            if matches!(v.status.as_str(), "simulation_failed" | "approval_failed") {
+            // `signing` means a signing call was interrupted before its outcome
+            // was stored. `simulation_failed` is written only by earlier
+            // versions, which sent the signed transaction to an RPC to simulate
+            // it. Either may have left a signature behind.
+            if matches!(v.status.as_str(), "signing" | "simulation_failed") {
+                v.may_be_signed = true;
+            }
+            // Only an operation that was never possibly signed is rebuilt after
+            // a refusal or a failed unsigned simulation. Once it may have been
+            // signed, every retry signs the stored message again, which can
+            // only reproduce the same transaction.
+            if !v.may_be_signed
+                && v.approval.is_none()
+                && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
+            {
+                if a.selector() == SignSelector::Reusable
+                    && let Err(e) = session_authority(&owner, &s, &sess)
+                {
+                    return e;
+                }
                 v = match build_pending(a, &sess.address, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
@@ -951,6 +1052,11 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             v
         }
         Ok(None) => {
+            if a.selector() == SignSelector::Reusable
+                && let Err(e) = session_authority(&owner, &s, &sess)
+            {
+                return e;
+            }
             let p = match build_pending(a, &sess.address, &r, digest) {
                 Ok(value) => value,
                 Err(e) => return e,
@@ -971,7 +1077,18 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     ) {
         return DispatchResponse::Write;
     }
-    if p.status == "approval_pending" && p.approval.is_some() {
+    // A reusable approval does not bind the message, so waiting for it may
+    // refresh the transaction. An Exact approval binds these exact bytes:
+    // they are kept until it signs or simulation shows they can no longer
+    // land, which drops the approval and rebuilds under a new one.
+    if p.status == "approval_pending"
+        && p.approval.is_some()
+        && !p.may_be_signed
+        && a.selector() == SignSelector::Reusable
+    {
+        if let Err(e) = session_authority(&owner, &s, &sess) {
+            return e;
+        }
         let approval = p.approval.clone();
         p = match build_pending(a, &sess.address, &r, p.digest.clone()) {
             Ok(value) => value,
@@ -1026,6 +1143,49 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
+    // Simulate before signing: an RPC that receives a signed transaction can
+    // broadcast it, so a signature must never leave until this operation will
+    // not build another transaction.
+    if let Err(e) = simulate(&p.tx) {
+        p.status = "preflight_failed".into();
+        // A failed simulation says nothing permanent: a state-dependent
+        // failure can clear. An Exact approval binds these bytes, so it is
+        // given up only once their blockhash has provably expired.
+        let keep_exact_approval = p.approval.is_some()
+            && a.selector() == SignSelector::Exact
+            && !match blockhash_expired(&p) {
+                Ok(expired) => expired,
+                Err(error) => return error,
+            };
+        if !p.may_be_signed && !keep_exact_approval {
+            p.approval = None;
+        }
+        if let Err(store_error) = put(&key, &p, true) {
+            return store_error;
+        }
+        if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
+            return store_error;
+        }
+        if p.may_be_signed {
+            return fail(format!(
+                "{}; this operation may already be signed, so it is never rebuilt: retry to sign the same transaction, or confirm it cannot land before using a new operationId",
+                dispatch_message(&e)
+            ));
+        }
+        if keep_exact_approval {
+            return fail(format!(
+                "{}; the transaction awaiting approval is kept until its blockhash expires, so retry",
+                dispatch_message(&e)
+            ));
+        }
+        return e;
+    }
+    // Recorded before the host call, so an interruption leaves `signing`
+    // behind and the next retry treats the message as possibly signed.
+    p.status = "signing".into();
+    if let Err(e) = put(&key, &p, true) {
+        return e;
+    }
     let sig = match host::sign_payload(&PayloadSignRequest {
         wallet: owner.wallet.clone(),
         preimage: env.message.to_vec(),
@@ -1040,7 +1200,10 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
         selector: a.selector(),
         key_ref_jcs: Some(session_secret.key_ref_jcs),
     }) {
-        Ok(SignOutcome::Signature(v)) => v,
+        Ok(SignOutcome::Signature(v)) => {
+            p.may_be_signed = true;
+            v
+        }
         Ok(SignOutcome::ApprovalPending {
             action_id,
             expires_ms,
@@ -1082,6 +1245,7 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
                 p.approval = None;
             } else {
                 p.status = "signing_uncertain".into();
+                p.may_be_signed = true;
             }
             if let Err(store_error) = put(&key, &p, true) {
                 return store_error;
@@ -1105,17 +1269,6 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
     signed[env.sig_offset..env.sig_offset + 64].copy_from_slice(&sig);
     let tx = B64.encode(signed);
     let signature = bs58::encode(sig).into_string();
-    if let Err(e) = simulate(&tx) {
-        p.status = "simulation_failed".into();
-        p.approval = None;
-        if let Err(store_error) = put(&key, &p, true) {
-            return store_error;
-        }
-        if let Err(store_error) = publish(&owner, &s, &op, a, &p) {
-            return store_error;
-        }
-        return e;
-    }
     if let Err(e) = active_session(&owner, &s, a) {
         return e;
     }
@@ -1134,9 +1287,12 @@ pub fn execute(c: &Ctx, a: Action, owner: SessionOwner, s: String, b: &[u8]) -> 
             &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
         )
     } else {
+        // Preflight at the commitment the blockhash was read and simulated at.
+        // The finalized default lags and reports young blockhashes as
+        // BlockhashNotFound after the transaction is already signed.
         let request = rpc(
             "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0}]),
+            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
         );
         match post(RPC, &request) {
             Err(_) => post(RPC_VERIFY, &request),
@@ -1730,7 +1886,7 @@ pub fn preflight(c: &Ctx, w: String) -> DispatchResponse {
                 blockers.push(json!({
                     "blocker":"invalid_session_id",
                     "session":sid,
-                    "detail":format!("{}", dispatch_message(&e))
+                    "detail":dispatch_message(&e)
                 }));
             }
         }
@@ -1980,7 +2136,7 @@ fn transaction_fee(
         RPC,
         &rpc(
             "getFeeForMessage",
-            json!([B64.encode(env.message), {"commitment":"processed"}]),
+            json!([B64.encode(env.message), {"commitment":COMMITMENT}]),
         ),
     )?;
     let quoted = response
@@ -1989,12 +2145,28 @@ fn transaction_fee(
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
 }
+/// Whether this transaction's blockhash has provably expired: the cluster's
+/// finalized block height is past the `lastValidBlockHeight` recorded when it
+/// was built. Transactions without that record are never treated as expired.
+fn blockhash_expired(p: &Pending) -> Result<bool, DispatchResponse> {
+    let Some(last_valid) = p.api.get("lastValidBlockHeight").and_then(Value::as_u64) else {
+        return Ok(false);
+    };
+    let height = post(
+        RPC,
+        &rpc("getBlockHeight", json!([{"commitment":"finalized"}])),
+    )?
+    .get("result")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| fail("Solana RPC omitted the finalized block height"))?;
+    Ok(height > last_valid)
+}
 fn simulate(tx: &str) -> Result<(), DispatchResponse> {
     let v = post(
         RPC,
         &rpc(
             "simulateTransaction",
-            json!([tx,{"encoding":"base64","sigVerify":true,"commitment":"processed"}]),
+            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":COMMITMENT}]),
         ),
     )?;
     simulation_result(&v).map_err(fail)
@@ -2186,6 +2358,58 @@ fn require_account(
     } else {
         Err(format!("{label} account mismatch"))
     }
+}
+/// Solana's `find_program_address`: the first bump, counting down from 255,
+/// whose hash is not an Ed25519 point.
+fn program_address(seeds: &[&[u8]], program: &[u8; 32]) -> Result<[u8; 32], String> {
+    (0..=u8::MAX)
+        .rev()
+        .find_map(|bump| {
+            let mut hasher = Sha256::new();
+            for seed in seeds {
+                hasher.update(seed);
+            }
+            hasher.update([bump]);
+            hasher.update(program);
+            hasher.update(b"ProgramDerivedAddress");
+            let address: [u8; 32] = hasher.finalize().into();
+            CompressedEdwardsY(address)
+                .decompress()
+                .is_none()
+                .then_some(address)
+        })
+        .ok_or_else(|| "no program address exists for these seeds".into())
+}
+/// The session's own token account for `mint`: the associated token account
+/// under the SPL token program the instruction names at `program_position`.
+/// Builder responses are untrusted, so the account that receives or spends a
+/// trade's tokens is derived here rather than taken from the transaction.
+fn require_payer_token_account(
+    m: &Msg,
+    ix: &Ix,
+    position: usize,
+    program_position: usize,
+    payer: &[u8; 32],
+    mint: &[u8; 32],
+    label: &str,
+) -> Result<(), String> {
+    let token_program = account(m, ix, program_position)?;
+    if token_program != &pk(PROGRAMS[3])? && token_program != &pk(PROGRAMS[4])? {
+        return Err(format!("{label} token program is not SPL Token"));
+    }
+    let expected = program_address(&[payer, token_program, mint], &pk(PROGRAMS[2])?)?;
+    require_account(m, ix, position, &expected, label)
+}
+/// The pool Pump creates when a coin graduates: index 0, owned by the Pump
+/// program's pool authority for the mint, quoted in wrapped SOL. Anyone can
+/// create another pool for the same pair, so only this one is accepted.
+fn require_canonical_pool(m: &Msg, ix: &Ix, mint: &[u8; 32]) -> Result<(), String> {
+    let authority = program_address(&[b"pool-authority", mint], &pk(PROGRAMS[5])?)?;
+    let pool = program_address(
+        &[b"pool", &[0, 0], &authority, mint, &pk(SOL)?],
+        &pk(PROGRAMS[6])?,
+    )?;
+    require_account(m, ix, 0, &pool, "AMM pool")
 }
 
 fn validate_sweep_tx(
@@ -2728,6 +2952,15 @@ fn validate_protocol_instructions(
             }
             Action::Create if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "initial-buy mint")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    5,
+                    8,
+                    payer,
+                    mint,
+                    "initial-buy recipient",
+                )?;
                 require_account(message, ix, 6, payer, "initial-buy user")?;
                 let requested = request_u64(request, "solLamports")?;
                 let maximum = u128::from(requested) + (u128::from(requested) * 2).div_ceil(100);
@@ -2743,15 +2976,27 @@ fn validate_protocol_instructions(
             }
             Action::Buy if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "buy mint")?;
+                require_payer_token_account(message, ix, 5, 8, payer, mint, "buy recipient")?;
                 require_account(message, ix, 6, payer, "buy user")?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
                 validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
             }
             Action::Buy if program == &amm && has_discriminator(ix, IX_BUY) => {
+                require_canonical_pool(message, ix, mint)?;
                 require_account(message, ix, 1, payer, "AMM buy user")?;
                 require_account(message, ix, 3, mint, "AMM buy mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM buy quote mint")?;
+                require_payer_token_account(message, ix, 5, 11, payer, mint, "AMM buy recipient")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    6,
+                    12,
+                    payer,
+                    &wrapped_mint,
+                    "AMM buy wrapped SOL source",
+                )?;
                 validate_buy_cost(ix, max_buy_lamports(request)?)?;
                 validate_minimum_output(ix, 8, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
@@ -2764,9 +3009,20 @@ fn validate_protocol_instructions(
                 primary += 1;
             }
             Action::Sell if program == &amm && has_discriminator(ix, IX_SELL) => {
+                require_canonical_pool(message, ix, mint)?;
                 require_account(message, ix, 1, payer, "AMM sell user")?;
                 require_account(message, ix, 3, mint, "AMM sell mint")?;
                 require_account(message, ix, 4, &wrapped_mint, "AMM sell quote mint")?;
+                require_payer_token_account(message, ix, 5, 11, payer, mint, "AMM sell source")?;
+                require_payer_token_account(
+                    message,
+                    ix,
+                    6,
+                    12,
+                    payer,
+                    &wrapped_mint,
+                    "AMM sell recipient",
+                )?;
                 validate_sell_amount(ix, request_u64(request, "amount")?)?;
                 validate_minimum_output(ix, 16, request_u64(request, "minOutputAmount")?)?;
                 primary += 1;
@@ -3413,6 +3669,90 @@ mod tests {
         );
         (message, request, response)
     }
+    /// Builder transactions are untrusted, so every account that receives or
+    /// spends a trade's tokens, the AMM pool, and the token program used to
+    /// derive them must be the session's own. Each is swapped for a stranger's
+    /// account in an otherwise valid transaction.
+    #[test]
+    fn verifier_rejects_substituted_trade_accounts_and_pools() {
+        let parsed = |name: &str, action: Action, request: Value| {
+            let response = fixture(name);
+            let raw = B64
+                .decode(response.get("transaction").and_then(Value::as_str).unwrap())
+                .unwrap();
+            let mut message = message(envelope(&raw).unwrap().message).unwrap();
+            assert!(hydrate_lookups(&mut message, &response).is_ok());
+            (message, normalized(action, request), response)
+        };
+        let create = json!({"name":"Bloom Fixture","symbol":"BLMF","uri":"https://example.com/pumpfun-fixture.json","solLamports":"1000000","minOutputAmount":"1"});
+        let buy =
+            |mint| json!({"mint":mint,"amount":"1000000","minOutputAmount":"1","slippagePct":2});
+        let sell = json!({"mint":AMM_MINT,"amount":"1","minOutputAmount":"1","slippagePct":2});
+        let cases = [
+            ("create", Action::Create, create, PROGRAMS[5], vec![5, 8]),
+            (
+                "buy_bond",
+                Action::Buy,
+                buy(BOND_MINT),
+                PROGRAMS[5],
+                vec![5, 8],
+            ),
+            (
+                "buy_amm",
+                Action::Buy,
+                buy(AMM_MINT),
+                PROGRAMS[6],
+                vec![0, 5, 6, 11, 12],
+            ),
+            (
+                "sell_amm",
+                Action::Sell,
+                sell,
+                PROGRAMS[6],
+                vec![0, 5, 6, 11, 12],
+            ),
+        ];
+        for (name, action, request, program, positions) in cases {
+            let response = fixture(name);
+            let mint = pk(response["mintPublicKey"]
+                .as_str()
+                .or(request["mint"].as_str())
+                .unwrap())
+            .unwrap();
+            let program = pk(program).unwrap();
+            let payer = pk(USER).unwrap();
+            let prepared = || {
+                let (mut message, request, response) = parsed(name, action, request.clone());
+                let trade = message
+                    .instructions
+                    .iter()
+                    .position(|ix| {
+                        message.keys.get(ix.program) == Some(&program)
+                            && (has_discriminator(ix, IX_BUY) || has_discriminator(ix, IX_SELL))
+                    })
+                    .unwrap();
+                // The recorded sell quotes zero output, which is refused on its own.
+                if matches!(action, Action::Sell) {
+                    message.instructions[trade].data[16..24].copy_from_slice(&1u64.to_le_bytes());
+                }
+                (message, request, response, trade)
+            };
+            let (message, request, response, _) = prepared();
+            validate_message(&message, &payer, &mint, action, &request, &response)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+
+            for position in positions {
+                let (mut message, request, response, trade) = prepared();
+                message.keys.push([7; 32]);
+                message.instructions[trade].accounts[position] =
+                    u8::try_from(message.keys.len() - 1).unwrap();
+                assert!(
+                    validate_message(&message, &payer, &mint, action, &request, &response).is_err(),
+                    "{name}: account {position} was substituted"
+                );
+            }
+        }
+    }
     #[test]
     fn verifier_rejects_wrong_action_and_unused_requested_mint() {
         let (mut message, request, response) = parsed_buy_fixture();
@@ -3633,6 +3973,48 @@ mod tests {
         })
     }
 
+    /// A session Bloom no longer authorizes (stopped, expired, or out of
+    /// budget) or has not finished approving refuses a trade before the
+    /// builder is called, and records nothing.
+    #[test]
+    fn a_trade_asks_bloom_for_session_authority_before_the_builder() {
+        for (outcome, reason) in [
+            (
+                Err(SdkError::Host(HostStatus::Denied)),
+                "no longer authorizes",
+            ),
+            (
+                Ok(petal::PetalKeyOutcome::Pending {
+                    operation_id: "key-op".into(),
+                    scope_digest: "scope".into(),
+                }),
+                "pending",
+            ),
+        ] {
+            let mut host = host_serving_a_buy();
+            host.derivation(outcome);
+            fake_host::install(host);
+            let response = run_buy("buy-refused", false);
+            assert!(
+                dispatch_message(&response).contains(reason),
+                "{}",
+                dispatch_message(&response)
+            );
+            fake_host::with(|host| {
+                assert!(
+                    host.calls.is_empty(),
+                    "no builder or RPC call: {:?}",
+                    host.rpc_methods()
+                );
+                assert_eq!(host.key_requests.len(), 1);
+                assert!(
+                    host.secret_json(&sec(&legacy_owner(), SESSION, "buy-refused"))
+                        .is_none()
+                );
+            });
+        }
+    }
+
     #[test]
     fn a_buy_reaches_the_host_as_an_ordinary_send_transaction() {
         fake_host::install(host_serving_a_buy());
@@ -3685,6 +4067,11 @@ mod tests {
             );
             assert_eq!(params[1]["encoding"], json!("base64"));
             assert_eq!(params[1]["skipPreflight"], json!(false));
+            assert_eq!(params[1]["preflightCommitment"], json!("confirmed"));
+            let simulation = host.calls_for("simulateTransaction")[0]
+                .rpc_params()
+                .expect("simulation params");
+            assert_eq!(simulation[1]["commitment"], json!("confirmed"));
         });
 
         assert_eq!(public_operation("buy-1")["status"], json!("submitted"));
@@ -3795,7 +4182,6 @@ mod tests {
                 host.calls_for("sendTransaction").is_empty(),
                 "nothing may be broadcast when signing was refused"
             );
-            assert!(host.calls_for("simulateTransaction").is_empty());
         });
         assert_eq!(
             public_operation("buy-denied")["status"],
@@ -3834,13 +4220,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_simulation_never_broadcasts_and_the_same_request_can_be_retried() {
-        let mut host = host_serving_a_buy();
+    fn builder_calls(host: &FakeHost) -> usize {
+        host.calls
+            .iter()
+            .filter(|call| call.url == SWAP_URL)
+            .count()
+    }
+
+    fn simulation_rejects(host: &mut FakeHost, rejects: bool) {
+        let err = if rejects {
+            json!({"InstructionError":[0,{"Custom":1}]})
+        } else {
+            Value::Null
+        };
         host.reply_only(
             &format!("{RPC} simulateTransaction"),
-            json!({"result":{"value":{"err":{"InstructionError":[0,{"Custom":1}]}}}}),
+            json!({"result":{"value":{"err":err}}}),
         );
+    }
+
+    #[test]
+    fn an_uncertain_signature_survives_a_failed_preflight() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        fake_host::install(host);
+        run_buy("review-uncertain", false);
+        assert_eq!(
+            public_operation("review-uncertain")["status"],
+            json!("signing_uncertain")
+        );
+        fake_host::with(|host| simulation_rejects(host, true));
+        run_buy("review-uncertain", false);
+        fake_host::with(|host| simulation_rejects(host, false));
+        run_buy("review-uncertain", false);
+        fake_host::with(|host| {
+            assert_eq!(
+                builder_calls(host),
+                1,
+                "an uncertain signature must never permit a rebuild"
+            )
+        });
+    }
+
+    #[test]
+    fn a_legacy_signed_failure_survives_a_later_denial() {
+        let mut host = host_serving_a_buy();
+        simulation_rejects(&mut host, true);
+        fake_host::install(host);
+        run_buy("review-legacy", false);
+        let key = sec(&legacy_owner(), SESSION, "review-legacy");
+        fake_host::with(|host| {
+            let mut stored = host.secret_json(&key).unwrap();
+            stored["status"] = json!("simulation_failed");
+            host.seed_secret(&key, &stored);
+            simulation_rejects(host, false);
+            host.sign_outcome(Err(SdkError::Host(HostStatus::Denied)));
+        });
+        run_buy("review-legacy", false);
+        run_buy("review-legacy", false);
+        fake_host::with(|host| {
+            assert_eq!(
+                builder_calls(host),
+                1,
+                "a later denial cannot erase an earlier signed transaction"
+            )
+        });
+    }
+
+    #[test]
+    fn an_exact_sweep_retry_preserves_the_approved_message() {
+        let mut host = host_serving_a_buy();
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":1_000_000}}),
+        );
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "exact-old-message".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        let body =
+            serde_json::to_vec(&json!({"operationId":"review-sweep","destination":AMM_CREATOR}))
+                .unwrap();
+        let run = || {
+            execute(
+                &ctx(&[("bloom.route_id", "ROUTE_SWEEP")]),
+                Action::Sweep,
+                legacy_owner(),
+                SESSION.into(),
+                &body,
+            )
+        };
+        assert!(dispatch_message(&run()).contains("approval required"));
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} getLatestBlockhash"),
+                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1001}}}),
+            );
+        });
+        run();
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2);
+            assert_eq!(
+                host.sign_requests[1].approval_hint.as_deref(),
+                Some("exact-old-message")
+            );
+            assert!(
+                host.sign_requests[0].preimage == host.sign_requests[1].preimage,
+                "the same Exact approval hint was attached to a different transaction"
+            );
+        });
+    }
+
+    #[test]
+    fn a_failed_simulation_signs_nothing_and_the_same_request_can_be_retried() {
+        let mut host = host_serving_a_buy();
+        simulation_rejects(&mut host, true);
         fake_host::install(host);
 
         let first = run_buy("buy-retry", false);
@@ -3850,21 +4349,28 @@ mod tests {
             dispatch_message(&first)
         );
         fake_host::with(|host| {
+            assert!(host.sign_requests.is_empty(), "simulation precedes signing");
             assert!(host.calls_for("sendTransaction").is_empty());
+            let simulation = host.calls_for("simulateTransaction")[0]
+                .rpc_params()
+                .unwrap();
+            assert_eq!(simulation[1]["sigVerify"], json!(false));
+            let simulated = B64.decode(simulation[0].as_str().unwrap()).unwrap();
+            let env = envelope(&simulated).unwrap();
+            assert_eq!(
+                simulated[env.sig_offset..env.sig_offset + 64],
+                [0; 64],
+                "only the unsigned transaction reaches the RPC"
+            );
         });
         assert_eq!(
             public_operation("buy-retry")["status"],
-            json!("simulation_failed")
+            json!("preflight_failed")
         );
 
-        // The same operation id and the same request rebuild and go through
-        // once the cluster stops rejecting the transaction.
-        fake_host::with(|host| {
-            host.reply_only(
-                &format!("{RPC} simulateTransaction"),
-                json!({"result":{"value":{"err":null}}}),
-            );
-        });
+        // Nothing was signed, so the same operation id and request rebuild
+        // and go through once the cluster stops rejecting the transaction.
+        fake_host::with(|host| simulation_rejects(host, false));
         let second = run_buy("buy-retry", false);
         assert_eq!(
             second,
@@ -3872,12 +4378,57 @@ mod tests {
             "{}",
             dispatch_message(&second)
         );
-        assert_eq!(
-            public_operation("buy-retry")["status"],
-            json!("submitted"),
-            "a safe pre-broadcast retry completes under the same operation id"
-        );
+        assert_eq!(public_operation("buy-retry")["status"], json!("submitted"));
         fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 2, "the retry rebuilt the transaction");
+            assert_eq!(host.sign_requests.len(), 1);
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    /// Earlier versions signed before simulating, so a stored
+    /// `simulation_failed` operation may have a signed transaction on an RPC
+    /// that can still land. It must never be rebuilt into a second
+    /// executable transaction; a retry may only sign its stored message again.
+    #[test]
+    fn a_signed_simulation_failure_is_never_rebuilt() {
+        let mut host = host_serving_a_buy();
+        simulation_rejects(&mut host, true);
+        fake_host::install(host);
+        run_buy("buy-legacy", false);
+        let key = sec(&legacy_owner(), SESSION, "buy-legacy");
+        let stored = fake_host::with(|host| {
+            let mut stored = host.secret_json(&key).unwrap();
+            stored["status"] = json!("simulation_failed");
+            host.seed_secret(&key, &stored);
+            stored
+        });
+
+        let retry = run_buy("buy-legacy", false);
+        assert!(dispatch_message(&retry).contains("may already be signed"));
+        fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 1, "a failed retry does not rebuild");
+            assert!(host.sign_requests.is_empty());
+            assert_eq!(
+                host.secret_json(&key).unwrap()["may_be_signed"],
+                json!(true)
+            );
+        });
+
+        fake_host::with(|host| simulation_rejects(host, false));
+        assert_eq!(run_buy("buy-legacy", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(
+                builder_calls(host),
+                1,
+                "a successful retry does not rebuild"
+            );
+            let raw = B64.decode(stored["tx"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                host.sign_requests[0].preimage,
+                envelope(&raw).unwrap().message,
+                "only the stored message is signed"
+            );
             assert_eq!(host.calls_for("sendTransaction").len(), 1);
         });
     }
@@ -4014,7 +4565,9 @@ mod tests {
         );
         let message = dispatch_message(&response);
         assert!(
-            message.contains("key approval required") && message.contains("key-op-1"),
+            message.contains("session authority pending")
+                && message.contains("key-op-1")
+                && message.contains(&session_key_slot(&legacy_owner(), SESSION)),
             "{message}"
         );
         fake_host::with(|host| {
@@ -4034,18 +4587,25 @@ mod tests {
                      "lifetime":"20000000","rolling_windows":[]}
                 ])
             );
+            // The SDK's own request type carries the budgets, so the request
+            // goes through `sdk::request_key` like any other key request.
+            let budgets: Vec<petal::ApprovalValueLimit> =
+                serde_json::from_value(host.key_requests[0]["approval_value_limits"].clone())
+                    .unwrap();
+            assert_eq!(budgets.len(), 1);
         });
     }
 
     #[test]
-    fn a_session_deadline_is_the_lifetime_this_petal_asked_for() {
-        // The pinned SDK's `PetalKeyOutcome::Ready` carries no expiry, so the
-        // Petal can only record `now + requested lifetime`. When the ceremony
-        // takes a while, the Signer's grant is already older than that. This
-        // test pins the current behaviour so the gap is visible; preflight
-        // reports it as an operator check rather than pretending otherwise.
-        let derive_completed_ms = NOW_MS + 900_000;
-        let mut host = FakeHost::new(derive_completed_ms);
+    fn a_session_deadline_never_outlasts_the_hosts_key() {
+        // The host's key scope starts when its derivation ceremony completes,
+        // which is no earlier than the first request. Counting the lifetime
+        // from that request never overstates the session's authority.
+        let mut host = FakeHost::new(NOW_MS);
+        host.derivation(Ok(petal::PetalKeyOutcome::Pending {
+            operation_id: "key-op-2".into(),
+            scope_digest: "scope-digest-2".into(),
+        }));
         host.derivation(Ok(petal::PetalKeyOutcome::Ready {
             operation_id: "key-op-2".into(),
             scope_digest: "scope-digest-2".into(),
@@ -4053,11 +4613,12 @@ mod tests {
             addresses: vec![USER.into()],
         }));
         fake_host::install(host);
+        let body = br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#;
+        assert_ne!(new_session(legacy_owner(), body), DispatchResponse::Write);
 
-        let response = new_session(
-            legacy_owner(),
-            br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#,
-        );
+        let derive_completed_ms = NOW_MS + 900_000;
+        fake_host::with(|host| host.now_ms = derive_completed_ms);
+        let response = new_session(legacy_owner(), body);
         assert_eq!(
             response,
             DispatchResponse::Write,
@@ -4077,14 +4638,14 @@ mod tests {
             DispatchResponse::Write,
             "a retry cannot increase the session budget"
         );
-        fake_host::with(|host| assert_eq!(host.key_requests.len(), 1));
+        fake_host::with(|host| assert_eq!(host.key_requests.len(), 2));
         assert_eq!(stored["approval_value_limits"][0]["lifetime"], "20000000");
         assert_eq!(stored["address"], json!(USER));
         assert_eq!(stored["created_ms"], json!(derive_completed_ms));
         assert_eq!(
             stored["expires_ms"],
-            json!(derive_completed_ms + 3_600_000),
-            "the recorded deadline starts when the ceremony finished, not when it began"
+            json!(NOW_MS + 3_600_000),
+            "the deadline counts from the first request, not from ceremony completion"
         );
         assert!(
             stored.get("key_ref_jcs").is_none(),
@@ -4095,6 +4656,66 @@ mod tests {
                 host.secret_json(&session_sec(&legacy_owner(), SESSION))
                     .is_some(),
                 "the signing reference belongs in the secret namespace"
+            );
+        });
+    }
+
+    /// A policy change makes the host restage an existing session's approval.
+    /// Repeating new.json reaches that reconciliation with the same key
+    /// request and reports Pending, without replacing the key or resetting
+    /// the session's lifetime.
+    #[test]
+    fn an_existing_session_reconciles_its_authority_without_resetting() {
+        let ready = || {
+            Ok(petal::PetalKeyOutcome::Ready {
+                operation_id: "key-op-3".into(),
+                scope_digest: "scope-digest-3".into(),
+                key_ref_jcs: br#"{"public_key_fingerprint":"test-fingerprint"}"#.to_vec(),
+                addresses: vec![USER.into()],
+            })
+        };
+        let mut host = FakeHost::new(NOW_MS);
+        host.derivation(ready());
+        host.derivation(Ok(petal::PetalKeyOutcome::Pending {
+            operation_id: "key-op-3".into(),
+            scope_digest: "scope-digest-3".into(),
+        }));
+        host.derivation(ready());
+        host.derivation(Ok(petal::PetalKeyOutcome::Ready {
+            operation_id: "key-op-3".into(),
+            scope_digest: "scope-digest-3".into(),
+            key_ref_jcs: br#"{"public_key_fingerprint":"another-key"}"#.to_vec(),
+            addresses: vec![USER.into()],
+        }));
+        fake_host::install(host);
+        let body = br#"{"id":"agent-1","duration_ms":3600000,"max_lamports":"20000000"}"#;
+        assert_eq!(new_session(legacy_owner(), body), DispatchResponse::Write);
+        let created = fake_host::with(|host| {
+            host.now_ms = NOW_MS + 600_000;
+            host.state_json(&sk(&legacy_owner(), SESSION, "session.json"))
+                .unwrap()
+        });
+
+        let pending = new_session(legacy_owner(), body);
+        assert!(dispatch_message(&pending).contains("session authority pending"));
+        assert_eq!(new_session(legacy_owner(), body), DispatchResponse::Write);
+        assert_ne!(
+            new_session(legacy_owner(), body),
+            DispatchResponse::Write,
+            "a different key for the same session is refused"
+        );
+        fake_host::with(|host| {
+            assert_eq!(host.key_requests.len(), 4);
+            assert!(
+                host.key_requests
+                    .iter()
+                    .all(|request| *request == host.key_requests[0])
+            );
+            assert_eq!(
+                host.state_json(&sk(&legacy_owner(), SESSION, "session.json"))
+                    .unwrap(),
+                created,
+                "reconciliation never rewrites the session record"
             );
         });
     }
@@ -4312,9 +4933,10 @@ mod tests {
     #[test]
     fn a_crash_before_the_durable_broadcast_record_never_broadcasts() {
         let mut host = host_serving_a_buy();
-        // Let the two writes that stage the operation land, then fail the
-        // write that records the broadcast attempt. The send must not happen.
-        host.fail_store_after = Some(2);
+        // Let the writes that stage the operation and record the signing
+        // attempt land, then fail the write that records the broadcast
+        // attempt. The send must not happen.
+        host.fail_store_after = Some(3);
         fake_host::install(host);
 
         let response = run_buy("buy-crash", false);
@@ -4323,9 +4945,207 @@ mod tests {
             "a store failure must surface, not be swallowed: {response:?}"
         );
         fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 1, "the signature was produced");
             assert!(
                 host.calls_for("sendTransaction").is_empty(),
                 "a broadcast may not precede its durable record"
+            );
+            host.fail_store_after = None;
+        });
+
+        // The signature exists but was never recorded; only the `signing`
+        // marker survived. The retry must sign the same message, not rebuild.
+        assert_eq!(run_buy("buy-crash", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 1);
+            assert_eq!(
+                host.sign_requests[0].preimage,
+                host.sign_requests[1].preimage
+            );
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    /// A signing call can outlive its process. When a signature comes back
+    /// for an operation that was waiting on its approval and nothing after it
+    /// is recorded, the retry must not refresh the transaction as if the
+    /// approval were still pending.
+    #[test]
+    fn a_signature_interrupted_after_an_approval_wait_is_never_rebuilt() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "session-approval".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("buy-interrupted", false)).contains("approval required"));
+
+        // Refresh, publish, and the signing marker land; the broadcast record does not.
+        fake_host::with(|host| host.fail_store_after = Some(host.puts + 3));
+        assert!(matches!(
+            run_buy("buy-interrupted", false),
+            DispatchResponse::Error { .. }
+        ));
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2);
+            assert!(host.calls_for("sendTransaction").is_empty());
+            host.fail_store_after = None;
+        });
+
+        assert_eq!(run_buy("buy-interrupted", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(
+                builder_calls(host),
+                2,
+                "the interrupted signature is not rebuilt"
+            );
+            assert_eq!(
+                host.sign_requests[1].preimage,
+                host.sign_requests[2].preimage
+            );
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    /// Blockhash expiry settles only an unsigned transaction. A sweep that may
+    /// already be signed could have landed before its blockhash expired, so
+    /// neither a failed simulation nor expiry makes it rebuildable.
+    #[test]
+    fn expiry_never_makes_a_possibly_signed_sweep_rebuildable() {
+        let mut host = host_serving_a_buy();
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":1_000_000}}),
+        );
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.reply(&format!("{RPC} getBlockHeight"), json!({"result": 5000}));
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Backend)));
+        host.sign_outcome(Err(SdkError::Host(HostStatus::Denied)));
+        fake_host::install(host);
+        let body =
+            serde_json::to_vec(&json!({"operationId":"sweep-uncertain","destination":AMM_CREATOR}))
+                .unwrap();
+        let run = || {
+            execute(
+                &ctx(&[("bloom.route_id", "ROUTE_SWEEP")]),
+                Action::Sweep,
+                legacy_owner(),
+                SESSION.into(),
+                &body,
+            )
+        };
+        assert!(dispatch_message(&run()).contains("may already have produced a signature"));
+        fake_host::with(|host| simulation_rejects(host, true));
+        assert!(dispatch_message(&run()).contains("may already be signed"));
+        fake_host::with(|host| simulation_rejects(host, false));
+        run();
+        run();
+        fake_host::with(|host| {
+            assert_eq!(
+                host.calls_for("getLatestBlockhash").len(),
+                1,
+                "never rebuilt"
+            );
+            assert!(
+                host.sign_requests
+                    .windows(2)
+                    .all(|pair| pair[0].preimage == pair[1].preimage)
+            );
+        });
+    }
+
+    /// An Exact approval is never carried onto new bytes, and a failed
+    /// simulation is not proof that its transaction can no longer land. The
+    /// approval is kept until the finalized block height passes the
+    /// transaction's last valid height; only then does a retry rebuild and
+    /// ask for a new approval.
+    #[test]
+    fn an_exact_sweep_gives_up_its_approval_only_after_its_blockhash_expires() {
+        let mut host = host_serving_a_buy();
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":1_000_000}}),
+        );
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "exact-pending".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "exact-pending".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        let body =
+            serde_json::to_vec(&json!({"operationId":"sweep-slow","destination":AMM_CREATOR}))
+                .unwrap();
+        let run = || {
+            execute(
+                &ctx(&[("bloom.route_id", "ROUTE_SWEEP")]),
+                Action::Sweep,
+                legacy_owner(),
+                SESSION.into(),
+                &body,
+            )
+        };
+        let block_height = |height: u64| {
+            fake_host::with(|host| {
+                host.reply_only(&format!("{RPC} getBlockHeight"), json!({"result": height}));
+            });
+        };
+        assert!(dispatch_message(&run()).contains("approval required"));
+
+        // A state-dependent failure while the blockhash is still valid keeps
+        // the approval and the exact bytes it binds.
+        fake_host::with(|host| simulation_rejects(host, true));
+        block_height(1000);
+        assert!(dispatch_message(&run()).contains("kept until its blockhash expires"));
+        fake_host::with(|host| simulation_rejects(host, false));
+        assert!(dispatch_message(&run()).contains("approval required"));
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2);
+            assert_eq!(
+                host.sign_requests[0].preimage,
+                host.sign_requests[1].preimage
+            );
+            assert_eq!(
+                host.sign_requests[1].approval_hint.as_deref(),
+                Some("exact-pending")
+            );
+        });
+
+        // Once the finalized height passes the last valid height, the bytes
+        // can never land: the approval is dropped and the retry rebuilds.
+        fake_host::with(|host| simulation_rejects(host, true));
+        block_height(1001);
+        assert!(dispatch_message(&run()).contains("simulation failed"));
+        assert_eq!(
+            public_operation("sweep-slow")["status"],
+            json!("preflight_failed")
+        );
+        fake_host::with(|host| {
+            simulation_rejects(host, false);
+            host.reply_only(
+                &format!("{RPC} getLatestBlockhash"),
+                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1200}}}),
+            );
+        });
+        run();
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 3);
+            assert_ne!(
+                host.sign_requests[1].preimage,
+                host.sign_requests[2].preimage
+            );
+            assert_eq!(
+                host.sign_requests[2].approval_hint, None,
+                "a rebuilt Exact payload needs its own approval"
             );
         });
     }
