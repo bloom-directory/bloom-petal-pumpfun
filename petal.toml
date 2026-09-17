@@ -13,7 +13,7 @@ outputs = ["petal/pumpfun"]
 aware = true
 
 [consent]
-summary = "Inspect Pump.fun coins; create and trade coins; collect fees or cashback; and manage fee sharing with a scoped Bloom Solana key."
+summary = "Inspect Pump.fun coins; buy and sell existing coins; collect fees or cashback; and manage fee sharing with a scoped Bloom Solana key. Coin creation is unsupported in this release."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:key.derive"]

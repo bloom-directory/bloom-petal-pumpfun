@@ -1,15 +1,30 @@
 # Pump.fun Petal
 
-A mainnet Pump.fun integration for Bloom. It reads coin state, creates coins,
-buys and sells through Pump's automatic bonding-curve/PumpSwap routing,
+A mainnet Pump.fun integration for Bloom. It reads coin state, buys and sells
+existing coins through Pump's automatic bonding-curve/PumpSwap routing,
 collects creator fees or cashback, and creates or updates fee-sharing configs.
 
 Writes use a short-lived Ed25519 key derived and held by Bloom. Fund the public
 `address` returned by `session.json`; the owner's root key never reaches Pump.
 
+## What this release supports
+
+The supported flow is one session over an existing coin:
+
+`create session → review address and budgets → approve → fund → buy → sell →
+stop → close token accounts → sweep remaining SOL`
+
+**Coin creation is not supported in this release.** The `create.json` route and
+its recipient and pool checks are present and still enforced, but the route has
+never been run against Pump's real create program, so treat it as unverified:
+do not use it, and do not rely on it working. Creation acceptance is tracked in
+[PM #33](https://github.com/bloom-directory/pm/issues/33). Everything below that
+mentions `create` describes the route as built, not as verified.
+
 ## How a write is authorized
 
-Trading writes — create, buy, sell, collect_fees, sharing_config — sign under
+Trading writes — buy, sell, collect_fees, sharing_config, and the unsupported
+create — sign under
 one reusable Bloom approval for the session key. The owner approves it once,
 with the session's budgets, after admitting the session address to the wallet
 policy. It covers only this package's declared routes and operation classes and
@@ -129,7 +144,7 @@ fees of trading writes. `token_limits` maps each mint the session may sell
 to its cumulative raw-token debit ceiling. See [SETUP.md](SETUP.md) before
 choosing these budgets; they are sealed into the trading approval, and close and
 sweep are approved separately.
-Create bodies
+Create bodies — for the unsupported `create.json` route —
 require `name`, `symbol`, `uri`, positive decimal-string `solLamports`, and a
 positive decimal-string `minOutputAmount`. Buy and sell bodies require `mint`,
 a positive decimal-string `amount`, and `minOutputAmount` in raw output units.

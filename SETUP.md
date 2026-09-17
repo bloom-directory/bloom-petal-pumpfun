@@ -1,5 +1,13 @@
 # Pump.fun Petal — operational notes
 
+## Scope
+
+These notes cover the supported flow: create a session, review its address and
+budgets, approve, fund, buy and sell an existing coin, stop, close token
+accounts, sweep. Coin creation through `create.json` is **not supported in this
+release** and has not been run against Pump's real create program; its checks
+remain in place, but do not include it in a setup you intend to use.
+
 ## Compatibility
 
 This package needs a Bloom build that includes three changes, none of which is
