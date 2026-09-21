@@ -5358,4 +5358,20 @@ mod tests {
             assert!(!builder_probe_status_reachable(status), "{status}");
         }
     }
+
+    #[test]
+    fn served_help_marks_coin_creation_unsupported() {
+        for (name, source) in [
+            ("README.md", include_str!("../files/README.md.rs")),
+            (
+                "create.json",
+                include_str!("../files/sessions/[wallet]/sessions/[session]/create.json.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("Coin creation is unsupported in this release."),
+                "{name} must mark coin creation unsupported: scope is a served claim"
+            );
+        }
+    }
 }
