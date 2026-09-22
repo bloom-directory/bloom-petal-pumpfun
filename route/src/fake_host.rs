@@ -11,11 +11,11 @@
 //! the last reply repeats, so a test only scripts the responses it cares
 //! about changing.
 
-use petal::{
-    HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, SdkError,
-    SignOutcome,
-};
+use curve25519_dalek::edwards::EdwardsPoint;
+use curve25519_dalek::scalar::Scalar;
+use petal::{HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, SdkError, SignOutcome};
 use serde_json::Value;
+use sha2::{Digest, Sha512};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -47,13 +47,13 @@ pub struct FakeHost {
     pub calls: Vec<Call>,
     /// Every signing request the route made, in order.
     pub sign_requests: Vec<PayloadSignRequest>,
-    pub key_requests: Vec<Value>,
+    /// What `host::vfs_read` serves, by path.
+    pub vfs: BTreeMap<String, Vec<u8>>,
     state: BTreeMap<String, Vec<u8>>,
     secrets: BTreeMap<String, Vec<u8>>,
     replies: BTreeMap<String, Vec<Value>>,
     served: BTreeMap<String, usize>,
     signatures: Vec<Result<SignOutcome, SdkError>>,
-    derivations: Vec<Result<PetalKeyOutcome, SdkError>>,
     /// Successful store writes so far.
     pub puts: usize,
     /// Make every store write after this many successful writes fail, to model
@@ -83,6 +83,7 @@ impl FakeHost {
     }
 
     /// Seed a value in the public state namespace.
+    #[allow(dead_code)]
     pub fn seed_state(&mut self, key: &str, value: &impl serde::Serialize) -> &mut Self {
         self.state.insert(
             key.to_owned(),
@@ -106,9 +107,9 @@ impl FakeHost {
         self
     }
 
-    /// Queue one key-derivation outcome.
-    pub fn derivation(&mut self, outcome: Result<PetalKeyOutcome, SdkError>) -> &mut Self {
-        self.derivations.push(outcome);
+    /// Serve one VFS path.
+    pub fn seed_vfs(&mut self, path: &str, value: &str) -> &mut Self {
+        self.vfs.insert(path.to_owned(), value.as_bytes().to_vec());
         self
     }
 
@@ -180,13 +181,34 @@ impl FakeHost {
         let served = self.served.entry(key).or_default();
         let index = (*served).min(replies.len() - 1);
         *served += 1;
-        let body = serde_json::to_vec(&replies[index]).expect("reply serializes");
+        let mut reply = replies[index].clone();
+        // `"$signature"` stands for whatever signature the submitted
+        // transaction actually carries, so a test can script an accepting RPC
+        // without knowing the signature in advance.
+        if reply.get("result").and_then(Value::as_str) == Some("$signature") {
+            reply["result"] = Value::String(echoed_signature(
+                self.calls.last().expect("the send was recorded"),
+            ));
+        }
+        let body = serde_json::to_vec(&reply).expect("reply serializes");
         Ok(HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "application/json".into())],
             body,
         })
     }
+}
+
+/// The base58 signature inside a `sendTransaction` request's transaction.
+fn echoed_signature(call: &Call) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    let encoded = call
+        .rpc_params()
+        .and_then(|params| params.get(0))
+        .and_then(Value::as_str)
+        .expect("sendTransaction carries a transaction");
+    let raw = B64.decode(encoded).expect("transaction is base64");
+    bs58::encode(&raw[1..65]).into_string()
 }
 
 thread_local! {
@@ -286,28 +308,74 @@ pub fn store_list(prefix: &str, max_bytes: usize) -> Result<Vec<String>, SdkErro
     })
 }
 
-pub fn derive_key(request_jcs: &[u8]) -> Result<PetalKeyOutcome, SdkError> {
+pub fn vfs_read(path: &str, max_bytes: usize) -> Result<Vec<u8>, SdkError> {
     with(|host| {
-        host.key_requests
-            .push(serde_json::from_slice(request_jcs).expect("canonical key request"));
-        if host.derivations.is_empty() {
-            // Unscripted: the session's key is live and authorized.
-            return Ok(PetalKeyOutcome::Ready {
-                operation_id: "fake-key-op".into(),
-                scope_digest: "fake-scope-digest".into(),
-                key_ref_jcs: br#"{"public_key_fingerprint":"test-fingerprint"}"#.to_vec(),
-                addresses: Vec::new(),
-            });
+        let bytes = host
+            .vfs
+            .get(path)
+            .cloned()
+            .ok_or(SdkError::Host(HostStatus::NotFound))?;
+        if bytes.len() > max_bytes {
+            return Err(SdkError::Host(HostStatus::BufferTooSmall {
+                needed: bytes.len(),
+            }));
         }
-        host.derivations.remove(0)
+        Ok(bytes)
     })
+}
+
+/// The seed of the key the unscripted host signs with. The builder fixtures
+/// name its public key as their payer, so a test drives the whole flow
+/// against a signature that really does verify against the trading account.
+pub const SIGNING_SEED: [u8; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
+
+fn expanded() -> (Scalar, [u8; 32], [u8; 32]) {
+    let h = Sha512::digest(SIGNING_SEED);
+    let mut clamped: [u8; 32] = h[..32].try_into().expect("32 bytes");
+    clamped[0] &= 248;
+    clamped[31] &= 127;
+    clamped[31] |= 64;
+    let scalar = Scalar::from_bytes_mod_order(clamped);
+    let prefix: [u8; 32] = h[32..].try_into().expect("32 bytes");
+    let public = EdwardsPoint::mul_base(&scalar).compress();
+    (scalar, prefix, public.to_bytes())
+}
+
+/// The base58 address of the signing key, as `address.sol` would render it.
+/// This is how `tests/pump-builder-fixtures.json` was re-pointed at a payer
+/// whose key the suite holds; print it when regenerating them.
+#[allow(dead_code)]
+pub fn signing_address() -> String {
+    bs58::encode(expanded().2).into_string()
+}
+
+/// An Ed25519 signature over `message`, per RFC 8032.
+pub fn sign_message(message: &[u8]) -> Vec<u8> {
+    let (scalar, prefix, public) = expanded();
+    let mut hash = Sha512::new();
+    hash.update(prefix);
+    hash.update(message);
+    let r = Scalar::from_bytes_mod_order_wide(&hash.finalize().into());
+    let big_r = EdwardsPoint::mul_base(&r).compress();
+    let mut hash = Sha512::new();
+    hash.update(big_r.as_bytes());
+    hash.update(public);
+    hash.update(message);
+    let k = Scalar::from_bytes_mod_order_wide(&hash.finalize().into());
+    let s = r + k * scalar;
+    let mut signature = big_r.as_bytes().to_vec();
+    signature.extend_from_slice(s.as_bytes());
+    signature
 }
 
 pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
     with(|host| {
         host.sign_requests.push(request.clone());
         if host.signatures.is_empty() {
-            return Ok(SignOutcome::Signature(vec![7u8; 64]));
+            return Ok(SignOutcome::Signature(sign_message(&request.preimage)));
         }
         host.signatures.remove(0)
     })
