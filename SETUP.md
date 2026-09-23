@@ -152,10 +152,30 @@ Three different clocks bound a trade, and they are not the same thing:
   in practice, but the authority is the transaction's own last valid block
   height, which the Petal reads and compares against the finalized height.
 - **approval expiry** — how long Bloom's approval stays usable.
-- **price** — `minOutputAmount` and `slippagePct` decide whether a fill is
-  acceptable. They do not extend chain validity: widening slippage does not buy
-  review time, and a transaction whose blockhash has expired is rejected before
-  any price is considered.
+- **price** — the quote is fixed when the transaction is built, and the owner
+  then reads and approves inside that window. See below: the output floor has
+  no tolerance, so a slow approval makes a fill more likely to fail. Widening
+  slippage does not extend chain validity either.
+
+### `slippagePct` does not move the output floor
+
+Measured against the live builder on 23 September 2026, on both routes and at
+2%, 10% and 40%: the swap instruction's minimum-output field is **exactly** the
+builder's own quote, unchanged by `slippagePct`. Only the maximum input moves.
+
+A Pump buy therefore demands at least the full quoted output with zero
+tolerance, and `slippagePct` only widens how much SOL may be paid. Any adverse
+movement between build and execution fails the trade.
+
+`minOutputAmount` is a **check, not a control**. The Petal compares it against
+the floor the builder baked in and refuses a transaction that promises less;
+it cannot lower that floor, so asking for less does not make a fill easier.
+
+The Petal simulates before signing, so a trade whose floor the pool can no
+longer satisfy stops at `preflight_failed` with the program's own error
+preserved, before a ceremony is created. Retrying under the same `operationId`
+rebuilds it against a fresh quote. Evidence:
+`shared/pumpfun-live-builder-2026-09-23/`.
 
 If an approval takes long enough that the blockhash expires, the retry rebuilds
 and asks again. The Petal never refreshes bytes under an existing approval and

@@ -51,7 +51,8 @@ sign. Address lookup tables are resolved independently through two Solana RPCs
 before their accounts are checked.
 
 Swap requests carry a caller-selected `minOutputAmount`, and the on-chain
-instruction must preserve at least that many raw output units. The token
+instruction must preserve at least that many raw output units. That is a check
+on the builder, not a control: the builder sets the instruction's real floor. The token
 accounts a trade receives into or spends from must be the trading account's own
 associated token accounts, and PumpSwap trades must use the coin's canonical
 pool; both are derived locally, never taken from the builder. Bloom applies a
@@ -59,9 +60,13 @@ local base and priority fee floor and requires an explicit successful simulation
 of the unsigned transaction before signing.
 
 Optional request fields follow Pump's official agent API: `slippagePct`,
-`frontRunningProtection` and `tipAmount`. Protected writes are sent only to
-Jito; ordinary writes use the declared public Solana RPC and fall back to the
-second RPC once. Protection is routing, not a guarantee.
+`frontRunningProtection` and `tipAmount`. `slippagePct` widens only the maximum
+input; the builder sets the output floor to its own quote with no tolerance, so
+a fill fails on any adverse movement. `SETUP.md` has the measurements.
+
+Protected writes are sent only to Jito; ordinary writes use the declared public
+Solana RPC and fall back to the second RPC once. Protection is routing, not a
+guarantee.
 
 ## Closing an empty token account
 

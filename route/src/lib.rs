@@ -4560,6 +4560,151 @@ mod tests {
         });
     }
 
+    /// Today's real Pump.fun builder output, through this Petal's validation
+    /// and review. Ignored by default because it needs captured responses;
+    /// `scripts/check-live-builder.sh` fetches them and runs this.
+    ///
+    /// The local-validator run settles a close, whose transaction the Petal
+    /// builds itself. This is the other half: the instruction shapes, pool and
+    /// token-account derivations, quotes and economics that only the hosted
+    /// builder produces. Nothing here signs or submits.
+    #[test]
+    #[ignore = "needs PUMPFUN_LIVE_BUILDER_DIR from scripts/check-live-builder.sh"]
+    fn live_builder_output_passes_validation_and_produces_a_review() {
+        let dir = match std::env::var("PUMPFUN_LIVE_BUILDER_DIR") {
+            Ok(dir) => dir,
+            Err(_) => panic!("set PUMPFUN_LIVE_BUILDER_DIR, or run scripts/check-live-builder.sh"),
+        };
+        let mut checked = 0;
+        for label in ["buy_bond", "buy_amm", "sell_bond", "sell_amm"] {
+            let request_path = format!("{dir}/{label}-request.json");
+            let response_path = format!("{dir}/{label}-response.json");
+            let (Ok(request_raw), Ok(response_raw)) = (
+                std::fs::read_to_string(&request_path),
+                std::fs::read_to_string(&response_path),
+            ) else {
+                continue;
+            };
+            let Ok(builder_request) = serde_json::from_str::<Value>(&request_raw) else {
+                continue;
+            };
+            let Ok(response) = serde_json::from_str::<Value>(&response_raw) else {
+                continue;
+            };
+            if response
+                .get("transaction")
+                .and_then(Value::as_str)
+                .is_none()
+            {
+                println!("{label}: builder returned no transaction; skipped");
+                continue;
+            }
+            checked += 1;
+
+            let action = if label.starts_with("buy") {
+                Action::Buy
+            } else {
+                Action::Sell
+            };
+            let user = builder_request["user"].as_str().expect("request user");
+            let mint = if matches!(action, Action::Buy) {
+                builder_request["outputMint"].as_str()
+            } else {
+                builder_request["inputMint"].as_str()
+            }
+            .expect("request mint");
+
+            // The body an agent would write, normalized exactly as a route
+            // write normalizes it. `minOutputAmount` is the floor the caller
+            // chooses; take the builder's own quote so the check is against
+            // what it actually offered.
+            let quoted = response
+                .pointer("/pumpMintInfo/expectedOutAmount")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_u64().map(|value| value.to_string()))
+                })
+                .unwrap_or_else(|| "1".to_owned());
+            let body = json!({
+                "mint": mint,
+                "amount": builder_request["amount"],
+                "minOutputAmount": quoted,
+                "slippagePct": builder_request["slippagePct"],
+            });
+            let mut normalized = body.as_object().expect("body").clone();
+            if let Err(error) = normalize(action, user, &mut normalized) {
+                panic!("{label}: normalize refused the request: {error:?}");
+            }
+
+            let transaction = response["transaction"].as_str().expect("transaction");
+            let parsed = match validate_tx(transaction, user, action, &normalized, &response) {
+                Ok(parsed) => parsed,
+                Err(error) => panic!(
+                    "{label}: today's builder output failed validation: {}",
+                    dispatch_message(&error)
+                ),
+            };
+
+            // The review the owner would read, from the validated transaction.
+            let review = swap_review(user, action, &normalized, &parsed, 5_000)
+                .unwrap_or_else(|error| panic!("{label}: review: {error}"));
+            let debits = effects(action, &normalized, &parsed)
+                .unwrap_or_else(|error| panic!("{label}: effects: {error}"));
+            let destinations = destinations(action, &parsed);
+
+            println!("\n=== {label} ===");
+            println!("  program route: {}", protocol_program_of(&parsed));
+            for line in &review {
+                println!("  review | {line}");
+            }
+            println!("  declared debits: {}", json!(debits));
+            println!("  declared destinations: {}", json!(destinations));
+
+            // The floor the instruction carries must be at least what the
+            // request asked for; that is the whole point of the check.
+            let (input, minimum) = swap_instruction_amounts(&parsed, action)
+                .unwrap_or_else(|error| panic!("{label}: instruction amounts: {error}"));
+            let requested_floor: u64 = normalized["minOutputAmount"]
+                .as_str()
+                .expect("normalized floor")
+                .parse()
+                .expect("floor parses");
+            assert!(
+                minimum >= requested_floor,
+                "{label}: instruction floor {minimum} is below the requested {requested_floor}"
+            );
+            assert!(input > 0, "{label}: the instruction spends nothing");
+            assert!(
+                review.iter().any(|line| line.contains(user)),
+                "{label}: the review does not name the account"
+            );
+            assert!(!destinations.is_empty(), "{label}: no declared destination");
+        }
+        assert!(
+            checked > 0,
+            "no builder responses were readable under {dir}"
+        );
+        println!("\nvalidated {checked} live builder transactions");
+    }
+
+    /// Which protocol program a validated swap actually routed through.
+    fn protocol_program_of(message: &Msg) -> String {
+        let pump = pk(PROGRAMS[5]).expect("pump program");
+        let amm = pk(PROGRAMS[6]).expect("amm program");
+        for ix in &message.instructions {
+            match message.keys.get(ix.program) {
+                Some(program) if program == &pump => {
+                    return format!("bonding curve {}", PROGRAMS[5]);
+                }
+                Some(program) if program == &amm => return format!("PumpSwap AMM {}", PROGRAMS[6]),
+                _ => {}
+            }
+        }
+        "none found".to_owned()
+    }
+
     /// What a route serves about itself is part of the product contract. A
     /// reader must not be able to find a session, a budget or a second wallet
     /// anywhere in the help, because none of them exist any more.
