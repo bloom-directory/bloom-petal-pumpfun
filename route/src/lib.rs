@@ -377,12 +377,6 @@ struct Pending {
     status: String,
     signature: Option<String>,
     approval: Option<String>,
-    /// The approval this operation gave up when it rebuilt. Bloom takes it as
-    /// the hint on the next signing call: a wallet holds one live ceremony, so
-    /// without it the abandoned ceremony blocks the rebuilt transaction until
-    /// it expires on its own.
-    #[serde(default)]
-    superseded: Option<String>,
     /// Set once any signing call for this message may have produced a
     /// signature, and never cleared: a later refusal or failed simulation
     /// says nothing about an earlier call. While set, the operation keeps
@@ -477,7 +471,6 @@ fn build_pending(
         status: "built".into(),
         signature: None,
         approval: None,
-        superseded: None,
         may_be_signed: false,
         review,
         last_valid_block_height: 0,
@@ -906,7 +899,6 @@ fn build_close_token_account_pending(
         status: "built".into(),
         signature: None,
         approval: None,
-        superseded: None,
         may_be_signed: false,
         review,
         last_valid_block_height,
@@ -968,14 +960,10 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                 && v.approval.is_none()
                 && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
             {
-                let superseded = v.superseded.take();
                 v = match build_pending(a, &trader, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
-                // The rebuilt transaction still has to tell Bloom which
-                // approval it replaced.
-                v.superseded = superseded;
                 if let Err(e) = put(&key, &v, true) {
                     return e;
                 }
@@ -1063,7 +1051,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             // Give the approval up, and tell Bloom on the next call: the
             // rebuilt transaction cannot be offered while this one's ceremony
             // is still live.
-            p.superseded = p.approval.take().or(p.superseded);
+            p.approval = None;
         }
         if let Err(store_error) = put(&key, &p, true) {
             return store_error;
@@ -1108,14 +1096,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         operation_class: a.class().into(),
         petal_use_claim_jcs: claim_jcs,
         claim_assurance_evidence: None,
-        // Either this operation's own approval artifact, or — when it has
-        // rebuilt — the tagged form that tells Bloom the earlier attempt is
-        // given up. The two are deliberately distinct strings: a stale
-        // artifact id can never be read as permission to abandon anything.
-        approval_hint: p
-            .approval
-            .clone()
-            .or_else(|| p.superseded.as_deref().map(|id| format!("supersedes:{id}"))),
+        // This operation's own approval artifact, and nothing else. A rebuilt
+        // transaction asks for its own approval from scratch; it never tells
+        // Bloom to give up the earlier one, because deciding whether that
+        // earlier attempt might already have signed is not something either
+        // side can currently establish.
+        approval_hint: p.approval.clone(),
         action: None,
         // The review the owner reads, frozen with these bytes. The host
         // hashes it into the approval's canonical facts, so an approval
@@ -1137,7 +1123,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         }) => {
             p.status = "approval_pending".into();
             p.approval = Some(action_id.clone());
-            p.superseded = None;
             if let Err(e) = put(&key, &p, true) {
                 return e;
             }
@@ -1170,7 +1155,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             );
             if refused {
                 p.status = "approval_failed".into();
-                p.superseded = p.approval.take().or(p.superseded);
+                p.approval = None;
             } else {
                 p.status = "signing_uncertain".into();
                 p.may_be_signed = true;
@@ -4412,14 +4397,12 @@ mod tests {
                 host.sign_requests[1].preimage,
                 host.sign_requests[2].preimage
             );
-            // A rebuilt payload needs its own approval, and names the one it
-            // gave up so Bloom can end that ceremony: a wallet holds one live
-            // ceremony, so otherwise the rebuild cannot be offered until the
-            // abandoned one expires.
-            assert_eq!(
-                host.sign_requests[2].approval_hint.as_deref(),
-                Some("supersedes:exact-pending")
-            );
+            // A rebuilt payload asks for its own approval from scratch and
+            // names no artifact at all. It does not tell Bloom to give up the
+            // earlier one: neither side can currently establish that the
+            // abandoned attempt did not sign, so the abandoned ceremony is
+            // left to expire and the rebuild waits for it.
+            assert_eq!(host.sign_requests[2].approval_hint, None);
         });
     }
 
@@ -4476,13 +4459,10 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 hints,
-                vec![
-                    None,
-                    None,
-                    Some("supersedes:exact-b".into()),
-                    Some("supersedes:exact-a".into()),
-                ],
-                "each rebuild gives up its own operation's approval and no other"
+                vec![None, None, None, None],
+                "no write names another request's approval artifact, before or \
+                 after a rebuild: the only hint this Petal ever sends is its \
+                 own live approval"
             );
         });
         fake_host::with(|host| {
