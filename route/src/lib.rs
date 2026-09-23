@@ -999,7 +999,14 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         operation_class: a.class().into(),
         petal_use_claim_jcs: claim_jcs,
         claim_assurance_evidence: None,
-        approval_hint: p.approval.clone().or_else(|| p.superseded.clone()),
+        // Either this operation's own approval artifact, or — when it has
+        // rebuilt — the tagged form that tells Bloom the earlier attempt is
+        // given up. The two are deliberately distinct strings: a stale
+        // artifact id can never be read as permission to abandon anything.
+        approval_hint: p
+            .approval
+            .clone()
+            .or_else(|| p.superseded.as_deref().map(|id| format!("supersedes:{id}"))),
         action: None,
         // The review the owner reads, frozen with these bytes. The host
         // hashes it into the approval's canonical facts, so an approval
@@ -4229,8 +4236,83 @@ mod tests {
             // abandoned one expires.
             assert_eq!(
                 host.sign_requests[2].approval_hint.as_deref(),
-                Some("exact-pending")
+                Some("supersedes:exact-pending")
             );
+        });
+    }
+
+    /// Which approval a rebuild says it has given up is the Petal's assertion:
+    /// Bloom scopes it to this package, route, wallet, class and key, but
+    /// within that scope it does not second-guess which operation is meant. So
+    /// the Petal has to name only its own operation's previous attempt. Two
+    /// operations that differ by nothing but their id, expiring and rebuilding
+    /// together, must never name each other's.
+    #[test]
+    fn a_rebuild_names_only_its_own_operations_previous_attempt() {
+        let mut host = host_serving_a_close();
+        for action in ["exact-a", "exact-b", "rebuilt-b", "rebuilt-a"] {
+            host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+                action_id: action.into(),
+                expires_ms: NOW_MS + 60_000,
+            }));
+        }
+        fake_host::install(host);
+        let block_height = |height: u64| {
+            fake_host::with(|host| {
+                host.reply_only(&format!("{RPC} getBlockHeight"), json!({"result": height}));
+            });
+        };
+
+        for op in ["close-a", "close-b"] {
+            assert!(dispatch_message(&run_close(op)).contains("approval required"));
+        }
+
+        // Both deadlines pass. Each gives its own approval up, and neither
+        // signs: two writes each, and the order between them is interleaved on
+        // purpose.
+        fake_host::with(|host| simulation_rejects(host, true));
+        block_height(1001);
+        for op in ["close-b", "close-a"] {
+            run_close(op);
+        }
+        fake_host::with(|host| {
+            simulation_rejects(host, false);
+            host.reply_only(
+                &format!("{RPC} getLatestBlockhash"),
+                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1200}}}),
+            );
+        });
+        for op in ["close-b", "close-a"] {
+            run_close(op);
+        }
+
+        fake_host::with(|host| {
+            let hints = host
+                .sign_requests
+                .iter()
+                .map(|request| request.approval_hint.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                hints,
+                vec![
+                    None,
+                    None,
+                    Some("supersedes:exact-b".into()),
+                    Some("supersedes:exact-a".into()),
+                ],
+                "each rebuild gives up its own operation's approval and no other"
+            );
+        });
+        fake_host::with(|host| {
+            for (op, expected) in [("close-a", "rebuilt-a"), ("close-b", "rebuilt-b")] {
+                let stored = host.secret_json(&secret_key(&owner(), op)).expect("stored");
+                assert_eq!(
+                    stored["approval"],
+                    json!(expected),
+                    "{op} holds the approval prepared for its own rebuild"
+                );
+                assert_eq!(stored["superseded"], Value::Null);
+            }
         });
     }
 
