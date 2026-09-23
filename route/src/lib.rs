@@ -377,6 +377,12 @@ struct Pending {
     status: String,
     signature: Option<String>,
     approval: Option<String>,
+    /// The approval this operation gave up when it rebuilt. Bloom takes it as
+    /// the hint on the next signing call: a wallet holds one live ceremony, so
+    /// without it the abandoned ceremony blocks the rebuilt transaction until
+    /// it expires on its own.
+    #[serde(default)]
+    superseded: Option<String>,
     /// Set once any signing call for this message may have produced a
     /// signature, and never cleared: a later refusal or failed simulation
     /// says nothing about an earlier call. While set, the operation keeps
@@ -457,6 +463,7 @@ fn build_pending(
         status: "built".into(),
         signature: None,
         approval: None,
+        superseded: None,
         may_be_signed: false,
         review,
         last_valid_block_height: 0,
@@ -537,10 +544,17 @@ fn swap_review(
         .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
         .ok_or("account rent allowance exceeds u64")?;
     let (spend, receive) = match action {
+        // A Pump buy names the tokens exactly and the spend as a ceiling: the
+        // pool decides what it actually costs, and the trade fails rather than
+        // pay past this. So this is the figure that can move against the owner
+        // between approving and landing, and the one they are here to bound.
         Action::Buy => (
-            format!("Maximum spent on the trade: {}", lamports_display(input)),
             format!(
-                "Guaranteed minimum received: {}",
+                "Maximum spent on the trade: {} (the pool sets the real cost, up to this)",
+                lamports_display(input)
+            ),
+            format!(
+                "Tokens received: {} (exactly this, or the trade fails)",
                 token_display(minimum_output, mint)
             ),
         ),
@@ -788,6 +802,7 @@ fn build_close_token_account_pending(
         status: "built".into(),
         signature: None,
         approval: None,
+        superseded: None,
         may_be_signed: false,
         review,
         last_valid_block_height,
@@ -844,10 +859,14 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                 && v.approval.is_none()
                 && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
             {
+                let superseded = v.superseded.take();
                 v = match build_pending(a, &user, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
+                // The rebuilt transaction still has to tell Bloom which
+                // approval it replaced.
+                v.superseded = superseded;
                 if let Err(e) = put(&key, &v, true) {
                     return e;
                 }
@@ -932,7 +951,10 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                 Err(error) => return error,
             };
         if !p.may_be_signed && !keep_exact_approval {
-            p.approval = None;
+            // Give the approval up, and tell Bloom on the next call: the
+            // rebuilt transaction cannot be offered while this one's ceremony
+            // is still live.
+            p.superseded = p.approval.take().or(p.superseded);
         }
         if let Err(store_error) = put(&key, &p, true) {
             return store_error;
@@ -977,7 +999,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         operation_class: a.class().into(),
         petal_use_claim_jcs: claim_jcs,
         claim_assurance_evidence: None,
-        approval_hint: p.approval.clone(),
+        approval_hint: p.approval.clone().or_else(|| p.superseded.clone()),
         action: None,
         // The review the owner reads, frozen with these bytes. The host
         // hashes it into the approval's canonical facts, so an approval
@@ -999,6 +1021,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         }) => {
             p.status = "approval_pending".into();
             p.approval = Some(action_id.clone());
+            p.superseded = None;
             if let Err(e) = put(&key, &p, true) {
                 return e;
             }
@@ -1031,7 +1054,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             );
             if refused {
                 p.status = "approval_failed".into();
-                p.approval = None;
+                p.superseded = p.approval.take().or(p.superseded);
             } else {
                 p.status = "signing_uncertain".into();
                 p.may_be_signed = true;
@@ -2806,7 +2829,7 @@ mod tests {
         }
     }
     #[test]
-    fn a_swap_review_states_the_account_the_floor_and_the_worst_case_cost() {
+    fn a_swap_review_states_the_account_the_bound_and_the_worst_case_cost() {
         let response = fixture("buy_bond");
         let transaction = response["transaction"].as_str().unwrap();
         let request = normalized(
@@ -2822,12 +2845,13 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains(&format!("Token: {BOND_MINT}")), "{joined}");
-        // The floor is the instruction's own, stated in raw token units
-        // because the Petal cannot verify this mint's decimals.
-        let (input, minimum) = swap_instruction_amounts(&parsed, Action::Buy).unwrap();
+        // A buy names the tokens exactly and the spend as a ceiling. Token
+        // amounts are stated in raw units because the Petal cannot verify
+        // this mint's decimals.
+        let (input, tokens) = swap_instruction_amounts(&parsed, Action::Buy).unwrap();
         assert!(
             joined.contains(&format!(
-                "Guaranteed minimum received: {minimum} raw units of {BOND_MINT}"
+                "Tokens received: {tokens} raw units of {BOND_MINT}"
             )),
             "{joined}"
         );
@@ -3791,8 +3815,8 @@ mod tests {
             assert!(
                 items
                     .iter()
-                    .any(|item| item.starts_with("Guaranteed minimum received:")),
-                "the review states the enforced floor: {items:?}"
+                    .any(|item| item.starts_with("Maximum spent on the trade:")),
+                "the review bounds what the trade can spend: {items:?}"
             );
             let claim: Value =
                 serde_json::from_slice(&request.petal_use_claim_jcs).expect("claim is JSON");
@@ -4199,9 +4223,13 @@ mod tests {
                 host.sign_requests[1].preimage,
                 host.sign_requests[2].preimage
             );
+            // A rebuilt payload needs its own approval, and names the one it
+            // gave up so Bloom can end that ceremony: a wallet holds one live
+            // ceremony, so otherwise the rebuild cannot be offered until the
+            // abandoned one expires.
             assert_eq!(
-                host.sign_requests[2].approval_hint, None,
-                "a rebuilt Exact payload needs its own approval"
+                host.sign_requests[2].approval_hint.as_deref(),
+                Some("exact-pending")
             );
         });
     }

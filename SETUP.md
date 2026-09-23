@@ -153,26 +153,33 @@ Three different clocks bound a trade, and they are not the same thing:
   height, which the Petal reads and compares against the finalized height.
 - **approval expiry** — how long Bloom's approval stays usable.
 - **price** — the quote is fixed when the transaction is built, and the owner
-  then reads and approves inside that window. See below: the output floor has
-  no tolerance, so a slow approval makes a fill more likely to fail. Widening
-  slippage does not extend chain validity either.
+  then reads and approves inside that window. See below: on a buy the price
+  may move against the owner up to the maximum spend, and widening slippage
+  raises that ceiling. It does not extend chain validity.
 
-### `slippagePct` does not move the output floor
+### On a buy, `slippagePct` moves the maximum spend, not the tokens
 
+A Pump buy names **an exact token amount out and a ceiling on the SOL in**.
 Measured against the live builder on 23 September 2026, on both routes and at
-2%, 10% and 40%: the swap instruction's minimum-output field is **exactly** the
-builder's own quote, unchanged by `slippagePct`. Only the maximum input moves.
+2%, 10% and 40%: the token amount is **exactly** the builder's quote every
+time, unchanged by `slippagePct`; only `max_quote_amount_in` moves — 1,020,000,
+1,100,000 and 1,400,000 lamports for a 1,000,000 lamport buy.
 
-A Pump buy therefore demands at least the full quoted output with zero
-tolerance, and `slippagePct` only widens how much SOL may be paid. Any adverse
-movement between build and execution fails the trade.
+So the tolerance is on what the trade spends. The pool can move against the
+owner between building and landing, and the program pays whatever the curve
+now asks, up to that ceiling; past it the trade fails rather than pay more.
+A wider `slippagePct` buys the same tokens and risks more SOL.
+
+That is why the maximum spend is the figure the review states first and totals
+at the end: it is what can change after the owner has read it.
 
 `minOutputAmount` is a **check, not a control**. The Petal compares it against
-the floor the builder baked in and refuses a transaction that promises less;
-it cannot lower that floor, so asking for less does not make a fill easier.
+the token amount the builder baked in and refuses a transaction that promises
+less; it cannot change that amount, so asking for less does not make a fill
+easier.
 
-The Petal simulates before signing, so a trade whose floor the pool can no
-longer satisfy stops at `preflight_failed` with the program's own error
+The Petal simulates before signing, so a trade the pool can no longer satisfy
+within its ceiling stops at `preflight_failed` with the program's own error
 preserved, before a ceremony is created. Retrying under the same `operationId`
 rebuilds it against a fresh quote. Evidence:
 `shared/pumpfun-live-builder-2026-09-23/`.
