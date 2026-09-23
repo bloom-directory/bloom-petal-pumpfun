@@ -954,6 +954,15 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         }
         return e;
     }
+    // Every write on this Petal is reviewed. A stored operation from an
+    // older build, or a build path that failed to describe its transaction,
+    // must not reach a ceremony that shows the owner nothing: refuse here,
+    // before any signature can exist.
+    if p.review.is_empty() {
+        return fail(
+            "this operation has no owner review, so it will not be signed; retry under a new operationId to rebuild it",
+        );
+    }
     // Recorded before the host call, so an interruption leaves `signing`
     // behind and the next retry treats the message as possibly signed.
     p.status = "signing".into();
@@ -4372,6 +4381,44 @@ mod tests {
         for status in [300, 401, 403, 404, 429, 500, 503] {
             assert!(!builder_probe_status_reachable(status), "{status}");
         }
+    }
+
+    /// A write is reviewed or it is not signed. An operation record written
+    /// by an older build carries no review, and reaching a ceremony with
+    /// nothing to show the owner is worse than failing.
+    #[test]
+    fn an_operation_with_no_review_is_never_signed() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "never-used".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("buy-unreviewed", false)).contains("approval required"));
+
+        // Strip the review the way a record from a build that predates it
+        // would arrive.
+        fake_host::with(|host| {
+            let key = secret_key(&owner(), "buy-unreviewed");
+            let mut stored = host.secret_json(&key).expect("pending operation");
+            stored["review"] = json!([]);
+            host.seed_secret(&key, &stored);
+        });
+
+        let response = run_buy("buy-unreviewed", false);
+        assert!(
+            dispatch_message(&response).contains("no owner review"),
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| {
+            assert_eq!(
+                host.sign_requests.len(),
+                1,
+                "the unreviewed retry must not reach the host at all"
+            );
+            assert!(host.calls_for("sendTransaction").is_empty());
+        });
     }
 
     /// The host chooses the signing key, not the Petal. If it returns a
