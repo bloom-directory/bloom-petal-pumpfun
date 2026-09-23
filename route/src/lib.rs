@@ -416,12 +416,13 @@ struct Public {
 
 fn build_pending(
     a: Action,
-    user: &str,
+    trader: &Trader<'_>,
     request: &Map<String, Value>,
     digest: String,
 ) -> Result<Pending, DispatchResponse> {
+    let user = trader.address;
     if matches!(a, Action::CloseTokenAccount) {
-        return build_close_token_account_pending(user, request, digest);
+        return build_close_token_account_pending(trader, request, digest);
     }
     let mut builder_request = request.clone();
     builder_request.remove("minOutputAmount");
@@ -444,8 +445,21 @@ fn build_pending(
             .message,
     ));
     let network_fee_lamports = transaction_fee(&tx, request)?;
-    let review = swap_review(user, a, request, &parsed, network_fee_lamports)
-        .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
+    let mint = match a {
+        Action::Buy => request.get("outputMint"),
+        _ => request.get("inputMint"),
+    }
+    .and_then(Value::as_str)
+    .ok_or_else(|| fail("normalized swap mint missing"))?;
+    let review = swap_review(
+        trader,
+        a,
+        request,
+        &parsed,
+        network_fee_lamports,
+        verified_mint_decimals(mint),
+    )
+    .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
     let mut api = response;
     api.as_object_mut()
         .ok_or_else(|| fail("builder response must be an object"))?
@@ -483,8 +497,73 @@ fn lamports_display(lamports: u64) -> String {
         format!("{whole}.{fraction} SOL")
     }
 }
-fn token_display(amount: u64, mint: &str) -> String {
-    format!("{amount} raw units of {mint}")
+/// A token amount. With a scale two independent RPCs agree on, this is a
+/// figure a person can compare against a price; without one it stays in raw
+/// units and says so. The mint is always spelled out and its name and symbol
+/// never are: those are metadata the coin's creator chooses, and a review that
+/// repeated them would be quoting the counterparty.
+fn token_display(amount: u64, mint: &str, decimals: Option<u8>) -> String {
+    let Some(decimals) = decimals else {
+        return format!("{amount} raw units of {mint} (scale unverified)");
+    };
+    let scale = 10_u64.pow(u32::from(decimals));
+    let whole = amount / scale;
+    let fraction = format!("{:0width$}", amount % scale, width = usize::from(decimals));
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        format!("{whole} of {mint}")
+    } else {
+        format!("{whole}.{fraction} of {mint}")
+    }
+}
+
+/// The mint's decimal scale, taken only when two independent RPCs agree. Any
+/// disagreement, absence or implausible value yields `None`, and the amount is
+/// then shown in raw units rather than at a scale that might be wrong: a
+/// misplaced decimal point is worse than an ugly number.
+fn verified_mint_decimals(mint: &str) -> Option<u8> {
+    let read = |url: &str| -> Option<u8> {
+        let value = post(
+            url,
+            &rpc(
+                "getAccountInfo",
+                json!([mint, {"encoding":"jsonParsed","commitment":"finalized"}]),
+            ),
+        )
+        .ok()?;
+        let account = value.pointer("/result/value")?;
+        let owner = account.get("owner").and_then(Value::as_str)?;
+        if owner != PROGRAMS[3] && owner != PROGRAMS[4] {
+            return None;
+        }
+        let parsed = account.pointer("/data/parsed")?;
+        if parsed.get("type").and_then(Value::as_str) != Some("mint") {
+            return None;
+        }
+        u8::try_from(parsed.pointer("/info/decimals").and_then(Value::as_u64)?)
+            .ok()
+            .filter(|decimals| *decimals <= 18)
+    };
+    let primary = read(RPC)?;
+    (primary == read(RPC_VERIFY)?).then_some(primary)
+}
+
+/// Who the transaction spends from, named both the way the owner selected it
+/// in Bloom and the way the chain names it. An address alone does not tell the
+/// owner which of their accounts is about to pay.
+struct Trader<'a> {
+    wallet: &'a str,
+    account: u32,
+    address: &'a str,
+}
+
+impl Trader<'_> {
+    fn line(&self) -> String {
+        format!(
+            "Trading account: Bloom wallet \"{}\" account {} ({})",
+            self.wallet, self.account, self.address
+        )
+    }
 }
 
 /// The input ceiling and guaranteed output floor the swap instruction itself
@@ -520,11 +599,12 @@ fn swap_instruction_amounts(message: &Msg, action: Action) -> Result<(u64, u64),
 /// Every figure is read back out of the transaction that was just validated,
 /// so the review and the bytes cannot disagree.
 fn swap_review(
-    user: &str,
+    trader: &Trader<'_>,
     action: Action,
     request: &Map<String, Value>,
     message: &Msg,
     network_fee_lamports: u64,
+    decimals: Option<u8>,
 ) -> Result<Vec<String>, String> {
     let (input, minimum_output) = swap_instruction_amounts(message, action)?;
     let mint = match action {
@@ -543,39 +623,55 @@ fn swap_review(
     let account_rent = ata_count
         .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
         .ok_or("account rent allowance exceeds u64")?;
-    let (spend, receive) = match action {
-        // A Pump buy names a token amount and a ceiling on the SOL in, and
-        // only the ceiling moves with slippage. So the spend is the figure
-        // that can move against the owner between approving and landing, and
-        // the one they are here to bound. Both lines are read out of the
-        // instruction; neither asserts anything about the program beyond the
-        // field it names.
+    // A Pump buy names a token amount and a ceiling on the SOL in, and only
+    // the ceiling moves with slippage. So the spend is the figure that can
+    // move against the owner between approving and landing, and the one they
+    // are here to bound. A sell is the other way round: it names the tokens
+    // that leave and a floor under the SOL that returns. Every line is read
+    // out of the instruction, and none asserts anything about the program
+    // beyond the field it names — in particular a buy's token amount is the
+    // amount the instruction names, not a promise of delivery.
+    let (assets, amounts, fee_note) = match action {
         Action::Buy => (
-            format!(
-                "Maximum spent on the trade: {} (the pool sets the real cost, up to this)",
-                lamports_display(input)
-            ),
-            format!("Tokens bought: {}", token_display(minimum_output, mint)),
+            [
+                "Paying with: SOL".to_owned(),
+                format!("Buying token: {mint}"),
+            ],
+            [
+                format!(
+                    "Maximum spent on the trade: {} (the pool sets the real cost, up to this)",
+                    lamports_display(input)
+                ),
+                format!(
+                    "Tokens the instruction names: {}",
+                    token_display(minimum_output, mint, decimals)
+                ),
+            ],
+            "Pump's own trading fee comes out of that maximum, not on top of it",
         ),
         _ => (
-            format!("Sold: {}", token_display(input, mint)),
-            format!(
-                "Least SOL this may return: {}",
-                lamports_display(minimum_output)
-            ),
+            [
+                format!("Selling token: {mint}"),
+                "Receiving: SOL".to_owned(),
+            ],
+            [
+                format!("Sold: {}", token_display(input, mint, decimals)),
+                format!(
+                    "Least SOL this may return: {}",
+                    lamports_display(minimum_output)
+                ),
+            ],
+            "Pump's own trading fee is already taken out of that minimum",
         ),
     };
-    let mut review = vec![
-        format!("{} on Pump.fun", action.label()),
-        format!("Trading account: {user}"),
-        format!("Token: {mint}"),
-        spend,
-        receive,
-        format!(
-            "Estimated network fee: {} (a cap, charged as used)",
-            lamports_display(network_fee_lamports)
-        ),
-    ];
+    let mut review = vec![format!("{} on Pump.fun", action.label()), trader.line()];
+    review.extend(assets);
+    review.extend(amounts);
+    review.push(fee_note.to_owned());
+    review.push(format!(
+        "Estimated network fee: {} (a cap, charged as used)",
+        lamports_display(network_fee_lamports)
+    ));
     if account_rent > 0 {
         review.push(format!(
             "Rent for {ata_count} new token account(s), up to {}; recoverable by closing them while empty",
@@ -588,17 +684,25 @@ fn swap_review(
             lamports_display(tip)
         ));
     }
-    if matches!(action, Action::Buy) {
+    // Both sides end with the whole SOL bound, because both have one. A sell
+    // spends no SOL on the trade itself, but its fee and any new token account
+    // are still real money leaving the account, and a review that totalled
+    // only buys would leave the owner to add those up.
+    let overhead = tip
+        .checked_add(account_rent)
+        .and_then(|value| value.checked_add(network_fee_lamports))
+        .ok_or("native cost exceeds u64")?;
+    review.push(if matches!(action, Action::Buy) {
         let total = input
-            .checked_add(tip)
-            .and_then(|value| value.checked_add(account_rent))
-            .and_then(|value| value.checked_add(network_fee_lamports))
+            .checked_add(overhead)
             .ok_or("total native cost exceeds u64")?;
-        review.push(format!(
-            "Most this can cost in total: {}",
-            lamports_display(total)
-        ));
-    }
+        format!("Most this can cost in total: {}", lamports_display(total))
+    } else {
+        format!(
+            "Most this can cost in SOL: {} (fee, tip and rent; the trade itself returns SOL)",
+            lamports_display(overhead)
+        )
+    });
     Ok(review)
 }
 
@@ -715,10 +819,11 @@ fn quote_message_fee(message: &[u8]) -> Result<u64, DispatchResponse> {
 }
 
 fn build_close_token_account_pending(
-    user: &str,
+    trader: &Trader<'_>,
     request: &Map<String, Value>,
     digest: String,
 ) -> Result<Pending, DispatchResponse> {
+    let user = trader.address;
     let token_account = request
         .get("tokenAccount")
         .and_then(Value::as_str)
@@ -770,7 +875,7 @@ fn build_close_token_account_pending(
     validate_close_token_account_tx(&tx, user, token_account, &fact.token_program)?;
     let review = vec![
         "Close an empty Pump.fun token account".to_owned(),
-        format!("Trading account: {user}"),
+        trader.line(),
         format!("Token account: {token_account}"),
         format!("Token: {mint}"),
         "Token balance: 0 (the account is empty, and closing a non-empty one is refused)"
@@ -811,6 +916,11 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     let user = match owner.address() {
         Ok(value) => value,
         Err(e) => return e,
+    };
+    let trader = Trader {
+        wallet: &owner.wallet,
+        account: owner.account,
+        address: &user,
     };
     let mut r: Map<String, Value> = match serde_json::from_slice(b) {
         Ok(v) => v,
@@ -859,7 +969,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                 && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
             {
                 let superseded = v.superseded.take();
-                v = match build_pending(a, &user, &r, digest.clone()) {
+                v = match build_pending(a, &trader, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
@@ -876,7 +986,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             v
         }
         Ok(None) => {
-            let p = match build_pending(a, &user, &r, digest) {
+            let p = match build_pending(a, &trader, &r, digest) {
                 Ok(value) => value,
                 Err(e) => return e,
             };
@@ -2689,6 +2799,16 @@ mod tests {
     const USER: &str = "FAe4sisG95oZ42w7buUn5qEE4TAnfTTFPiguZUHmhiF";
     const BOND_MINT: &str = "C8CMvu8FXZruHrNjFaixaDJjiveG6gKmUvT5BrK5pump";
     const AMM_MINT: &str = "H3m3TD2mwmU5zkUTHRDoLU7RdxbWp6BEgoQa3s9wpump";
+
+    /// A trader on a non-zero account, so a review that silently assumed
+    /// account 0 would fail rather than look right.
+    fn trader() -> Trader<'static> {
+        Trader {
+            wallet: "w",
+            account: 3,
+            address: USER,
+        }
+    }
     const AMM_CREATOR: &str = "7g5fP4E7B74M5rtNT7JrS1w9FK2Sobf7XzQLNVvQ5sHv";
 
     fn fixture(name: &str) -> Value {
@@ -2843,20 +2963,33 @@ mod tests {
             json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         let parsed = validate_tx(transaction, USER, Action::Buy, &request, &response).unwrap();
-        let review = swap_review(USER, Action::Buy, &request, &parsed, 5_000).unwrap();
+        let review =
+            swap_review(&trader(), Action::Buy, &request, &parsed, 5_000, Some(6)).unwrap();
         let joined = review.join("\n");
         assert!(joined.starts_with("Buy on Pump.fun"), "{joined}");
+        // The owner selected an account in Bloom, not an address. Naming only
+        // the address leaves them to recognise which of their accounts pays.
         assert!(
-            joined.contains(&format!("Trading account: {USER}")),
+            joined.contains(&format!(
+                "Trading account: Bloom wallet \"w\" account 3 ({USER})"
+            )),
             "{joined}"
         );
-        assert!(joined.contains(&format!("Token: {BOND_MINT}")), "{joined}");
-        // A buy names the tokens exactly and the spend as a ceiling. Token
-        // amounts are stated in raw units because the Petal cannot verify
-        // this mint's decimals.
+        // Direction is stated as assets, not left to the verb alone.
+        assert!(joined.contains("Paying with: SOL"), "{joined}");
+        assert!(
+            joined.contains(&format!("Buying token: {BOND_MINT}")),
+            "{joined}"
+        );
+        // A buy names a token amount and a ceiling on the spend. The amount is
+        // reported as what the instruction names, because that is all these
+        // bytes establish; the enforced protection is the ceiling.
         let (input, tokens) = swap_instruction_amounts(&parsed, Action::Buy).unwrap();
         assert!(
-            joined.contains(&format!("Tokens bought: {tokens} raw units of {BOND_MINT}")),
+            joined.contains(&format!(
+                "Tokens the instruction names: {}",
+                token_display(tokens, BOND_MINT, Some(6))
+            )),
             "{joined}"
         );
         assert!(
@@ -2864,6 +2997,12 @@ mod tests {
                 "Maximum spent on the trade: {}",
                 lamports_display(input)
             )),
+            "{joined}"
+        );
+        // Pump takes a fee. It is inside the ceiling, but an owner cannot know
+        // that from a line that never mentions it.
+        assert!(
+            joined.contains("Pump's own trading fee comes out of that maximum"),
             "{joined}"
         );
         assert!(joined.contains("Most this can cost in total:"), "{joined}");
@@ -2879,12 +3018,21 @@ mod tests {
             Action::Sell,
             json!({"mint":BOND_MINT,"amount":"1","minOutputAmount":"1","slippagePct":2}),
         );
-        let review = swap_review(USER, Action::Sell, &request, &parsed, 5_000)
+        // No verified scale here, so the amount stays in raw units and says so
+        // rather than implying a decimal point the Petal could not check.
+        let review = swap_review(&trader(), Action::Sell, &request, &parsed, 5_000, None)
             .unwrap()
             .join("\n");
         let (sold, minimum) = swap_instruction_amounts(&parsed, Action::Sell).unwrap();
         assert!(
-            review.contains(&format!("Sold: {sold} raw units of {BOND_MINT}")),
+            review.contains(&format!("Selling token: {BOND_MINT}")),
+            "{review}"
+        );
+        assert!(review.contains("Receiving: SOL"), "{review}");
+        assert!(
+            review.contains(&format!(
+                "Sold: {sold} raw units of {BOND_MINT} (scale unverified)"
+            )),
             "{review}"
         );
         assert!(
@@ -2893,6 +3041,41 @@ mod tests {
                 lamports_display(minimum)
             )),
             "{review}"
+        );
+        assert!(
+            review.contains("Pump's own trading fee is already taken out of that minimum"),
+            "{review}"
+        );
+        // A sell spends no SOL on the trade, but its fee and any new token
+        // account are still money leaving the account, and they are totalled.
+        assert!(review.contains("Most this can cost in SOL:"), "{review}");
+    }
+
+    /// Token amounts read at a scale two RPCs agreed on, or not at all.
+    #[test]
+    fn a_token_amount_is_scaled_only_when_its_mint_decimals_were_verified() {
+        assert_eq!(
+            token_display(92_767_093_907, AMM_MINT, Some(6)),
+            format!("92767.093907 of {AMM_MINT}")
+        );
+        // Trailing zeros go, and a whole amount keeps no point at all.
+        assert_eq!(
+            token_display(1_500_000, AMM_MINT, Some(6)),
+            format!("1.5 of {AMM_MINT}")
+        );
+        assert_eq!(
+            token_display(2_000_000, AMM_MINT, Some(6)),
+            format!("2 of {AMM_MINT}")
+        );
+        // A zero-decimal mint is still a whole number, not a raw-unit string.
+        assert_eq!(
+            token_display(7, AMM_MINT, Some(0)),
+            format!("7 of {AMM_MINT}")
+        );
+        // Unverified stays raw and admits it.
+        assert_eq!(
+            token_display(92_767_093_907, AMM_MINT, None),
+            format!("92767093907 raw units of {AMM_MINT} (scale unverified)")
         );
     }
     #[test]
@@ -4721,6 +4904,13 @@ mod tests {
             }
             .expect("request mint");
 
+            // The scale the script agreed across two independent RPCs, written
+            // only when they matched. Absent means the review must fall back to
+            // raw units, which is itself worth seeing on live output.
+            let live_decimals = std::fs::read_to_string(format!("{dir}/{mint}-decimals.txt"))
+                .ok()
+                .and_then(|text| text.trim().parse::<u8>().ok());
+
             // The body an agent would write, normalized exactly as a route
             // write normalizes it. `minOutputAmount` is the floor the caller
             // chooses; take the builder's own quote so the check is against
@@ -4755,8 +4945,19 @@ mod tests {
             };
 
             // The review the owner would read, from the validated transaction.
-            let review = swap_review(user, action, &normalized, &parsed, 5_000)
-                .unwrap_or_else(|error| panic!("{label}: review: {error}"));
+            let review = swap_review(
+                &Trader {
+                    wallet: "live",
+                    account: 0,
+                    address: user,
+                },
+                action,
+                &normalized,
+                &parsed,
+                5_000,
+                live_decimals,
+            )
+            .unwrap_or_else(|error| panic!("{label}: review: {error}"));
             let debits = effects(action, &normalized, &parsed)
                 .unwrap_or_else(|error| panic!("{label}: effects: {error}"));
             let destinations = destinations(action, &parsed);

@@ -25,6 +25,7 @@ mkdir -p "$OUT"
 BUILDER=https://fun-block.pump.fun/agents/swap
 COINS=https://frontend-api-v3.pump.fun/coins-v2
 RPC=https://api.mainnet-beta.solana.com
+RPC_VERIFY=https://rpc.solanatracker.io/public
 SOL=So11111111111111111111111111111111111111112
 
 say() { printf '%s\n' "$*"; }
@@ -46,6 +47,25 @@ build_one() {
     return 1
   fi
   say "  ${label}: builder returned a transaction ($(jq -r '.transaction | length' "${OUT}/${label}-response.json") base64 chars)"
+}
+
+# The mint's decimal scale, taken only when both RPCs agree — the same rule the
+# route applies in verified_mint_decimals. Written where the review test reads
+# it; absent means the review falls back to raw units, which is the point.
+decimals_of() {
+  local mint="$1" a b
+  read_one() {
+    curl -s -m 20 -X POST -H 'content-type: application/json' \
+      --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"${mint}\",{\"encoding\":\"jsonParsed\",\"commitment\":\"finalized\"}]}" \
+      "$1" | jq -r '.result.value | select(.data.parsed.type == "mint") | .data.parsed.info.decimals // empty' 2>/dev/null
+  }
+  a="$(read_one "$RPC")"; b="$(read_one "$RPC_VERIFY")"
+  if [ -n "$a" ] && [ "$a" = "$b" ]; then
+    printf '%s' "$a" > "${OUT}/${mint}-decimals.txt"
+    say "  ${mint}: decimals ${a}, agreed by both RPCs"
+  else
+    say "  ${mint}: decimals unverified (${a:-none} vs ${b:-none}); review will use raw units"
+  fi
 }
 
 simulate_one() {
@@ -105,6 +125,10 @@ say "simulating the unsigned transactions (sigVerify off, blockhash replaced):"
 for label in buy_bond buy_amm; do
   [ -f "${OUT}/${label}-response.json" ] && simulate_one "$label" || true
 done
+say ""
+
+say "verifying each mint's decimal scale across two independent RPCs:"
+for mint in "$BOND_MINT" "$AMM_MINT"; do decimals_of "$mint"; done
 say ""
 
 say "running this Petal's validation and review over the captured output:"
