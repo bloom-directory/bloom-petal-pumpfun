@@ -1798,19 +1798,21 @@ fn builder_probe_status_reachable(status: u16) -> bool {
 }
 
 fn probe_builder() -> BuilderCheck {
-    let endpoint = format!("{BUILD}/agents/create-coin");
+    // The swap route, because it is the only builder route this package is
+    // allowed to reach. Probing /agents/create-coin — which this release
+    // removed — asks the sandbox for a host the manifest does not permit, so
+    // the call is denied before it leaves the machine and every preflight
+    // reports the builder unreachable. The unit tests did not catch it: their
+    // fake host answers whatever URL it is given.
+    let endpoint = format!("{BUILD}{}", Action::Buy.path());
     let body = match serde_json::to_vec(&json!({
         "preflight": true,
-        "publicKey": "11111111111111111111111111111111",
-        "name": "preflight-probe",
-        "symbol": "PREFLIGHT",
-        "description": "read-only probe",
-        "showName": true,
-        "twitter": "",
-        "telegram": "",
-        "website": "",
-        "uri": "https://example.com/preflight.json",
-        "creator": null,
+        "inputMint": "11111111111111111111111111111111",
+        "outputMint": "11111111111111111111111111111111",
+        "amount": "0",
+        "user": "11111111111111111111111111111111",
+        "feePayer": "11111111111111111111111111111111",
+        "encoding": "base64",
     })) {
         Ok(v) => v,
         Err(e) => {
@@ -1820,10 +1822,10 @@ fn probe_builder() -> BuilderCheck {
             };
         }
     };
-    // This deliberately invalid, non-signing request must never create a
-    // coin. A 400/422 validation response proves the exact builder route is
-    // live without asking it to produce a transaction. Authentication,
-    // routing, and server failures remain blockers.
+    // A deliberately invalid request: identical mints and a zero amount, so
+    // the builder must reject it rather than quote anything. A 400/422
+    // validation response proves the route is live without asking it to build
+    // a transaction. Authentication, routing and server failures stay blockers.
     match host::http(
         &HttpRequest {
             method: "POST".into(),
@@ -3346,7 +3348,7 @@ mod tests {
     const WALLET: &str = "main";
     const NOW_MS: u64 = 1_757_000_000_000;
     const SWAP_URL: &str = "https://fun-block.pump.fun/agents/swap";
-    const PROBE_URL: &str = "https://fun-block.pump.fun/agents/create-coin";
+    const PROBE_URL: &str = "https://fun-block.pump.fun/agents/swap";
 
     fn owner() -> TradeOwner {
         TradeOwner::from_params(WALLET, None, None).unwrap()
