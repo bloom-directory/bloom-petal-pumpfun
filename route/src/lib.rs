@@ -4948,9 +4948,17 @@ mod tests {
 
             // The review the owner would read, from the validated transaction.
             let review = swap_review(
+                // The Bloom wallet and account this would run as. Taken from
+                // the environment because the review states them, and a render
+                // showing a placeholder would not be the approval the owner is
+                // going to be asked to read.
                 &Trader {
-                    wallet: "live",
-                    account: 0,
+                    wallet: &std::env::var("PUMPFUN_LIVE_WALLET")
+                        .unwrap_or_else(|_| "live".to_owned()),
+                    account: std::env::var("PUMPFUN_LIVE_ACCOUNT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
                     address: user,
                 },
                 action,
