@@ -1906,7 +1906,17 @@ fn transaction_fee(
 /// was built. Transactions without that record are never treated as expired.
 fn blockhash_expired(p: &Pending) -> Result<bool, DispatchResponse> {
     let Some(last_valid) = p.api.get("lastValidBlockHeight").and_then(Value::as_u64) else {
-        return Ok(false);
+        // Only a locally built transaction records that height. Pump's builder
+        // returns the transaction and its mint info and nothing else, so every
+        // buy and sell lands here — and answering "not expired" would mean a
+        // swap whose approval the owner never completed could never be given
+        // up, never rebuilt, and never retried under its own operation id.
+        //
+        // The cluster can answer directly instead: ask whether the blockhash
+        // these bytes actually carry is still usable. Only a definite "no"
+        // counts as expired; an RPC that will not answer leaves the operation
+        // exactly where it was.
+        return blockhash_rejected_by_cluster(p);
     };
     let height = post(
         RPC,
@@ -1917,6 +1927,35 @@ fn blockhash_expired(p: &Pending) -> Result<bool, DispatchResponse> {
     .ok_or_else(|| fail("Solana RPC omitted the finalized block height"))?;
     Ok(height > last_valid)
 }
+/// Whether the cluster says this transaction's own blockhash can no longer be
+/// used. Read at finalized commitment through both RPCs: a swap has no
+/// recorded expiry height, and giving an approval up is only safe on an answer
+/// the Petal is sure of, so the two must agree before anything is abandoned.
+fn blockhash_rejected_by_cluster(p: &Pending) -> Result<bool, DispatchResponse> {
+    let raw = B64
+        .decode(&p.tx)
+        .map_err(|_| fail("stored transaction is not base64"))?;
+    let blockhash = bs58::encode(
+        envelope(&raw)
+            .map_err(|error| fail(format!("stored transaction is unreadable: {error}")))?
+            .blockhash,
+    )
+    .into_string();
+    let ask = |url: &str| -> Result<bool, DispatchResponse> {
+        post(
+            url,
+            &rpc(
+                "isBlockhashValid",
+                json!([blockhash, {"commitment":"finalized"}]),
+            ),
+        )?
+        .pointer("/result/value")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| fail("Solana RPC did not answer whether the blockhash is valid"))
+    };
+    Ok(!ask(RPC)? && !ask(RPC_VERIFY)?)
+}
+
 fn simulate(tx: &str) -> Result<(), DispatchResponse> {
     let v = post(
         RPC,
@@ -4337,6 +4376,7 @@ mod tests {
     /// approval is kept until the finalized block height passes the
     /// transaction's last valid height; only then does a retry rebuild and
     /// ask for a new approval.
+
     #[test]
     fn an_exact_approval_is_given_up_only_after_its_blockhash_expires() {
         let mut host = host_serving_a_close();
@@ -4403,6 +4443,81 @@ mod tests {
             // abandoned attempt did not sign, so the abandoned ceremony is
             // left to expire and the rebuild waits for it.
             assert_eq!(host.sign_requests[2].approval_hint, None);
+        });
+    }
+
+    /// A swap has no recorded expiry height: Pump's builder returns the
+    /// transaction and its mint info and nothing else. Before this, that meant
+    /// a buy whose approval the owner never completed could never be given up,
+    /// never rebuilt, and never retried under its own operation id - it was
+    /// wedged, and the only escape was a new operation id, which is the one
+    /// action that can pay twice. The cluster is asked directly instead.
+    #[test]
+    fn a_swap_whose_approval_went_unanswered_is_given_up_once_the_cluster_says_so() {
+        let mut host = host_serving_a_buy();
+        for _ in 0..2 {
+            host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+                action_id: "exact-buy-pending".into(),
+                expires_ms: NOW_MS + 60_000,
+            }));
+        }
+        fake_host::install(host);
+        let valid = |primary: bool, verify: bool| {
+            fake_host::with(|host| {
+                host.reply_only(
+                    &format!("{RPC} isBlockhashValid"),
+                    json!({"result": {"value": primary}}),
+                );
+                host.reply_only(
+                    &format!("{RPC_VERIFY} isBlockhashValid"),
+                    json!({"result": {"value": verify}}),
+                );
+            });
+        };
+        assert!(dispatch_message(&run_buy("buy-slow", false)).contains("approval required"));
+        let built = fake_host::with(|host| host.sign_requests[0].preimage.clone());
+
+        // Still usable: the approval and the exact bytes it binds are kept,
+        // even through a failed simulation.
+        fake_host::with(|host| simulation_rejects(host, true));
+        valid(true, true);
+        assert!(
+            dispatch_message(&run_buy("buy-slow", false))
+                .contains("kept until its blockhash expires")
+        );
+
+        // One RPC says dead and the other says usable: not sure enough to give
+        // an owner-approved transaction away.
+        valid(false, true);
+        assert!(
+            dispatch_message(&run_buy("buy-slow", false))
+                .contains("kept until its blockhash expires")
+        );
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 1, "nothing was rebuilt");
+        });
+
+        // Both agree it is dead. The simulation is still failing - that is the
+        // path a stale transaction takes - and now the approval is given up
+        // and the transaction rebuilt.
+        valid(false, false);
+        let _ = run_buy("buy-slow", false);
+        fake_host::with(|host| simulation_rejects(host, false));
+        let _ = run_buy("buy-slow", false);
+        fake_host::with(|host| {
+            // The builder fixture replays one transaction, so the bytes match;
+            // what matters is that a second signing call happened at all, which
+            // before this fix it never could.
+            assert_eq!(
+                host.sign_requests.len(),
+                2,
+                "the dead transaction was rebuilt"
+            );
+            assert_eq!(
+                host.sign_requests[1].approval_hint, None,
+                "the rebuild asks for its own approval and names no other artifact"
+            );
+            let _ = &built;
         });
     }
 
