@@ -1058,7 +1058,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             return store_error;
         }
         return fail(format!(
-            "the host signed with a key that is not the trading account {user}: {error}"
+            "the host signed with a key that is not the trading account {user}, so this transaction can never execute: {error}. The signature is kept and this operation is never rebuilt; check which account the route is mounted for, then use a new operationId"
         ));
     }
     let mut signed = raw.clone();
@@ -4372,6 +4372,43 @@ mod tests {
         for status in [300, 401, 403, 404, 429, 500, 503] {
             assert!(!builder_probe_status_reachable(status), "{status}");
         }
+    }
+
+    /// The host chooses the signing key, not the Petal. If it returns a
+    /// signature that does not belong to the address the builder was given,
+    /// the transaction cannot execute, and saying so here names the real
+    /// fault instead of leaving an RPC rejection to be interpreted.
+    #[test]
+    fn a_signature_from_the_wrong_key_never_reaches_the_network() {
+        let mut host = host_serving_a_buy();
+        for _ in 0..2 {
+            host.sign_outcome(Ok(SignOutcome::Signature(vec![7u8; 64])));
+        }
+        fake_host::install(host);
+
+        let response = run_buy("buy-wrong-key", false);
+        let message = dispatch_message(&response);
+        assert!(message.contains("not the trading account"), "{message}");
+        assert!(message.contains(USER), "{message}");
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("sendTransaction").is_empty(),
+                "a transaction signed by the wrong key must not be broadcast"
+            );
+        });
+        // A signature exists, so the operation is never rebuilt.
+        assert_eq!(
+            public_operation("buy-wrong-key")["status"],
+            json!("signing_uncertain")
+        );
+        assert_eq!(dispatch_message(&run_buy("buy-wrong-key", false)), message);
+        fake_host::with(|host| {
+            assert_eq!(builder_calls(host), 1, "never rebuilt");
+            assert_eq!(
+                host.sign_requests[0].preimage, host.sign_requests[1].preimage,
+                "the retry signs the same transaction"
+            );
+        });
     }
 
     /// An operation id belongs to one account. The same id and the same body
