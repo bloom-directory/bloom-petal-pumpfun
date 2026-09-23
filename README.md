@@ -22,10 +22,10 @@ account is a third.
 What the owner sees before approving comes from the transaction itself, read
 back out of the bytes that were just validated: the trading account, the token,
 **the maximum the trade can spend** (or, for a sell, the amount sold and the
-minimum returned), the tokens a buy receives, the network fee, any rent for new
-token accounts, any Jito tip, and for a buy the worst-case total. These figures
-are the Petal's and are labelled as such — Bloom does not independently
-re-derive them.
+least SOL the instruction may return), the tokens a buy names, the network fee,
+any rent for new token accounts, any Jito tip, and for a buy the worst-case
+total. These figures are the Petal's and are labelled as such — Bloom does not
+independently re-derive them.
 
 ## Route tree
 
@@ -54,18 +54,18 @@ before their accounts are checked.
 Swap requests carry a caller-selected `minOutputAmount`, and the on-chain
 instruction must preserve at least that many raw output units. That is a check
 on the builder, not a control: the builder sets the amount the instruction
-names. The token
-accounts a trade receives into or spends from must be the trading account's own
+names. The token accounts a trade receives into or spends from must be the
+trading account's own
 associated token accounts, and PumpSwap trades must use the coin's canonical
 pool; both are derived locally, never taken from the builder. Bloom applies a
 local base and priority fee floor and requires an explicit successful simulation
 of the unsigned transaction before signing.
 
 Optional request fields follow Pump's official agent API: `slippagePct`,
-`frontRunningProtection` and `tipAmount`. A Pump buy names an exact token
-amount out and a ceiling on the SOL in, and `slippagePct` raises only that
-ceiling: the tolerance is on what the trade spends, never on what it receives.
-`SETUP.md` has the measurements.
+`frontRunningProtection` and `tipAmount`. A Pump buy instruction names a token
+amount and a ceiling on the SOL in, and in every measured case `slippagePct`
+raised only that ceiling: the tolerance is on what the trade spends.
+`SETUP.md` has the measurements, and their limits.
 
 Protected writes are sent only to Jito; ordinary writes use the declared public
 Solana RPC and fall back to the second RPC once. Protection is routing, not a

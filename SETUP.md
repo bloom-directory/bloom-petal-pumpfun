@@ -159,19 +159,28 @@ Three different clocks bound a trade, and they are not the same thing:
 
 ### On a buy, `slippagePct` moves the maximum spend, not the tokens
 
-A Pump buy names **an exact token amount out and a ceiling on the SOL in**.
+A Pump buy instruction names **a token amount and a ceiling on the SOL in**.
 Measured against the live builder on 23 September 2026, on both routes and at
 2%, 10% and 40%: the token amount is **exactly** the builder's quote every
 time, unchanged by `slippagePct`; only `max_quote_amount_in` moves — 1,020,000,
 1,100,000 and 1,400,000 lamports for a 1,000,000 lamport buy.
 
 So the tolerance is on what the trade spends. The pool can move against the
-owner between building and landing, and the program pays whatever the curve
-now asks, up to that ceiling; past it the trade fails rather than pay more.
+owner between building and landing, and the program pays what the curve now
+asks, up to that ceiling; past it the trade fails rather than pay more, which
+is what both failed simulations in that run showed at the 2% default.
 A wider `slippagePct` buys the same tokens and risks more SOL.
 
 That is why the maximum spend is the figure the review states first and totals
 at the end: it is what can change after the owner has read it.
+
+What these measurements do **not** establish is what the program does with the
+token amount beyond refusing to overpay for it — whether it always delivers
+exactly that amount, or can deliver less in some pool state. The review says
+only what the instruction names, and the enforced protection it states is the
+maximum spend. They say nothing about **sells**, which were not probed: a sell
+names a token amount in and a floor on the SOL out, so its fields sit the other
+way round, and the review reports that floor as the instruction's own.
 
 `minOutputAmount` is a **check, not a control**. The Petal compares it against
 the token amount the builder baked in and refuses a transaction that promises

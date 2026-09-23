@@ -544,24 +544,23 @@ fn swap_review(
         .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
         .ok_or("account rent allowance exceeds u64")?;
     let (spend, receive) = match action {
-        // A Pump buy names the tokens exactly and the spend as a ceiling: the
-        // pool decides what it actually costs, and the trade fails rather than
-        // pay past this. So this is the figure that can move against the owner
-        // between approving and landing, and the one they are here to bound.
+        // A Pump buy names a token amount and a ceiling on the SOL in, and
+        // only the ceiling moves with slippage. So the spend is the figure
+        // that can move against the owner between approving and landing, and
+        // the one they are here to bound. Both lines are read out of the
+        // instruction; neither asserts anything about the program beyond the
+        // field it names.
         Action::Buy => (
             format!(
                 "Maximum spent on the trade: {} (the pool sets the real cost, up to this)",
                 lamports_display(input)
             ),
-            format!(
-                "Tokens received: {} (exactly this, or the trade fails)",
-                token_display(minimum_output, mint)
-            ),
+            format!("Tokens bought: {}", token_display(minimum_output, mint)),
         ),
         _ => (
             format!("Sold: {}", token_display(input, mint)),
             format!(
-                "Guaranteed minimum received: {}",
+                "Least SOL this may return: {}",
                 lamports_display(minimum_output)
             ),
         ),
@@ -2857,9 +2856,7 @@ mod tests {
         // this mint's decimals.
         let (input, tokens) = swap_instruction_amounts(&parsed, Action::Buy).unwrap();
         assert!(
-            joined.contains(&format!(
-                "Tokens received: {tokens} raw units of {BOND_MINT}"
-            )),
+            joined.contains(&format!("Tokens bought: {tokens} raw units of {BOND_MINT}")),
             "{joined}"
         );
         assert!(
@@ -2892,7 +2889,7 @@ mod tests {
         );
         assert!(
             review.contains(&format!(
-                "Guaranteed minimum received: {}",
+                "Least SOL this may return: {}",
                 lamports_display(minimum)
             )),
             "{review}"
