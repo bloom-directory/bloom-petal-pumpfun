@@ -54,13 +54,19 @@ Bloom compares every destination a claim declares against
 | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump bonding curve | a buy or sell before the coin migrates |
 | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
 | the selected Jito tip account | a protected write | only with `frontRunningProtection` |
+| the trading account's own Solana address | `close_token_account` | returning the rent — see below |
 
 Which Pump program a given mint routes through depends on whether it has
 migrated, and the Petal does not choose — the builder does. Allow both, or read
 `coins/<mint>.json` first and allow the one that mint actually uses.
 
-Closing a token account declares the trading account itself as the rent
-destination, which is the account the wallet already owns.
+**Closing a token account needs the trading account itself in
+`allowed_destinations`.** The close declares the rent destination, which is the
+trading account, and Bloom checks every declared destination against policy as
+a flat set — including an account the wallet already owns. Without the entry
+the write is refused after the owner has already approved it, with
+`CLAIM_INVALID: claim names destination <account> for chain "solana" outside
+wallet policy`. Add it before the first close.
 
 The eight Jito tip accounts the Petal accepts are listed in
 `route/src/lib.rs`. A write declares only the one it selects, and only when
@@ -97,15 +103,18 @@ Bloom hashes those bytes into the approval's canonical facts, so an approval
 prepared for one review cannot sign a different one — changing the review
 changes the facts digest and the retry is refused as a different operation.
 
-**On current Bloom master those bytes are hashed but not forwarded**: the
-daemon puts an `advisory_digest` in its canonical facts and passes no advisory
-to `sign_or_prepare_petal`, and Broker's `prepare_approval` sets
-`attributed_advisory_items: Vec::new()`. The ceremony therefore shows the
-claim's declared debits, destinations and fee — which are real, and already
-rendered with SOL units — but not the minimum output or the trade direction.
-Landing the forwarding path is what turns the review above into something the
-owner actually reads. Until then, treat the ceremony as showing the spend and
-the fee only.
+**On Bloom master those bytes are hashed and go nowhere**: the daemon puts an
+`advisory_digest` in its canonical facts and passes no advisory to
+`sign_or_prepare_petal`, and Broker's `prepare_approval` sets
+`attributed_advisory_items: Vec::new()`. The ceremony then shows the claim's
+declared debits, destinations and fee — real figures, already rendered with SOL
+units — but not the minimum output or the direction. On a build carrying the
+review transport the page shows the lines above, attributed to the app, in
+their own block. A live run confirmed it: see
+`shared/pumpfun-direct-live-2026-09-22/`.
+
+Bloom does not verify any of it. The page says so, and the review is worded as
+the app's own statement for that reason.
 
 ## Approval and retry continuation
 
