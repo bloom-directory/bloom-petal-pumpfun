@@ -4521,12 +4521,12 @@ mod tests {
         });
     }
 
-    /// Which approval a rebuild says it has given up is the Petal's assertion:
-    /// Bloom scopes it to this package, route, wallet, class and key, but
-    /// within that scope it does not second-guess which operation is meant. So
-    /// the Petal has to name only its own operation's previous attempt. Two
-    /// operations that differ by nothing but their id, expiring and rebuilding
-    /// together, must never name each other's.
+    /// A rebuild holds only its own approval, and Bloom scopes each artifact to
+    /// this package, route, wallet, class and key — within that scope it does
+    /// not second-guess which operation is meant. Two operations that differ by
+    /// nothing but their id expire and rebuild side by side, so each must drop
+    /// its own approval and pick up the one prepared for its own rebuilt bytes,
+    /// and neither may name (or hand back) the other's.
     #[test]
     fn a_rebuild_names_only_its_own_operations_previous_attempt() {
         let mut host = host_serving_a_close();
