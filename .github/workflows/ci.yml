@@ -87,5 +87,15 @@ jobs:
           done
           "$bloom_bin" --home "$home" petals build .
           "$bloom_bin" --home "$home" petal install .
-          "$bloom_bin" --home "$home" vfs cat /petals/pumpfun/README.md | grep -Fq 'buy or sell an existing coin'
-          "$bloom_bin" --home "$home" vfs cat /petals/pumpfun/status.json | grep -Fq '{'
+          # Smoke-read through the mounted VFS. Grep patterns must be text the
+          # served files actually contain: the README states the no-session-key
+          # guarantee; status.json is a JSON object. Failures are loud — a bare
+          # `grep -q` in a pipefail script dies silently (seen in CI 2026-09-25).
+          smoke_read() {
+            "$bloom_bin" --home "$home" vfs cat "$1" >"$RUNNER_TEMP/smoke.out" \
+              || { echo "vfs cat $1 failed; serve log:" >&2; cat "$RUNNER_TEMP/bloom.log" >&2; exit 1; }
+            grep -Fq "$2" "$RUNNER_TEMP/smoke.out" \
+              || { echo "mounted $1 is missing expected text: $2" >&2; exit 1; }
+          }
+          smoke_read /petals/pumpfun/README.md 'no session key'
+          smoke_read /petals/pumpfun/status.json '{'
