@@ -3,11 +3,15 @@
 A mainnet Pump.fun integration for Bloom. It reads coin state and buys or sells
 existing coins through Pump's automatic bonding-curve/PumpSwap routing.
 
-Every write is one transaction the owner approves in Bloom, signed with the key
+Every write is one operation the owner approves in Bloom, signed with the key
 of the Bloom account they already selected. There is **no session key, no
-separate wallet, no funding transfer and no spending budget.** An agent can
-propose a trade; only the owner can authorize one, and they authorize the exact
-transaction they are shown.
+separate wallet, no funding transfer and no standing budget.** An agent can
+propose a trade; only the owner can authorize one. The approval covers one
+operation of that kind, capped at the SOL ceiling the ceremony shows: the
+requested amount plus slippage, token-account rent, tip and network fee. After
+the owner approves, the Petal rebuilds the transaction with a fresh blockhash
+and signs it under that approval, because a blockhash lives about a minute and
+a ceremony can take most of it.
 
 Coin creation, fee collection and fee-sharing configuration are not part of this
 release. Their routes are gone, not merely disabled. Creation acceptance is
@@ -102,14 +106,10 @@ shown.
 Retrying means writing the identical request under the same `operationId`. What
 it does depends on where the operation stopped:
 
-- `approval_pending` — the owner has not answered. The approval binds these
-  exact bytes and this exact review, so the transaction is kept, even through a
-  failed simulation. Only once its blockhash has expired — the finalized block
-  height passes its last valid height, about a minute — does a retry drop the
-  approval, rebuild, and ask for a new one covering the new bytes.
-- `approval_failed` or `preflight_failed` — if no signing call could have
-  produced a signature, the Petal rebuilds with a fresh blockhash under the same
-  economic intent.
+- `approval_pending`, `approval_failed` or `preflight_failed` — if no signing
+  call could have produced a signature, the Petal rebuilds with a fresh
+  blockhash under the same economic intent and the same approval. A rebuild
+  whose network fee is above the approved one is not signed.
 - `signing` or `signing_uncertain` — a signature may exist. From then on the
   operation is never rebuilt, whatever later attempts report: every retry signs
   the same transaction again, which can only reproduce it. If it can no longer

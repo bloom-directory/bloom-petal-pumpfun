@@ -84,11 +84,11 @@ bloom vfs cat /wallets/<wallet>/policy.json
 | --- | --- | --- | --- |
 | 1 | package eligibility | allow this Petal package version | already allowed |
 | 2 | `PolicyUpdate` | admit any protocol destination the policy lacks | policy already covers them |
-| 3 | `SealedApproval` | this exact transaction | never — one per trade |
+| 3 | `SealedApproval` | one trade of this kind, up to the SOL ceiling shown | never — one per trade |
 
 Ceremony 3 repeats for every buy, every sell and every close. That is the
-design, not an oversight: nothing here signs a transaction the owner has not
-seen.
+design, not an oversight: nothing here signs a trade the owner has not approved,
+or spends above the ceiling they saw.
 
 ## What the owner sees
 
@@ -130,9 +130,9 @@ whatever later attempts report, because a rebuilt transaction could pay twice.
 
 | Status | Meaning | What a retry does |
 | --- | --- | --- |
-| `approval_pending` | an owner ceremony is required; `action_id` is in the response | keeps the exact transaction and review the owner is approving; drops them only once the blockhash has provably expired |
+| `approval_pending` | an owner ceremony is required; `action_id` is in the response | rebuilds with a fresh blockhash and signs under the approval once the owner has completed it |
 | `approval_failed` | signing was refused | rebuilds and asks again, unless the transaction may already be signed |
-| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed or an unexpired approval binds it |
+| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed |
 | `signing` | a signing call was interrupted before its outcome was recorded | treated as possibly signed: signs the same transaction again |
 | `signing_uncertain` | signing returned no answer and may already have signed | signs the same transaction again |
 | `broadcast_attempted` | sent, with no acknowledgement — outcome unknown | reports it; never re-broadcasts |
@@ -148,9 +148,9 @@ intent under a new `operationId`.
 
 Three different clocks bound a trade, and they are not the same thing:
 
-- **chain validity** — the blockhash the builder pinned. Roughly 60–90 seconds
-  in practice, but the authority is the transaction's own last valid block
-  height, which the Petal reads and compares against the finalized height.
+- **chain validity** — the blockhash the builder pinned. Roughly 60 seconds,
+  often less by the time the builder answers. The approval does not bind it:
+  the retry after the ceremony rebuilds with a fresh one.
 - **approval expiry** — how long Bloom's approval stays usable.
 - **price** — the quote is fixed when the transaction is built, and the owner
   then reads and approves inside that window. See below: on a buy the price
@@ -193,6 +193,6 @@ preserved, before a ceremony is created. Retrying under the same `operationId`
 rebuilds it against a fresh quote. Evidence:
 `shared/pumpfun-live-builder-2026-09-23/`.
 
-If an approval takes long enough that the blockhash expires, the retry rebuilds
-and asks again. The Petal never refreshes bytes under an existing approval and
-never widens slippage on its own.
+The retry after the ceremony rebuilds against a fresh blockhash and quote under
+the same request, so the same ceiling holds. The Petal never widens slippage on
+its own.
