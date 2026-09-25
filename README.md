@@ -11,7 +11,8 @@ operation of that kind, capped at the SOL ceiling the ceremony shows: the
 requested amount plus slippage, token-account rent, tip and network fee. After
 the owner approves, the Petal rebuilds the transaction with a fresh blockhash
 and signs it under that approval, because a blockhash lives about a minute and
-a ceremony can take most of it.
+a ceremony can take most of it. The approval is scoped to this package, route,
+account and kind of trade, and capped in SOL; it does not name the coin.
 
 Coin creation, fee collection and fee-sharing configuration are not part of this
 release. Their routes are gone, not merely disabled. Creation acceptance is

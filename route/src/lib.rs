@@ -79,7 +79,8 @@ mod fake_host;
 /// route flow and then assert on the requests that actually left the Petal.
 mod host {
     #[cfg(not(test))]
-    use petal::{HttpRequest, HttpResponse, PayloadSignRequest, SdkError, SignOutcome};
+    use petal::{HttpRequest, HttpResponse};
+    use petal::{PayloadSignRequest, SdkError, SignOutcome};
 
     #[cfg(not(test))]
     pub fn http(request: &HttpRequest, max_bytes: usize) -> Result<HttpResponse, SdkError> {
@@ -111,7 +112,11 @@ mod host {
     /// so it is sent as a batch of one.
     #[cfg(not(test))]
     pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
-        let batch = petal::PayloadBatchSignRequest {
+        single_outcome(petal::sdk::sign_payload_batch(&batch_of_one(request))?)
+    }
+
+    pub(crate) fn batch_of_one(request: &PayloadSignRequest) -> petal::PayloadBatchSignRequest {
+        petal::PayloadBatchSignRequest {
             wallet: request.wallet.clone(),
             payloads: vec![petal::PayloadSignItem {
                 preimage: request.preimage.clone(),
@@ -126,12 +131,22 @@ mod host {
             advisory: request.advisory.clone(),
             selector: request.selector.clone(),
             key_ref_jcs: request.key_ref_jcs.clone(),
-        };
-        match petal::sdk::sign_payload_batch(&batch)? {
-            petal::SignBatchOutcome::Signatures(mut signatures) => signatures
-                .pop()
-                .map(SignOutcome::Signature)
-                .ok_or_else(|| SdkError::Message("host returned no signature".into())),
+        }
+    }
+
+    pub(crate) fn single_outcome(
+        outcome: petal::SignBatchOutcome,
+    ) -> Result<SignOutcome, SdkError> {
+        match outcome {
+            petal::SignBatchOutcome::Signatures(signatures) => {
+                match <[Vec<u8>; 1]>::try_from(signatures) {
+                    Ok([signature]) => Ok(SignOutcome::Signature(signature)),
+                    Err(signatures) => Err(SdkError::Message(format!(
+                        "host returned {} signatures for one payload",
+                        signatures.len()
+                    ))),
+                }
+            }
             petal::SignBatchOutcome::ApprovalPending {
                 action_id,
                 expires_ms,
@@ -1125,12 +1140,11 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         operation_class: a.class().into(),
         petal_use_claim_jcs: claim_jcs,
         claim_assurance_evidence: None,
-        // This operation's own approval artifact, and nothing else. A rebuilt
-        // transaction asks for its own approval from scratch; it never tells
-        // Bloom to give up the earlier one, because deciding whether that
-        // earlier attempt might already have signed is not something either
-        // side can currently establish.
-        approval_hint: p.approval.clone(),
+        // None. Bloom derives a Reusable approval's identity from this
+        // package, route, wallet, class and key, so a hint adds nothing, and
+        // the id stored after a package-eligibility ceremony is not that
+        // identity: naming it would be refused once.
+        approval_hint: None,
         action: None,
         // The review the owner reads, frozen with these bytes. The host
         // hashes it into the approval's canonical facts, so an approval
@@ -3795,8 +3809,10 @@ mod tests {
         fake_host::with(|host| {
             assert_eq!(host.sign_requests.len(), 2);
             assert_eq!(
-                host.sign_requests[1].approval_hint.as_deref(),
-                Some("one-close")
+                host.secret_json(&secret_key(&owner(), "review-close"))
+                    .unwrap()["approval"],
+                Value::Null,
+                "the approval was used"
             );
             assert_ne!(
                 host.sign_requests[0].preimage, host.sign_requests[1].preimage,
@@ -4418,17 +4434,15 @@ mod tests {
         fake_host::with(|host| {
             assert_eq!(builder_calls(host), 3, "each retry rebuilt");
             assert_eq!(host.sign_requests.len(), 2);
-            assert_eq!(
-                host.sign_requests[1].approval_hint.as_deref(),
-                Some("buy-grant")
-            );
+            assert!(host.sign_requests.iter().all(|r| r.approval_hint.is_none()));
             assert_eq!(host.calls_for("sendTransaction").len(), 1);
         });
     }
 
-    /// Each operation names only the approval its own first request prepared.
+    /// Bloom derives a Reusable approval from the route, class and key, so no
+    /// request names one, including after its own approval was prepared.
     #[test]
-    fn a_rebuild_names_only_its_own_operations_approval() {
+    fn no_signing_request_names_an_approval() {
         let mut host = host_serving_a_close();
         for action in ["grant-a", "grant-b"] {
             host.sign_outcome(Ok(SignOutcome::ApprovalPending {
@@ -4449,7 +4463,7 @@ mod tests {
                 .iter()
                 .map(|request| request.approval_hint.as_deref())
                 .collect::<Vec<_>>();
-            assert_eq!(hints, vec![None, None, Some("grant-b"), Some("grant-a")]);
+            assert_eq!(hints, vec![None, None, None, None]);
         });
     }
 
@@ -5030,5 +5044,81 @@ mod tests {
                 .contains("rent always returns to the trading account"),
             "close must say where the rent goes"
         );
+    }
+
+    /// After a package-eligibility ceremony the host reports that ceremony's
+    /// id as pending. It is not the trade approval's identity, so the retry
+    /// must not name it: the host refuses a mismatched hint.
+    #[test]
+    fn an_eligibility_approval_is_never_named_on_the_retry() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "package-eligibility".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("buy-eligible", false)).contains("approval required"));
+        assert_eq!(run_buy("buy-eligible", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2);
+            assert_eq!(host.sign_requests[1].approval_hint, None);
+        });
+    }
+
+    #[test]
+    fn a_payload_is_sent_to_the_host_as_a_batch_of_one() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-batch", false), DispatchResponse::Write);
+        let request = fake_host::with(|host| host.sign_requests[0].clone());
+        let batch = host::batch_of_one(&request);
+        assert_eq!(batch.wallet, request.wallet);
+        assert_eq!(batch.operation_class, request.operation_class);
+        assert_eq!(batch.signature_algorithm, request.signature_algorithm);
+        assert_eq!(batch.petal_use_claim_jcs, request.petal_use_claim_jcs);
+        assert_eq!(batch.advisory, request.advisory);
+        assert_eq!(batch.approval_hint, request.approval_hint);
+        assert!(matches!(batch.selector, SignSelector::Reusable));
+        assert_eq!(batch.key_ref_jcs, None);
+        assert_eq!(batch.payloads.len(), 1);
+        assert_eq!(batch.payloads[0].preimage, request.preimage);
+        assert_eq!(batch.payloads[0].claimed_hash, request.claimed_hash);
+        // The claim's payload digest is the host's batch digest of exactly
+        // this one payload, which the host recomputes and compares.
+        let claim: Value = serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+        assert_eq!(
+            claim["payload_digest"],
+            json!(hex::encode(
+                petal::payload_batch_digest(&batch.payloads).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_batch_outcome_maps_to_exactly_one_signature_or_a_pending_approval() {
+        assert_eq!(
+            host::single_outcome(petal::SignBatchOutcome::Signatures(vec![vec![7; 64]])).unwrap(),
+            SignOutcome::Signature(vec![7; 64])
+        );
+        assert_eq!(
+            host::single_outcome(petal::SignBatchOutcome::ApprovalPending {
+                action_id: "grant".into(),
+                expires_ms: 5,
+            })
+            .unwrap(),
+            SignOutcome::ApprovalPending {
+                action_id: "grant".into(),
+                expires_ms: 5,
+            }
+        );
+        for count in [0, 2] {
+            assert!(
+                host::single_outcome(petal::SignBatchOutcome::Signatures(vec![
+                    vec![7; 64];
+                    count
+                ]))
+                .is_err(),
+                "{count} signatures for one payload"
+            );
+        }
     }
 }
