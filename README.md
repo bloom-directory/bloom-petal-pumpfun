@@ -110,7 +110,8 @@ it does depends on where the operation stopped:
 - `approval_pending`, `approval_failed` or `preflight_failed` — if no signing
   call could have produced a signature, the Petal rebuilds with a fresh
   blockhash under the same economic intent and the same approval. A rebuild
-  whose network fee is above the approved one is not signed.
+  whose debits and network fee exceed the approved ceiling is refused by the
+  Broker before anything is signed.
 - `signing` or `signing_uncertain` — a signature may exist. From then on the
   operation is never rebuilt, whatever later attempts report: every retry signs
   the same transaction again, which can only reproduce it. If it can no longer

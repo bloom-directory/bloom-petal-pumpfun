@@ -437,12 +437,6 @@ struct Pending {
     /// reuse an approval prepared for the old text.
     #[serde(default)]
     review: Vec<String>,
-    /// The network fee declared by the first signing request. That request
-    /// prepared the owner's approval, so its debits plus this fee are the
-    /// ceiling the Broker enforces. A rebuild whose fee is higher would be
-    /// refused there, so it is refused here before anything is signed.
-    #[serde(default)]
-    fee_ceiling_lamports: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Public {
@@ -521,7 +515,6 @@ fn build_pending(
         approval: None,
         may_be_signed: false,
         review,
-        fee_ceiling_lamports: None,
     })
 }
 
@@ -949,7 +942,6 @@ fn build_close_token_account_pending(
         approval: None,
         may_be_signed: false,
         review,
-        fee_ceiling_lamports: None,
     })
 }
 pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchResponse {
@@ -1012,13 +1004,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                     "built" | "approval_pending" | "preflight_failed" | "approval_failed"
                 )
             {
-                let (approval, fee_ceiling) = (v.approval.take(), v.fee_ceiling_lamports);
+                let approval = v.approval.take();
                 v = match build_pending(a, &trader, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
                 v.approval = approval;
-                v.fee_ceiling_lamports = fee_ceiling;
                 if let Err(e) = put(&key, &v, true) {
                     return e;
                 }
@@ -1086,15 +1077,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
     };
-    if let Some(ceiling) = p.fee_ceiling_lamports
-        && p.network_fee_lamports > ceiling
-    {
-        return fail(format!(
-            "the rebuilt transaction's network fee of {} is above the approved {}; retry to rebuild",
-            lamports_display(p.network_fee_lamports),
-            lamports_display(ceiling)
-        ));
-    }
     // Simulate before signing: an RPC that receives a signed transaction can
     // broadcast it, so a signature must never leave until this operation will
     // not build another transaction.
@@ -1128,7 +1110,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     // Recorded before the host call, so an interruption leaves `signing`
     // behind and the next retry treats the message as possibly signed.
     p.status = "signing".into();
-    p.fee_ceiling_lamports.get_or_insert(p.network_fee_lamports);
     if let Err(e) = put(&key, &p, true) {
         return e;
     }
@@ -1146,15 +1127,14 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         // identity: naming it would be refused once.
         approval_hint: None,
         action: None,
-        // The review the owner reads, frozen with these bytes. The host
-        // hashes it into the approval's canonical facts, so an approval
-        // prepared for one review cannot sign a different one.
+        // The review of these bytes. A Reusable approval does not bind it:
+        // the owner approves the ceiling, and each rebuild publishes its own
+        // review in the operation record.
         advisory: Some(review_advisory(&p.review)),
-        // One operation of this class, capped at this claim's debits and
-        // fee. The first request prepares that approval; after the owner
-        // completes it, a rebuilt transaction with a fresh blockhash signs
-        // under it. No delegated key is named, so Bloom selects the mounted
-        // account's own signing key.
+        // One operation of this class, capped at the debits and fee of the
+        // claim that prepared it. After the owner completes it, a rebuilt
+        // transaction with a fresh blockhash signs under it. No delegated key
+        // is named, so Bloom selects the mounted account's own signing key.
         selector: SignSelector::Reusable,
         key_ref_jcs: None,
     }) {
@@ -3823,11 +3803,12 @@ mod tests {
         });
     }
 
-    /// The first request's fee is part of the approved ceiling. A rebuild that
-    /// quotes more would be refused by the Broker, so it is refused before it
-    /// is signed, and the approval is kept for a later rebuild.
+    /// The Broker holds the ceiling: the claim that prepared the approval
+    /// sets it, and every later claim is accounted against it before
+    /// anything is signed. So each rebuild declares the fee its own
+    /// transaction pays, not a figure carried over from an earlier build.
     #[test]
-    fn a_rebuild_above_the_approved_fee_is_not_signed() {
+    fn each_rebuild_declares_its_own_network_fee() {
         let mut host = host_serving_a_close();
         host.sign_outcome(Ok(SignOutcome::ApprovalPending {
             action_id: "fee-cap".into(),
@@ -3835,30 +3816,26 @@ mod tests {
         }));
         fake_host::install(host);
         assert!(dispatch_message(&run_close("close-fee")).contains("approval required"));
-        let ceiling = fake_host::with(|host| {
-            host.secret_json(&secret_key(&owner(), "close-fee"))
-                .unwrap()["fee_ceiling_lamports"]
-                .as_u64()
-                .expect("ceiling recorded with the first signing request")
-        });
         fake_host::with(|host| {
             host.reply_only(
                 &format!("{RPC} getFeeForMessage"),
-                json!({"result":{"value": ceiling + 1}}),
+                json!({"result":{"value": 7_000}}),
             );
         });
-        assert!(dispatch_message(&run_close("close-fee")).contains("above the approved"));
+        assert_eq!(run_close("close-fee"), DispatchResponse::Write);
         fake_host::with(|host| {
-            assert_eq!(
-                host.sign_requests.len(),
-                1,
-                "nothing above the ceiling is signed"
-            );
-            assert_eq!(
-                host.secret_json(&secret_key(&owner(), "close-fee"))
-                    .unwrap()["approval"],
-                json!("fee-cap")
-            );
+            let fees = host
+                .sign_requests
+                .iter()
+                .map(|request| {
+                    let claim: Value =
+                        serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+                    claim["declared_fee"]["amount"].as_str().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(fees.len(), 2);
+            assert_eq!(fees[1], "7000");
+            assert_ne!(fees[0], fees[1]);
         });
     }
 
