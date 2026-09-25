@@ -13,16 +13,16 @@ outputs = ["petal/pumpfun"]
 aware = true
 
 [consent]
-summary = "Inspect Pump.fun coins; buy and sell existing coins; collect fees or cashback; and manage fee sharing with a scoped Bloom Solana key. Coin creation is unsupported in this release."
+summary = "Inspect Pump.fun coins, and buy or sell an existing coin from the Bloom account you selected. Every trade is one transaction you approve in Bloom; no session key, no separate wallet and no spending budget. An empty token account can be closed, returning its rent to the same account. Coin creation, fee collection and fee sharing are not supported."
 
 [caps]
-allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:key.derive"]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
 
 [[net.allow]]
 binding = "pump"
 host = "fun-block.pump.fun"
 methods = ["post"]
-paths = ["/agents/create-coin", "/agents/swap", "/agents/collect-fees", "/agents/sharing-config"]
+paths = ["/agents/swap"]
 
 [[net.allow]]
 binding = "coins"
@@ -49,24 +49,8 @@ methods = ["post"]
 paths = ["/api/v1/transactions"]
 
 [sign]
-allowed_intents = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config", "pumpfun.close_token_account", "pumpfun.sweep"]
+allowed_intents = ["pumpfun.buy", "pumpfun.sell", "pumpfun.close_token_account"]
 fee_asset = { chain = "solana", asset = "native" }
-
-[[key.derive]]
-route = "sessions/[wallet]/new.json"
-allowed_routes = [
-  "sessions/[wallet]/new.json",
-  "sessions/[wallet]/sessions/[session]/create.json",
-  "sessions/[wallet]/sessions/[session]/buy.json",
-  "sessions/[wallet]/sessions/[session]/sell.json",
-  "sessions/[wallet]/sessions/[session]/collect_fees.json",
-  "sessions/[wallet]/sessions/[session]/sharing_config.json",
-  "sessions/[wallet]/sessions/[session]/close_token_account.json",
-  "sessions/[wallet]/sessions/[session]/sweep.json",
-]
-operation_classes = ["pumpfun.create", "pumpfun.buy", "pumpfun.sell", "pumpfun.collect_fees", "pumpfun.sharing_config", "pumpfun.close_token_account", "pumpfun.sweep"]
-allowed_crypto_suites = ["ed25519-message"]
-maximum_lifetime_ms = 86400000
 
 [store]
 namespaces = ["state"]

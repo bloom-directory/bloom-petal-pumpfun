@@ -9,7 +9,7 @@ base64 = "0.22"
 bs58 = "0.5"
 curve25519-dalek = { version = "4", default-features = false }
 hex = "0.4"
-petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "f493f9ba442b3cc41021595ada0317cdf3b54058" }
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "2beed2ff344ce2b0c112e07096027e1ae0404007" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_jcs = "0.1"

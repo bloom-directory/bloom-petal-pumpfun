@@ -2,128 +2,75 @@
 
 ## Scope
 
-These notes cover the supported flow: create a session, review its address and
-budgets, approve, fund, buy and sell an existing coin, stop, close token
-accounts, sweep. Coin creation through `create.json` is **not supported in this
-release** and has not been run against Pump's real create program; its checks
-remain in place, but do not include it in a setup you intend to use.
+Buy or sell an existing coin from the Bloom account already selected, and
+optionally close an empty token account afterwards. Each of those is one owner
+approval. Coin creation, fee collection and fee-sharing configuration are not in
+this release and their routes have been removed.
 
 ## Compatibility
 
-This package needs a Bloom build that includes three changes, none of which is
-in a Bloom release yet:
-
-- `[sign].fee_asset` in `petal.toml` (bloom#276);
-- bounded session keys: budgets, address before approval, policy binding (bloom#302);
-- Exact signing with the Petal's own session key, for close and sweep (bloom#304).
+| Requirement | Why | State |
+| --- | --- | --- |
+| `[sign].fee_asset` in `petal.toml` | Bloom must know which asset the declared fee is in | bloom#276, unreleased |
+| review transport to the ceremony | otherwise the owner approves an opaque digest | see "What the owner sees" |
 
 Bloom v0.3.0 refuses to install this package: it does not recognize
-`[sign].fee_asset`. Record the first Bloom release containing all three here
-when it ships. Release installs also need this package in Bloom's signed
-release catalog; until then it runs only on a developer Triad.
+`[sign].fee_asset`. Record the first Bloom release containing it here when it
+ships. Release installs also need this package in Bloom's signed release
+catalog; until then it runs only on a developer Triad.
+
+This package does **not** need bloom#302 (bounded session keys) or bloom#304
+(Exact signing with a Petal's own session key). Both belong to the delegated
+session model this Petal no longer uses.
 
 ## Setup flow
 
-The Petal does not own session-key custody. Every key it uses is requested
-from Bloom, which answers either Pending (the owner still has something to do)
-or Ready (the session key exists and its trading approval is active).
+There is no session to create, no key to derive and no address to fund.
 
-1. `GET sessions/<wallet>/preflight.json` — verify connectivity, RPC
-   genesis and builder reachability.
+1. `GET trade/<wallet>/preflight.json` — verifies the trading account has a
+   readable Solana address, that the RPC is serving mainnet-beta, and that
+   Pump's builder is reachable.
 
-   Read all three lists in the response and do not confuse them.
-   `checks` are facts the Petal verified itself. `blockers` are checks it
-   ran that failed, and `ok` reflects only those. `operator_checks` are
-   facts the Petal cannot see from inside the sandbox and has not checked
-   either way — they are not failures, and an empty `blockers` list does
-   not mean somebody did them.
+   Read all three lists in the response and do not confuse them. `checks` are
+   facts the Petal verified itself. `blockers` are checks it ran that failed,
+   and `ok` reflects only those. `operator_checks` are facts the Petal cannot
+   see from inside the sandbox and has not checked either way — they are not
+   failures, and an empty `blockers` list does not mean somebody did them.
 
-2. `POST sessions/<wallet>/new.json {id, duration_ms, max_lamports, token_limits}`.
-   The Petal answers `session authority pending` with the key slot and the
-   Bloom path to watch:
-   `/wallets/<wallet>/<account>/sessions/<pumpfun mount>/<key slot>/session.json`.
-   Complete the key-derivation ceremony it points at (and, the first time,
-   the package eligibility ceremony).
+2. Make sure wallet policy allows the protocol programs the trade will route
+   through. See the table below.
 
-3. Retry step 2 with the identical body. Bloom records the key and answers
-   Pending again without preparing any approval yet. The session address is now
-   in that Bloom `session.json` under `delegated.addresses`.
-
-4. Update the wallet's Solana allowed destinations to cover the whole cycle,
-   and complete that policy ceremony. **The session address alone is not
-   enough.** See "What wallet policy has to allow" below, and prepare one policy
-   diff covering every entry the cycle needs.
-
-5. Retry step 2 again. Bloom now prepares the session's trading approval, with
-   its budgets, against the policy you just committed. Complete that ceremony
-   and retry once more to receive Ready; the Petal then writes its own
-   `session.json`.
-
-   If you retry before committing the policy, the approval is prepared against
-   the old policy. That is safe: after the policy commit, the next retry
-   prepares a replacement, which costs one more ceremony.
-
-6. Fund the session address from the owner wallet and approve that transfer.
-   Fund only what the cycle needs. On current Bloom a native transfer approval
-   must be completed within about a minute of preparing it.
-
-7. `POST sessions/<wallet>/sessions/<session>/buy.json {operationId, mint,
-   amount, minOutputAmount, ...}` — no further ceremony: trading writes sign
-   under the approval from step 5.
-
-Any later wallet policy change makes Bloom refuse that approval. Repeat step 2
-with the identical body: the same key and deadline get a replacement approval
-after one more ceremony.
-
-## Session budgets and fee asset
-
-`new.json` requires `max_lamports`, a positive decimal string limiting the
-**cumulative declared native value of trading writes** over the session: network
-fees, buys, and rent allowances. It is not a funding amount or a net-loss limit.
-
-`token_limits` is an optional object mapping mint addresses to positive
-raw-token decimal strings. Include every mint the session may sell, with a
-ceiling covering the total amount it may sell. An omitted mint has no debit
-allowance.
-
-Decide these budgets before step 2: changing them under the same session id is
-rejected, and a different budget needs a new session. Bloom checks their shape
-(positive, unique assets) and seals them unchanged into the trading approval,
-where the owner reviews them. It imposes no ceiling of its own.
-
-Close and sweep are not paid from these budgets. Each of those transactions is
-approved separately by the owner, for exactly the value it moves.
-
-Every claim this Petal makes declares a native Solana network fee.
-`petal.toml` declares that with `[sign] fee_asset = {chain = "solana", asset =
-"native"}`; Bloom's developer enrollment reads it. Release enrollment does not
-read it yet.
+3. `POST trade/<wallet>/buy.json {operationId, mint, amount, minOutputAmount}`.
+   The first call returns `approval required` with an `action_id`; complete the
+   ceremony, then repeat the identical write to continue.
 
 ## What wallet policy has to allow
 
 Bloom compares every destination a claim declares against
-`allowed_destinations` as a flat set — one membership test per entry, on both
-the native transfer path and the Petal claim path. The Petal declares more
-than the funding address:
+`allowed_destinations` as a flat set.
 
 | Destination | Declared by | Needed for |
 | --- | --- | --- |
-| the session address | the native funding transfer | funding (step 6) |
 | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump bonding curve | a buy or sell before the coin migrates |
 | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
-| `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` | Pump Fees | `collect_fees`, `sharing_config` |
-| `AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7` | Agent Payments | a tokenized-agent `create` |
-| the owner return address | `close_token_account` and `sweep` | the exit |
 | the selected Jito tip account | a protected write | only with `frontRunningProtection` |
+| the trading account's own Solana address | `close_token_account` | returning the rent — see below |
 
 Which Pump program a given mint routes through depends on whether it has
-migrated, and the Petal does not choose — the builder does. Allow both, or
-read `coins/<mint>.json` first and allow the one that mint actually uses.
+migrated, and the Petal does not choose — the builder does. Allow both, or read
+`coins/<mint>.json` first and allow the one that mint actually uses.
+
+**Closing a token account needs the trading account itself in
+`allowed_destinations`.** The close declares the rent destination, which is the
+trading account, and Bloom checks every declared destination against policy as
+a flat set — including an account the wallet already owns. Without the entry
+the write is refused after the owner has already approved it, with
+`CLAIM_INVALID: claim names destination <account> for chain "solana" outside
+wallet policy`. Add it before the first close.
 
 The eight Jito tip accounts the Petal accepts are listed in
-`route/src/lib.rs`. A write only declares the one it selects, and only when
-`frontRunningProtection` is set, so leave them out unless you intend to use
-protected writes.
+`route/src/lib.rs`. A write declares only the one it selects, and only when
+`frontRunningProtection` is set.
 
 Read the current policy before assuming any of this is missing:
 
@@ -133,69 +80,119 @@ bloom vfs cat /wallets/<wallet>/policy.json
 
 ## What the owner is prompted for
 
-For a wallet whose policy already allows the protocol programs and the return
-address:
-
 | # | Ceremony | What the owner is deciding | When it is skipped |
 | --- | --- | --- | --- |
 | 1 | package eligibility | allow this Petal package version | already allowed |
-| 2 | `KeyDerive` | create the session key, with its routes, operation classes and lifetime | never — one per session |
-| 3 | `PolicyUpdate` | admit the session address, and any protocol or return destination the policy lacks | never — the session address is new every time |
-| 4 | `SealedApproval` | the session's trading approval with its budgets | never; repeated after any later policy change |
-| 5 | `SealedApproval` | the funding transfer, for an exact amount | never |
-| 6+ | `SealedApproval` | each `close_token_account` and the `sweep`, for that exact transaction | never — one per recovery transaction |
+| 2 | `PolicyUpdate` | admit any protocol destination the policy lacks | policy already covers them |
+| 3 | `SealedApproval` | this exact transaction | never — one per trade |
 
-Trading writes add none. A coin's buy and sell therefore cost no ceremony, but
-the exit costs one per closed token account plus one for the sweep.
+Ceremony 3 repeats for every buy, every sell and every close. That is the
+design, not an oversight: nothing here signs a transaction the owner has not
+seen.
 
-The order of 3 and 4 matters only for cost: an approval prepared before the
-policy commit is replaced afterwards by one more ceremony 4.
+## What the owner sees
 
-## Session lifetime
+The Petal builds a review from the validated transaction and sends it with the
+payload as the SDK's `advisory` bytes, a bounded versioned object:
 
-The Petal's `session.json` `expires_ms` is the first `new.json` request time
-plus `duration_ms`. Bloom starts the key's lifetime later, when derivation
-completes, so this never overstates the key. The trading approval can end
-earlier than `expires_ms`, because Bloom keeps it inside the key's lifetime with
-a safety margin. Read its end from Bloom's session record at
-`/wallets/<wallet>/<account>/sessions/<pumpfun mount>/<key slot>/session.json`
-(`expires_at_ms`, with `signing_authority` showing whether it is still usable).
-A ceremony page's own countdown is only how long that page stays open.
+```json
+{"schema":"bloom.petal.review.v1","items":["Buy on Pump.fun","Trading account: …"]}
+```
 
-After the session stops or expires, trading writes are refused, but
-`close_token_account` and `sweep` still work: each asks the owner to approve
-that exact transaction.
+Bloom hashes those bytes into the approval's canonical facts, so an approval
+prepared for one review cannot sign a different one — changing the review
+changes the facts digest and the retry is refused as a different operation.
+
+**On Bloom master those bytes are hashed and go nowhere**: the daemon puts an
+`advisory_digest` in its canonical facts and passes no advisory to
+`sign_or_prepare_petal`, and Broker's `prepare_approval` sets
+`attributed_advisory_items: Vec::new()`. The ceremony then shows the claim's
+declared debits, destinations and fee — real figures, already rendered with SOL
+units — but not the minimum output or the direction. On a build carrying the
+review transport the page shows the lines above, attributed to the app, in
+their own block. A live run confirmed it: see
+`shared/pumpfun-direct-live-2026-09-22/`.
+
+Bloom does not verify any of it. The page says so, and the review is worded as
+the app's own statement for that reason.
 
 ## Approval and retry continuation
 
-`execute()` is idempotent per `operationId`. Calling it again with the same
-id and the same request continues where it stopped; calling it with the
-same id and different content is refused as `operationId already bound`.
+`execute()` is idempotent per `operationId` and per trading account. Calling it
+again with the same id and the same request continues where it stopped; the same
+id with different content is refused as `operationId already bound`.
 
 The Petal records whether any signing call for an operation's transaction may
-have produced a signature. Once that is possible, the operation is never
-rebuilt, whatever later attempts report, because a rebuilt transaction could
-pay twice.
+have produced a signature. Once that is possible the operation is never rebuilt,
+whatever later attempts report, because a rebuilt transaction could pay twice.
 
 `status` is the one field to read:
 
 | Status | Meaning | What a retry does |
 | --- | --- | --- |
-| `approval_pending` | an owner ceremony is required; `action_id` is in the response | trading writes: refresh the transaction and keep waiting. close/sweep: keep the exact transaction the owner is approving |
+| `approval_pending` | an owner ceremony is required; `action_id` is in the response | keeps the exact transaction and review the owner is approving; drops them only once the blockhash has provably expired |
 | `approval_failed` | signing was refused | rebuilds and asks again, unless the transaction may already be signed |
-| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed. A close/sweep awaiting approval keeps its transaction and approval, because a failed simulation can clear; only once its blockhash has expired (finalized block height past its last valid height) is the approval dropped and a new one requested |
+| `preflight_failed` | the unsigned transaction failed simulation | rebuilds, unless the transaction may already be signed or an unexpired approval binds it |
 | `signing` | a signing call was interrupted before its outcome was recorded | treated as possibly signed: signs the same transaction again |
 | `signing_uncertain` | signing returned no answer and may already have signed | signs the same transaction again |
-| `simulation_failed` | earlier versions only: a signed transaction failed simulation on an RPC and may still land | treated as possibly signed: signs the same transaction again |
 | `broadcast_attempted` | sent, with no acknowledgement — outcome unknown | reports it; never re-broadcasts |
 | `submitted` | the RPC returned the signature we sent | reports it |
 | `confirmed` / `finalized` | the cluster observed the transaction | reports it |
 | `chain_failed` | the transaction failed on-chain | reports it |
 
-A possibly signed transaction that can no longer land (a Solana blockhash lasts
-about a minute) stays stuck under its `operationId`. Confirm on the cluster that
-it did not land before retrying the intent under a new `operationId`.
+A possibly signed transaction that can no longer land stays stuck under its
+`operationId`. Confirm on the cluster that it did not land before retrying the
+intent under a new `operationId`.
 
-`broadcast_attempted` needs a person too. The Petal records the signature
-before sending, so read that signature against the cluster to settle whether it
-landed.
+## Timing
+
+Three different clocks bound a trade, and they are not the same thing:
+
+- **chain validity** — the blockhash the builder pinned. Roughly 60–90 seconds
+  in practice, but the authority is the transaction's own last valid block
+  height, which the Petal reads and compares against the finalized height.
+- **approval expiry** — how long Bloom's approval stays usable.
+- **price** — the quote is fixed when the transaction is built, and the owner
+  then reads and approves inside that window. See below: on a buy the price
+  may move against the owner up to the maximum spend, and widening slippage
+  raises that ceiling. It does not extend chain validity.
+
+### On a buy, `slippagePct` moves the maximum spend, not the tokens
+
+A Pump buy instruction names **a token amount and a ceiling on the SOL in**.
+Measured against the live builder on 23 September 2026, on both routes and at
+2%, 10% and 40%: the token amount is **exactly** the builder's quote every
+time, unchanged by `slippagePct`; only `max_quote_amount_in` moves — 1,020,000,
+1,100,000 and 1,400,000 lamports for a 1,000,000 lamport buy.
+
+So the tolerance is on what the trade spends. The pool can move against the
+owner between building and landing, and the program pays what the curve now
+asks, up to that ceiling; past it the trade fails rather than pay more, which
+is what both failed simulations in that run showed at the 2% default.
+A wider `slippagePct` buys the same tokens and risks more SOL.
+
+That is why the maximum spend is the figure the review states first and totals
+at the end: it is what can change after the owner has read it.
+
+What these measurements do **not** establish is what the program does with the
+token amount beyond refusing to overpay for it — whether it always delivers
+exactly that amount, or can deliver less in some pool state. The review says
+only what the instruction names, and the enforced protection it states is the
+maximum spend. They say nothing about **sells**, which were not probed: a sell
+names a token amount in and a floor on the SOL out, so its fields sit the other
+way round, and the review reports that floor as the instruction's own.
+
+`minOutputAmount` is a **check, not a control**. The Petal compares it against
+the token amount the builder baked in and refuses a transaction that promises
+less; it cannot change that amount, so asking for less does not make a fill
+easier.
+
+The Petal simulates before signing, so a trade the pool can no longer satisfy
+within its ceiling stops at `preflight_failed` with the program's own error
+preserved, before a ceremony is created. Retrying under the same `operationId`
+rebuilds it against a fresh quote. Evidence:
+`shared/pumpfun-live-builder-2026-09-23/`.
+
+If an approval takes long enough that the blockhash expires, the retry rebuilds
+and asks again. The Petal never refreshes bytes under an existing approval and
+never widens slippage on its own.

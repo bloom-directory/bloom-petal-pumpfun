@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust WASM targets
+        run: |
+          rustup show
+          rustup target add wasm32-wasip2 wasm32-unknown-unknown
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: route
+      - name: Format route crate
+        run: cargo fmt --manifest-path route/Cargo.toml --all -- --check
+      - name: Test route crate
+        run: cargo test --manifest-path route/Cargo.toml --locked
+      - name: Clippy route crate
+        run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Check route architecture
+        run: scripts/check-route-architecture.sh
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.254.0 --locked
+      - name: Install canonical Petal toolchain
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
+      - name: Build and validate route components
+        run: |
+          scripts/build.sh
+          petal check --root .
+      # This package declares [sign].fee_asset, which the Bloom CLI only
+      # accepts since bloom#276 (`pumpfun-fee-classes`). Build the CLI from
+      # that branch until it lands, then flip this ref back to master.
+      - name: Checkout Bloom CLI
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom
+          ref: pumpfun-fee-classes
+          path: bloom
+          persist-credentials: false
+      - name: Build key-free debug Bloom CLI for install smoke tests
+        run: cargo build --manifest-path bloom/Cargo.toml -p bloom --bin bloom
+      - name: Validate package and static dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          bloom_bin="$GITHUB_WORKSPACE/bloom/target/debug/bloom"
+          home="$(mktemp -d)"
+          cat > "$home/config.toml" <<'EOF'
+          default_chain = "local"
+          [chains.local]
+          name = "local"
+          chain_id = 31337
+          rpc_urls = ["http://127.0.0.1:1"]
+          allow_broadcast = false
+          display_name = "Local smoke"
+          native_symbol = "SOL"
+          native_decimals = 9
+          legacy_tx = false
+          [petals]
+          preinstalled = []
+          EOF
+          export BLOOM_MACHINE_IDENTITY="$home/absent-identity.json"
+          export BLOOM_EDGE_MANIFEST="$home/absent-edge.json"
+          export BLOOM_BROKER_SOCKET="$home/absent-broker.sock"
+          "$bloom_bin" --home "$home" serve >"$RUNNER_TEMP/bloom.log" 2>&1 &
+          bloom_pid=$!
+          trap 'kill "$bloom_pid" 2>/dev/null || true; wait "$bloom_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..60}; do
+            "$bloom_bin" --home "$home" status >/dev/null 2>&1 && break
+            if ! kill -0 "$bloom_pid" || [[ "$attempt" == 60 ]]; then
+              cat "$RUNNER_TEMP/bloom.log" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          "$bloom_bin" --home "$home" petals build .
+          "$bloom_bin" --home "$home" petal install .
+          # Smoke-read through the mounted VFS. Grep patterns must be text the
+          # served files actually contain: the README states the no-session-key
+          # guarantee; status.json is a JSON object. Failures are loud — a bare
+          # `grep -q` in a pipefail script dies silently (seen in CI 2026-09-25).
+          smoke_read() {
+            "$bloom_bin" --home "$home" vfs cat "$1" >"$RUNNER_TEMP/smoke.out" \
+              || { echo "vfs cat $1 failed; serve log:" >&2; cat "$RUNNER_TEMP/bloom.log" >&2; exit 1; }
+            grep -Fq "$2" "$RUNNER_TEMP/smoke.out" \
+              || { echo "mounted $1 is missing expected text: $2" >&2; exit 1; }
+          }
+          smoke_read /petals/pumpfun/README.md 'no session key'
+          smoke_read /petals/pumpfun/status.json '{'

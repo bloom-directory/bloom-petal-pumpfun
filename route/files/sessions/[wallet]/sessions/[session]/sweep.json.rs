@@ -1,1 +1,0 @@
-petal::route_file!(spec:petal::signing_write_spec("pumpfun.sweep").caps(&["bloom:http","bloom:store","bloom:sign"]),read:|_:&petal::Ctx|petal::read_json_value(&crate::json!({"description":"return all remaining native SOL from the session before stopping it","required":["operationId","destination"]})),write:|c:&petal::Ctx,b:&[u8]|crate::route_action(c,b,crate::Action::Sweep));
