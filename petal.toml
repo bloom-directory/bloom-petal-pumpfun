@@ -13,7 +13,7 @@ outputs = ["petal/pumpfun"]
 aware = true
 
 [consent]
-summary = "Inspect Pump.fun coins, and buy or sell an existing coin from the Bloom account you selected. Every trade is one transaction you approve in Bloom; no session key, no separate wallet and no spending budget. An empty token account can be closed, returning its rent to the same account. Coin creation, fee collection and fee sharing are not supported."
+summary = "Inspect Pump.fun coins, and buy or sell an existing coin from the Bloom account you selected. Every trade is one operation you approve in Bloom, capped at the SOL ceiling the approval shows, and rebuilt with a fresh blockhash after you approve; no session key, no separate wallet and no standing budget. An empty token account can be closed, returning its rent to the same account. Coin creation, fee collection and fee sharing are not supported."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]

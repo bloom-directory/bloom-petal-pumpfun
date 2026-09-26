@@ -79,7 +79,8 @@ mod fake_host;
 /// route flow and then assert on the requests that actually left the Petal.
 mod host {
     #[cfg(not(test))]
-    use petal::{HttpRequest, HttpResponse, PayloadSignRequest, SdkError, SignOutcome};
+    use petal::{HttpRequest, HttpResponse};
+    use petal::{PayloadSignRequest, SdkError, SignOutcome};
 
     #[cfg(not(test))]
     pub fn http(request: &HttpRequest, max_bytes: usize) -> Result<HttpResponse, SdkError> {
@@ -105,9 +106,55 @@ mod host {
     pub fn store_list(prefix: &str, max_bytes: usize) -> Result<Vec<String>, SdkError> {
         petal::sdk::store_list(prefix, max_bytes)
     }
+    /// Bloom prepares an owner approval for a Reusable selector only on the
+    /// batch call; the single-payload call signs under an approval that
+    /// already exists and refuses otherwise. This Petal signs one payload,
+    /// so it is sent as a batch of one.
     #[cfg(not(test))]
     pub fn sign_payload(request: &PayloadSignRequest) -> Result<SignOutcome, SdkError> {
-        petal::sdk::sign_payload(request)
+        single_outcome(petal::sdk::sign_payload_batch(&batch_of_one(request))?)
+    }
+
+    pub(crate) fn batch_of_one(request: &PayloadSignRequest) -> petal::PayloadBatchSignRequest {
+        petal::PayloadBatchSignRequest {
+            wallet: request.wallet.clone(),
+            payloads: vec![petal::PayloadSignItem {
+                preimage: request.preimage.clone(),
+                claimed_hash: request.claimed_hash,
+            }],
+            signature_algorithm: request.signature_algorithm.clone(),
+            operation_class: request.operation_class.clone(),
+            petal_use_claim_jcs: request.petal_use_claim_jcs.clone(),
+            claim_assurance_evidence: request.claim_assurance_evidence.clone(),
+            approval_hint: request.approval_hint.clone(),
+            action: request.action.clone(),
+            advisory: request.advisory.clone(),
+            selector: request.selector.clone(),
+            key_ref_jcs: request.key_ref_jcs.clone(),
+        }
+    }
+
+    pub(crate) fn single_outcome(
+        outcome: petal::SignBatchOutcome,
+    ) -> Result<SignOutcome, SdkError> {
+        match outcome {
+            petal::SignBatchOutcome::Signatures(signatures) => {
+                match <[Vec<u8>; 1]>::try_from(signatures) {
+                    Ok([signature]) => Ok(SignOutcome::Signature(signature)),
+                    Err(signatures) => Err(SdkError::Message(format!(
+                        "host returned {} signatures for one payload",
+                        signatures.len()
+                    ))),
+                }
+            }
+            petal::SignBatchOutcome::ApprovalPending {
+                action_id,
+                expires_ms,
+            } => Ok(SignOutcome::ApprovalPending {
+                action_id,
+                expires_ms,
+            }),
+        }
     }
     /// The trader's public Solana address, read from the account's own public
     /// wallet view. This is a public read of host-owned metadata, not a key
@@ -390,11 +437,6 @@ struct Pending {
     /// reuse an approval prepared for the old text.
     #[serde(default)]
     review: Vec<String>,
-    /// The last block height at which the built transaction can still land,
-    /// as the RPC reported it when the blockhash was read. Only close builds
-    /// it locally; a builder-supplied swap has no such figure and stores 0.
-    #[serde(default)]
-    last_valid_block_height: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Public {
@@ -473,7 +515,6 @@ fn build_pending(
         approval: None,
         may_be_signed: false,
         review,
-        last_valid_block_height: 0,
     })
 }
 
@@ -901,7 +942,6 @@ fn build_close_token_account_pending(
         approval: None,
         may_be_signed: false,
         review,
-        last_valid_block_height,
     })
 }
 pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchResponse {
@@ -952,18 +992,24 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             if matches!(v.status.as_str(), "signing" | "simulation_failed") {
                 v.may_be_signed = true;
             }
-            // Only an operation that was never possibly signed is rebuilt after
-            // a refusal or a failed unsigned simulation. Once it may have been
-            // signed, every retry signs the stored message again, which can
-            // only reproduce the same transaction.
+            // The approval covers one operation of this class up to a
+            // ceiling, not these bytes, so until a signature may exist every
+            // retry rebuilds with a fresh blockhash. A blockhash lives about
+            // a minute, and the owner's ceremony can take most of that.
+            // Once it may have been signed, every retry signs the stored
+            // message again, which can only reproduce the same transaction.
             if !v.may_be_signed
-                && v.approval.is_none()
-                && matches!(v.status.as_str(), "preflight_failed" | "approval_failed")
+                && matches!(
+                    v.status.as_str(),
+                    "built" | "approval_pending" | "preflight_failed" | "approval_failed"
+                )
             {
+                let approval = v.approval.take();
                 v = match build_pending(a, &trader, &r, digest.clone()) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
+                v.approval = approval;
                 if let Err(e) = put(&key, &v, true) {
                     return e;
                 }
@@ -994,9 +1040,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     ) {
         return DispatchResponse::Write;
     }
-    // Every approval here is Exact: it binds these bytes and this review.
-    // Waiting for the owner therefore never refreshes the transaction, and a
-    // pending operation keeps exactly what was described to them.
     let raw = match B64.decode(&p.tx) {
         Ok(v) => v,
         Err(_) => return fail("stored transaction invalid"),
@@ -1038,21 +1081,9 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     // broadcast it, so a signature must never leave until this operation will
     // not build another transaction.
     if let Err(e) = simulate(&p.tx) {
+        // The approval is kept: it is not bound to these bytes, and the
+        // retry rebuilds them.
         p.status = "preflight_failed".into();
-        // A failed simulation says nothing permanent: a state-dependent
-        // failure can clear. An Exact approval binds these bytes, so it is
-        // given up only once their blockhash has provably expired.
-        let keep_exact_approval = p.approval.is_some()
-            && !match blockhash_expired(&p) {
-                Ok(expired) => expired,
-                Err(error) => return error,
-            };
-        if !p.may_be_signed && !keep_exact_approval {
-            // Give the approval up, and tell Bloom on the next call: the
-            // rebuilt transaction cannot be offered while this one's ceremony
-            // is still live.
-            p.approval = None;
-        }
         if let Err(store_error) = put(&key, &p, true) {
             return store_error;
         }
@@ -1062,12 +1093,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         if p.may_be_signed {
             return fail(format!(
                 "{}; this operation may already be signed, so it is never rebuilt: retry to sign the same transaction, or confirm it cannot land before using a new operationId",
-                dispatch_message(&e)
-            ));
-        }
-        if keep_exact_approval {
-            return fail(format!(
-                "{}; the transaction awaiting approval is kept until its blockhash expires, so retry",
                 dispatch_message(&e)
             ));
         }
@@ -1096,21 +1121,21 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         operation_class: a.class().into(),
         petal_use_claim_jcs: claim_jcs,
         claim_assurance_evidence: None,
-        // This operation's own approval artifact, and nothing else. A rebuilt
-        // transaction asks for its own approval from scratch; it never tells
-        // Bloom to give up the earlier one, because deciding whether that
-        // earlier attempt might already have signed is not something either
-        // side can currently establish.
-        approval_hint: p.approval.clone(),
+        // None. Bloom derives a Reusable approval's identity from this
+        // package, route, wallet, class and key, so a hint adds nothing, and
+        // the id stored after a package-eligibility ceremony is not that
+        // identity: naming it would be refused once.
+        approval_hint: None,
         action: None,
-        // The review the owner reads, frozen with these bytes. The host
-        // hashes it into the approval's canonical facts, so an approval
-        // prepared for one review cannot sign a different one.
+        // The review of these bytes. A Reusable approval does not bind it:
+        // the owner approves the ceiling, and each rebuild publishes its own
+        // review in the operation record.
         advisory: Some(review_advisory(&p.review)),
-        // Exact, always: this approval covers these bytes and nothing else.
-        // No delegated key is named, so Bloom selects the mounted account's
-        // own signing key.
-        selector: SignSelector::Exact,
+        // One operation of this class, capped at the debits and fee of the
+        // claim that prepared it. After the owner completes it, a rebuilt
+        // transaction with a fresh blockhash signs under it. No delegated key
+        // is named, so Bloom selects the mounted account's own signing key.
+        selector: SignSelector::Reusable,
         key_ref_jcs: None,
     }) {
         Ok(SignOutcome::Signature(v)) => {
@@ -1425,12 +1450,12 @@ fn effects(a: Action, r: &Map<String, Value>, message: &Msg) -> Result<Vec<Value
         .ok_or("account rent allowance exceeds u64")?;
     let mut effects = match a {
         Action::Buy => {
-            let trade = message
-                .instructions
-                .iter()
-                .find(|ix| has_discriminator(ix, IX_BUY))
-                .ok_or_else(|| "approved buy instruction missing".to_owned())
-                .and_then(|ix| instruction_u64(ix, 16))?;
+            // The requested amount plus slippage, not the builder's quote:
+            // `validate_buy_cost` holds the built maximum under it, and it does
+            // not move when a rebuild re-quotes, so the approval's ceiling
+            // still covers the rebuilt transaction.
+            let trade = u64::try_from(max_buy_lamports(r)?)
+                .map_err(|_| "requested buy exceeds u64".to_owned())?;
             let total = trade
                 .checked_add(tip)
                 .and_then(|value| value.checked_add(account_rent))
@@ -1901,61 +1926,6 @@ fn transaction_fee(
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
 }
-/// Whether this transaction's blockhash has provably expired: the cluster's
-/// finalized block height is past the `lastValidBlockHeight` recorded when it
-/// was built. Transactions without that record are never treated as expired.
-fn blockhash_expired(p: &Pending) -> Result<bool, DispatchResponse> {
-    let Some(last_valid) = p.api.get("lastValidBlockHeight").and_then(Value::as_u64) else {
-        // Only a locally built transaction records that height. Pump's builder
-        // returns the transaction and its mint info and nothing else, so every
-        // buy and sell lands here — and answering "not expired" would mean a
-        // swap whose approval the owner never completed could never be given
-        // up, never rebuilt, and never retried under its own operation id.
-        //
-        // The cluster can answer directly instead: ask whether the blockhash
-        // these bytes actually carry is still usable. Only a definite "no"
-        // counts as expired; an RPC that will not answer leaves the operation
-        // exactly where it was.
-        return blockhash_rejected_by_cluster(p);
-    };
-    let height = post(
-        RPC,
-        &rpc("getBlockHeight", json!([{"commitment":"finalized"}])),
-    )?
-    .get("result")
-    .and_then(Value::as_u64)
-    .ok_or_else(|| fail("Solana RPC omitted the finalized block height"))?;
-    Ok(height > last_valid)
-}
-/// Whether the cluster says this transaction's own blockhash can no longer be
-/// used. Read at finalized commitment through both RPCs: a swap has no
-/// recorded expiry height, and giving an approval up is only safe on an answer
-/// the Petal is sure of, so the two must agree before anything is abandoned.
-fn blockhash_rejected_by_cluster(p: &Pending) -> Result<bool, DispatchResponse> {
-    let raw = B64
-        .decode(&p.tx)
-        .map_err(|_| fail("stored transaction is not base64"))?;
-    let blockhash = bs58::encode(
-        envelope(&raw)
-            .map_err(|error| fail(format!("stored transaction is unreadable: {error}")))?
-            .blockhash,
-    )
-    .into_string();
-    let ask = |url: &str| -> Result<bool, DispatchResponse> {
-        post(
-            url,
-            &rpc(
-                "isBlockhashValid",
-                json!([blockhash, {"commitment":"finalized"}]),
-            ),
-        )?
-        .pointer("/result/value")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| fail("Solana RPC did not answer whether the blockhash is valid"))
-    };
-    Ok(!ask(RPC)? && !ask(RPC_VERIFY)?)
-}
-
 fn simulate(tx: &str) -> Result<(), DispatchResponse> {
     let v = post(
         RPC,
@@ -1969,7 +1939,10 @@ fn simulate(tx: &str) -> Result<(), DispatchResponse> {
 fn simulation_result(v: &Value) -> Result<(), String> {
     match v.pointer("/result/value/err") {
         Some(Value::Null) => Ok(()),
-        Some(_) => Err(format!("simulation failed: {}", safe(v))),
+        Some(err) => Err(format!(
+            "simulation failed: {}",
+            err.to_string().chars().take(512).collect::<String>()
+        )),
         None => Err("Solana RPC omitted the simulation result".into()),
     }
 }
@@ -3794,14 +3767,14 @@ mod tests {
         });
     }
 
-    /// An Exact approval binds the bytes it was prepared for. Waiting for the
-    /// owner never rebuilds the transaction, even when the chain has moved on
-    /// and a fresh build would produce different bytes.
+    /// The approval caps one operation; it does not bind bytes. A retry after
+    /// the owner's ceremony rebuilds with a fresh blockhash and names the same
+    /// approval, so a slow ceremony cannot leave it holding a dead blockhash.
     #[test]
-    fn a_pending_approval_never_rebuilds_the_transaction_it_binds() {
+    fn a_pending_approval_is_rebuilt_with_a_fresh_blockhash() {
         let mut host = host_serving_a_close();
         host.sign_outcome(Ok(SignOutcome::ApprovalPending {
-            action_id: "exact-old-message".into(),
+            action_id: "one-close".into(),
             expires_ms: NOW_MS + 60_000,
         }));
         fake_host::install(host);
@@ -3812,22 +3785,57 @@ mod tests {
                 json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1001}}}),
             );
         });
-        run_close("review-close");
+        assert_eq!(run_close("review-close"), DispatchResponse::Write);
         fake_host::with(|host| {
             assert_eq!(host.sign_requests.len(), 2);
             assert_eq!(
-                host.sign_requests[1].approval_hint.as_deref(),
-                Some("exact-old-message")
+                host.secret_json(&secret_key(&owner(), "review-close"))
+                    .unwrap()["approval"],
+                Value::Null,
+                "the approval was used"
             );
-            assert_eq!(
+            assert_ne!(
                 host.sign_requests[0].preimage, host.sign_requests[1].preimage,
-                "the same Exact approval hint was attached to a different transaction"
+                "the retry signs a rebuilt transaction"
             );
-            assert_eq!(
-                host.calls_for("getLatestBlockhash").len(),
-                1,
-                "a pending approval does not rebuild"
+            assert_eq!(host.calls_for("getLatestBlockhash").len(), 2);
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+        });
+    }
+
+    /// The Broker holds the ceiling: the claim that prepared the approval
+    /// sets it, and every later claim is accounted against it before
+    /// anything is signed. So each rebuild declares the fee its own
+    /// transaction pays, not a figure carried over from an earlier build.
+    #[test]
+    fn each_rebuild_declares_its_own_network_fee() {
+        let mut host = host_serving_a_close();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "fee-cap".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_close("close-fee")).contains("approval required"));
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} getFeeForMessage"),
+                json!({"result":{"value": 7_000}}),
             );
+        });
+        assert_eq!(run_close("close-fee"), DispatchResponse::Write);
+        fake_host::with(|host| {
+            let fees = host
+                .sign_requests
+                .iter()
+                .map(|request| {
+                    let claim: Value =
+                        serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+                    claim["declared_fee"]["amount"].as_str().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(fees.len(), 2);
+            assert_eq!(fees[1], "7000");
+            assert_ne!(fees[0], fees[1]);
         });
     }
 
@@ -3987,7 +3995,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_asks_for_an_exact_approval_and_names_no_delegated_key() {
+    fn signing_asks_for_a_capped_one_operation_approval_and_names_no_delegated_key() {
         fake_host::install(host_serving_a_buy());
         assert_eq!(run_buy("buy-claim", false), DispatchResponse::Write);
 
@@ -3997,8 +4005,8 @@ mod tests {
             assert_eq!(request.operation_class, "pumpfun.buy");
             assert_eq!(request.signature_algorithm, "ed25519-message");
             assert!(
-                matches!(request.selector, SignSelector::Exact),
-                "every Pump.fun write binds the exact bytes the owner approved"
+                matches!(request.selector, SignSelector::Reusable),
+                "a Pump.fun write is approved as one operation up to a ceiling, so it can be rebuilt after the ceremony"
             );
             assert_eq!(
                 request.key_ref_jcs, None,
@@ -4042,11 +4050,18 @@ mod tests {
             assert_eq!(claim["operation_class"], json!("pumpfun.buy"));
             assert_eq!(claim["route"], json!("ROUTE_BUY"));
             assert_eq!(claim["package_hash"], json!("pumpfun-test-package"));
+            // The ceiling is the request's amount plus slippage, not the
+            // builder's quote, so a rebuild cannot outgrow it.
+            let debit = &claim["declared_debits"][0];
+            assert_eq!(debit["asset"]["asset"], json!("native"));
+            let mut request: Map<String, Value> =
+                serde_json::from_slice(&buy_body("buy-claim", false)).unwrap();
+            request.remove("operationId");
+            normalize(Action::Buy, USER, &mut request).unwrap();
+            let expected = u64::try_from(max_buy_lamports(&request).unwrap()).unwrap();
             assert!(
-                claim["declared_debits"]
-                    .as_array()
-                    .is_some_and(|debits| !debits.is_empty()),
-                "the claim must declare what the transaction spends"
+                debit["amount"].as_str().unwrap().parse::<u64>().unwrap() >= expected,
+                "{debit}"
             );
         });
     }
@@ -4311,10 +4326,10 @@ mod tests {
         fake_host::install(host);
         assert!(dispatch_message(&run_buy("buy-interrupted", false)).contains("approval required"));
 
-        // The signing marker lands; the broadcast record does not. An Exact
-        // approval never refreshes the transaction, so there is no rebuild to
-        // account for here.
-        fake_host::with(|host| host.fail_store_after = Some(host.puts + 1));
+        // The retry rebuilds once, then its signing marker lands and the
+        // broadcast record does not.
+        // Rebuild record, its publication, then the signing marker.
+        fake_host::with(|host| host.fail_store_after = Some(host.puts + 3));
         assert!(matches!(
             run_buy("buy-interrupted", false),
             DispatchResponse::Error { .. }
@@ -4329,7 +4344,7 @@ mod tests {
         fake_host::with(|host| {
             assert_eq!(
                 builder_calls(host),
-                1,
+                2,
                 "the interrupted signature is not rebuilt"
             );
             assert_eq!(
@@ -4371,225 +4386,61 @@ mod tests {
         });
     }
 
-    /// An Exact approval is never carried onto new bytes, and a failed
-    /// simulation is not proof that its transaction can no longer land. The
-    /// approval is kept until the finalized block height passes the
-    /// transaction's last valid height; only then does a retry rebuild and
-    /// ask for a new approval.
-
+    /// A failed simulation says nothing about the approval, which is not bound
+    /// to those bytes. It is kept, and the retry rebuilds and signs under it.
     #[test]
-    fn an_exact_approval_is_given_up_only_after_its_blockhash_expires() {
-        let mut host = host_serving_a_close();
-        for _ in 0..2 {
-            host.sign_outcome(Ok(SignOutcome::ApprovalPending {
-                action_id: "exact-pending".into(),
-                expires_ms: NOW_MS + 60_000,
-            }));
-        }
-        fake_host::install(host);
-        let run = || run_close("close-slow");
-        let block_height = |height: u64| {
-            fake_host::with(|host| {
-                host.reply_only(&format!("{RPC} getBlockHeight"), json!({"result": height}));
-            });
-        };
-        assert!(dispatch_message(&run()).contains("approval required"));
-
-        // A state-dependent failure while the blockhash is still valid keeps
-        // the approval and the exact bytes it binds.
-        fake_host::with(|host| simulation_rejects(host, true));
-        block_height(1000);
-        assert!(dispatch_message(&run()).contains("kept until its blockhash expires"));
-        fake_host::with(|host| simulation_rejects(host, false));
-        assert!(dispatch_message(&run()).contains("approval required"));
-        fake_host::with(|host| {
-            assert_eq!(host.sign_requests.len(), 2);
-            assert_eq!(
-                host.sign_requests[0].preimage,
-                host.sign_requests[1].preimage
-            );
-            assert_eq!(
-                host.sign_requests[1].approval_hint.as_deref(),
-                Some("exact-pending")
-            );
-        });
-
-        // Once the finalized height passes the last valid height, the bytes
-        // can never land: the approval is dropped and the retry rebuilds.
-        fake_host::with(|host| simulation_rejects(host, true));
-        block_height(1001);
-        assert!(dispatch_message(&run()).contains("simulation failed"));
-        assert_eq!(
-            public_operation("close-slow")["status"],
-            json!("preflight_failed")
-        );
-        fake_host::with(|host| {
-            simulation_rejects(host, false);
-            host.reply_only(
-                &format!("{RPC} getLatestBlockhash"),
-                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1200}}}),
-            );
-        });
-        run();
-        fake_host::with(|host| {
-            assert_eq!(host.sign_requests.len(), 3);
-            assert_ne!(
-                host.sign_requests[1].preimage,
-                host.sign_requests[2].preimage
-            );
-            // A rebuilt payload asks for its own approval from scratch and
-            // names no artifact at all. It does not tell Bloom to give up the
-            // earlier one: neither side can currently establish that the
-            // abandoned attempt did not sign, so the abandoned ceremony is
-            // left to expire and the rebuild waits for it.
-            assert_eq!(host.sign_requests[2].approval_hint, None);
-        });
-    }
-
-    /// A swap has no recorded expiry height: Pump's builder returns the
-    /// transaction and its mint info and nothing else. Before this, that meant
-    /// a buy whose approval the owner never completed could never be given up,
-    /// never rebuilt, and never retried under its own operation id - it was
-    /// wedged, and the only escape was a new operation id, which is the one
-    /// action that can pay twice. The cluster is asked directly instead.
-    #[test]
-    fn a_swap_whose_approval_went_unanswered_is_given_up_once_the_cluster_says_so() {
+    fn a_failed_simulation_keeps_the_approval_for_the_rebuild() {
         let mut host = host_serving_a_buy();
-        for _ in 0..2 {
-            host.sign_outcome(Ok(SignOutcome::ApprovalPending {
-                action_id: "exact-buy-pending".into(),
-                expires_ms: NOW_MS + 60_000,
-            }));
-        }
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "buy-grant".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
         fake_host::install(host);
-        let valid = |primary: bool, verify: bool| {
-            fake_host::with(|host| {
-                host.reply_only(
-                    &format!("{RPC} isBlockhashValid"),
-                    json!({"result": {"value": primary}}),
-                );
-                host.reply_only(
-                    &format!("{RPC_VERIFY} isBlockhashValid"),
-                    json!({"result": {"value": verify}}),
-                );
-            });
-        };
         assert!(dispatch_message(&run_buy("buy-slow", false)).contains("approval required"));
-        let built = fake_host::with(|host| host.sign_requests[0].preimage.clone());
 
-        // Still usable: the approval and the exact bytes it binds are kept,
-        // even through a failed simulation.
-        fake_host::with(|host| simulation_rejects(host, true));
-        valid(true, true);
-        assert!(
-            dispatch_message(&run_buy("buy-slow", false))
-                .contains("kept until its blockhash expires")
-        );
-
-        // One RPC says dead and the other says usable: not sure enough to give
-        // an owner-approved transaction away.
-        valid(false, true);
-        assert!(
-            dispatch_message(&run_buy("buy-slow", false))
-                .contains("kept until its blockhash expires")
-        );
         fake_host::with(|host| {
-            assert_eq!(host.sign_requests.len(), 1, "nothing was rebuilt");
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":"BlockhashNotFound"}}}),
+            );
         });
-
-        // Both agree it is dead. The simulation is still failing - that is the
-        // path a stale transaction takes - and now the approval is given up
-        // and the transaction rebuilt.
-        valid(false, false);
-        let _ = run_buy("buy-slow", false);
+        let failed = dispatch_message(&run_buy("buy-slow", false));
+        assert!(failed.contains("BlockhashNotFound"), "{failed}");
         fake_host::with(|host| simulation_rejects(host, false));
-        let _ = run_buy("buy-slow", false);
+        assert_eq!(run_buy("buy-slow", false), DispatchResponse::Write);
         fake_host::with(|host| {
-            // The builder fixture replays one transaction, so the bytes match;
-            // what matters is that a second signing call happened at all, which
-            // before this fix it never could.
-            assert_eq!(
-                host.sign_requests.len(),
-                2,
-                "the dead transaction was rebuilt"
-            );
-            assert_eq!(
-                host.sign_requests[1].approval_hint, None,
-                "the rebuild asks for its own approval and names no other artifact"
-            );
-            let _ = &built;
+            assert_eq!(builder_calls(host), 3, "each retry rebuilt");
+            assert_eq!(host.sign_requests.len(), 2);
+            assert!(host.sign_requests.iter().all(|r| r.approval_hint.is_none()));
+            assert_eq!(host.calls_for("sendTransaction").len(), 1);
         });
     }
 
-    /// A rebuild holds only its own approval, and Bloom scopes each artifact to
-    /// this package, route, wallet, class and key — within that scope it does
-    /// not second-guess which operation is meant. Two operations that differ by
-    /// nothing but their id expire and rebuild side by side, so each must drop
-    /// its own approval and pick up the one prepared for its own rebuilt bytes,
-    /// and neither may name (or hand back) the other's.
+    /// Bloom derives a Reusable approval from the route, class and key, so no
+    /// request names one, including after its own approval was prepared.
     #[test]
-    fn a_rebuild_names_only_its_own_operations_previous_attempt() {
+    fn no_signing_request_names_an_approval() {
         let mut host = host_serving_a_close();
-        for action in ["exact-a", "exact-b", "rebuilt-b", "rebuilt-a"] {
+        for action in ["grant-a", "grant-b"] {
             host.sign_outcome(Ok(SignOutcome::ApprovalPending {
                 action_id: action.into(),
                 expires_ms: NOW_MS + 60_000,
             }));
         }
         fake_host::install(host);
-        let block_height = |height: u64| {
-            fake_host::with(|host| {
-                host.reply_only(&format!("{RPC} getBlockHeight"), json!({"result": height}));
-            });
-        };
-
         for op in ["close-a", "close-b"] {
             assert!(dispatch_message(&run_close(op)).contains("approval required"));
         }
-
-        // Both deadlines pass. Each gives its own approval up, and neither
-        // signs: two writes each, and the order between them is interleaved on
-        // purpose.
-        fake_host::with(|host| simulation_rejects(host, true));
-        block_height(1001);
         for op in ["close-b", "close-a"] {
-            run_close(op);
+            assert_eq!(run_close(op), DispatchResponse::Write);
         }
-        fake_host::with(|host| {
-            simulation_rejects(host, false);
-            host.reply_only(
-                &format!("{RPC} getLatestBlockhash"),
-                json!({"result":{"value":{"blockhash":AMM_MINT,"lastValidBlockHeight":1200}}}),
-            );
-        });
-        for op in ["close-b", "close-a"] {
-            run_close(op);
-        }
-
         fake_host::with(|host| {
             let hints = host
                 .sign_requests
                 .iter()
-                .map(|request| request.approval_hint.clone())
+                .map(|request| request.approval_hint.as_deref())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                hints,
-                vec![None, None, None, None],
-                "no write names another request's approval artifact, before or \
-                 after a rebuild: the only hint this Petal ever sends is its \
-                 own live approval"
-            );
-        });
-        fake_host::with(|host| {
-            for (op, expected) in [("close-a", "rebuilt-a"), ("close-b", "rebuilt-b")] {
-                let stored = host.secret_json(&secret_key(&owner(), op)).expect("stored");
-                assert_eq!(
-                    stored["approval"],
-                    json!(expected),
-                    "{op} holds the approval prepared for its own rebuild"
-                );
-                assert_eq!(stored["superseded"], Value::Null);
-            }
+            assert_eq!(hints, vec![None, None, None, None]);
         });
     }
 
@@ -4784,11 +4635,13 @@ mod tests {
         assert!(dispatch_message(&run_buy("buy-unreviewed", false)).contains("approval required"));
 
         // Strip the review the way a record from a build that predates it
-        // would arrive.
+        // would arrive. A record that may be signed is never rebuilt, so it
+        // keeps the empty review.
         fake_host::with(|host| {
             let key = secret_key(&owner(), "buy-unreviewed");
             let mut stored = host.secret_json(&key).expect("pending operation");
             stored["review"] = json!([]);
+            stored["status"] = json!("signing");
             host.seed_secret(&key, &stored);
         });
 
@@ -5168,5 +5021,81 @@ mod tests {
                 .contains("rent always returns to the trading account"),
             "close must say where the rent goes"
         );
+    }
+
+    /// After a package-eligibility ceremony the host reports that ceremony's
+    /// id as pending. It is not the trade approval's identity, so the retry
+    /// must not name it: the host refuses a mismatched hint.
+    #[test]
+    fn an_eligibility_approval_is_never_named_on_the_retry() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "package-eligibility".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("buy-eligible", false)).contains("approval required"));
+        assert_eq!(run_buy("buy-eligible", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 2);
+            assert_eq!(host.sign_requests[1].approval_hint, None);
+        });
+    }
+
+    #[test]
+    fn a_payload_is_sent_to_the_host_as_a_batch_of_one() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-batch", false), DispatchResponse::Write);
+        let request = fake_host::with(|host| host.sign_requests[0].clone());
+        let batch = host::batch_of_one(&request);
+        assert_eq!(batch.wallet, request.wallet);
+        assert_eq!(batch.operation_class, request.operation_class);
+        assert_eq!(batch.signature_algorithm, request.signature_algorithm);
+        assert_eq!(batch.petal_use_claim_jcs, request.petal_use_claim_jcs);
+        assert_eq!(batch.advisory, request.advisory);
+        assert_eq!(batch.approval_hint, request.approval_hint);
+        assert!(matches!(batch.selector, SignSelector::Reusable));
+        assert_eq!(batch.key_ref_jcs, None);
+        assert_eq!(batch.payloads.len(), 1);
+        assert_eq!(batch.payloads[0].preimage, request.preimage);
+        assert_eq!(batch.payloads[0].claimed_hash, request.claimed_hash);
+        // The claim's payload digest is the host's batch digest of exactly
+        // this one payload, which the host recomputes and compares.
+        let claim: Value = serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+        assert_eq!(
+            claim["payload_digest"],
+            json!(hex::encode(
+                petal::payload_batch_digest(&batch.payloads).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_batch_outcome_maps_to_exactly_one_signature_or_a_pending_approval() {
+        assert_eq!(
+            host::single_outcome(petal::SignBatchOutcome::Signatures(vec![vec![7; 64]])).unwrap(),
+            SignOutcome::Signature(vec![7; 64])
+        );
+        assert_eq!(
+            host::single_outcome(petal::SignBatchOutcome::ApprovalPending {
+                action_id: "grant".into(),
+                expires_ms: 5,
+            })
+            .unwrap(),
+            SignOutcome::ApprovalPending {
+                action_id: "grant".into(),
+                expires_ms: 5,
+            }
+        );
+        for count in [0, 2] {
+            assert!(
+                host::single_outcome(petal::SignBatchOutcome::Signatures(vec![
+                    vec![7; 64];
+                    count
+                ]))
+                .is_err(),
+                "{count} signatures for one payload"
+            );
+        }
     }
 }
