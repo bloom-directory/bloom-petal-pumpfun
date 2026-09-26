@@ -450,6 +450,10 @@ struct Pending {
     /// fall back to the token-account allowance.
     #[serde(default)]
     created: Option<Created>,
+    /// For a sell of `"all"`: the balance it resolved to when built, and the
+    /// token account it empties and closes in the same transaction.
+    #[serde(default)]
+    sell_all: Option<SellAll>,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -489,6 +493,26 @@ fn build_pending(
     if matches!(a, Action::CloseTokenAccount) {
         return build_close_token_account_pending(trader, request, digest);
     }
+    let sell_all = if matches!(a, Action::Sell)
+        && request.get("amount").and_then(Value::as_str) == Some("all")
+    {
+        Some(full_balance(
+            user,
+            request_text(request, "inputMint").map_err(fail)?,
+        )?)
+    } else {
+        None
+    };
+    let resolved;
+    let request = match &sell_all {
+        Some(all) => {
+            let mut r = request.clone();
+            r.insert("amount".into(), json!(all.amount));
+            resolved = r;
+            &resolved
+        }
+        None => request,
+    };
     let mut builder_request = request.clone();
     builder_request.remove("minOutputAmount");
     builder_request.remove("priorityFee");
@@ -504,6 +528,10 @@ fn build_pending(
     let parsed = validate_tx(&tx, user, a, request, &response)?;
     let builder_fee = local_fee_floor(&parsed, request).map_err(fail)?;
     let (tx, parsed) = economize(tx, parsed, request)?;
+    let (tx, parsed) = match &sell_all {
+        Some(all) => append_close(&tx, parsed, all, user)?,
+        None => (tx, parsed),
+    };
     if matches!(a, Action::Sell) {
         verify_sell_floor(&parsed, request)?;
     }
@@ -535,6 +563,17 @@ fn build_pending(
         verified_mint_decimals(mint),
     )
     .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
+    let mut review = review;
+    if let Some(all) = &sell_all {
+        review.insert(
+            review.len() - 1,
+            format!(
+                "Sells the whole balance and closes the emptied token account {}; its rent of {} returns to the trading account",
+                all.token_account,
+                lamports_display(all.rent_lamports)
+            ),
+        );
+    }
     let mut api = response;
     api.as_object_mut()
         .ok_or_else(|| fail("builder response must be an object"))?
@@ -551,6 +590,7 @@ fn build_pending(
         network_fee_lamports,
         network_fee_cap_lamports,
         created: Some(created),
+        sell_all,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1049,6 +1089,7 @@ fn build_close_token_account_pending(
         network_fee_lamports,
         network_fee_cap_lamports: network_fee_lamports,
         created: Some(Created::default()),
+        sell_all: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1180,6 +1221,9 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(value) => value,
         Err(e) => return fail(e),
     };
+    if let Some(all) = &p.sell_all {
+        r.insert("amount".into(), json!(all.amount));
+    }
     let debits = match effects(a, &r, &parsed_message, p.created) {
         Ok(value) => value,
         Err(e) => return fail(e),
@@ -1481,7 +1525,13 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         Action::Buy | Action::Sell => {
             let mint = text(r, "mint", 32, 64)?;
             pk(&mint).map_err(bad)?;
-            let amount = number(r, "amount", 1)?;
+            let amount = if matches!(a, Action::Sell)
+                && r.get("amount").and_then(Value::as_str) == Some("all")
+            {
+                "all".to_owned()
+            } else {
+                number(r, "amount", 1)?
+            };
             number(r, "minOutputAmount", 1)?;
             let slip = match r.get("slippagePct") {
                 None => 2.0,
@@ -2007,7 +2057,7 @@ fn probe_builder() -> BuilderCheck {
 #[derive(Clone, Copy)]
 pub enum Listing {
     /// The newest launches, newest first.
-    New,
+    Latest,
     /// Coins whose creator is streaming now.
     Live,
 }
@@ -2019,7 +2069,7 @@ pub enum Listing {
 /// and shortened; a trade names the mint, never the name.
 pub fn coins(listing: Listing) -> DispatchResponse {
     let (url, description) = match listing {
-        Listing::New => (
+        Listing::Latest => (
             format!(
                 "{COIN_LISTINGS}?offset=0&limit={LISTING_LIMIT}&sort=created_timestamp&order=DESC&includeNsfw=false"
             ),
@@ -2295,6 +2345,189 @@ fn pool_reserves(
         .ok_or_else(|| fail("Solana RPC omitted a pool vault balance"))
     };
     Ok((balance(0)?, balance(1)?))
+}
+
+/// What a sell of `"all"` resolved to when it was built.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SellAll {
+    amount: String,
+    token_account: String,
+    token_program: String,
+    rent_lamports: u64,
+}
+
+/// The trading account's whole balance of `mint`, in its own associated
+/// token account. Other accounts holding the mint are not the ones the
+/// builder sells from, so they are left alone.
+fn full_balance(user: &str, mint: &str) -> Result<SellAll, DispatchResponse> {
+    let owner = pk(user).map_err(fail)?;
+    let mint_key = pk(mint).map_err(fail)?;
+    let associated = pk(PROGRAMS[2]).map_err(fail)?;
+    let v = post(
+        RPC,
+        &rpc(
+            "getTokenAccountsByOwner",
+            json!([user, {"mint": mint}, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
+        ),
+    )?;
+    for entry in v
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| fail("Solana RPC omitted the trading account's token accounts"))?
+    {
+        let (Some(address), Some(program), Some(amount), Some(rent)) = (
+            entry.get("pubkey").and_then(Value::as_str),
+            entry.pointer("/account/owner").and_then(Value::as_str),
+            entry
+                .pointer("/account/data/parsed/info/tokenAmount/amount")
+                .and_then(Value::as_str),
+            entry.pointer("/account/lamports").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        if ![PROGRAMS[3], PROGRAMS[4]].contains(&program) {
+            continue;
+        }
+        let program_key = pk(program).map_err(fail)?;
+        let expected =
+            program_address(&[&owner, &program_key, &mint_key], &associated).map_err(fail)?;
+        if pk(address).map_err(fail)? != expected {
+            continue;
+        }
+        if amount
+            .parse::<u64>()
+            .map_err(|_| fail("invalid token balance"))?
+            == 0
+        {
+            return Err(bad(format!(
+                "the trading account holds none of {mint} to sell"
+            )));
+        }
+        return Ok(SellAll {
+            amount: amount.to_owned(),
+            token_account: address.to_owned(),
+            token_program: program.to_owned(),
+            rent_lamports: rent,
+        });
+    }
+    Err(bad(format!(
+        "the trading account has no token account for {mint}"
+    )))
+}
+
+/// Append a CloseAccount for the token account a sell of `"all"` empties,
+/// returning its rent to the trading account in the same transaction. The
+/// builder's instructions were validated as built; this adds exactly one
+/// instruction of a fixed shape, checked again after the rewrite.
+fn append_close(
+    tx: &str,
+    parsed: Msg,
+    all: &SellAll,
+    user: &str,
+) -> Result<(String, Msg), DispatchResponse> {
+    let payer = pk(user).map_err(fail)?;
+    let token_account = pk(&all.token_account).map_err(fail)?;
+    let token_program = pk(&all.token_program).map_err(fail)?;
+    let account_index = parsed
+        .keys
+        .iter()
+        .position(|key| *key == token_account)
+        .filter(|index| parsed.writable(*index))
+        .ok_or_else(|| fail("the sell does not write the token account it empties"))?;
+    let program_index = parsed.keys[..parsed.static_len]
+        .iter()
+        .position(|key| *key == token_program)
+        .unwrap_or(parsed.static_len);
+    let mut instructions = parsed.instructions.clone();
+    instructions.push(Ix {
+        program: program_index,
+        accounts: vec![
+            u8::try_from(account_index).map_err(|_| fail("account index overflow"))?,
+            0,
+            0,
+        ],
+        data: vec![9],
+    });
+    let raw = B64
+        .decode(tx)
+        .map_err(|_| fail("transaction is not base64"))?;
+    let original = envelope(&raw).map_err(fail)?.message;
+    let (rewritten, _) =
+        txedit::rewrite(original, &instructions, Some(&token_program)).map_err(fail)?;
+    let rebuilt = txedit::unsigned_transaction(&rewritten).map_err(fail)?;
+    envelope(&rebuilt).map_err(|error| fail(format!("closing the token account: {error}")))?;
+    let mut reparsed = message(&rewritten).map_err(fail)?;
+    reparsed
+        .keys
+        .extend_from_slice(&parsed.keys[parsed.static_len..]);
+    let close = reparsed.instructions.last().expect("appended");
+    if reparsed.keys.get(close.program) != Some(&token_program)
+        || account(&reparsed, close, 0).map_err(fail)? != &token_account
+        || account(&reparsed, close, 1).map_err(fail)? != &payer
+        || account(&reparsed, close, 2).map_err(fail)? != &payer
+        || close.data != [9]
+        || reparsed.instructions.len() != parsed.instructions.len() + 1
+    {
+        return Err(fail("the appended close does not have its fixed shape"));
+    }
+    Ok((B64.encode(rebuilt), reparsed))
+}
+
+/// Every token account the trading account holds, under both token programs.
+pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
+    let owner = match TradeOwner::scope(c, &w) {
+        Ok(owner) => owner,
+        Err(e) => return e,
+    };
+    let address = match owner.address() {
+        Ok(address) => address,
+        Err(e) => return e,
+    };
+    let mut tokens = Vec::new();
+    for program in [PROGRAMS[3], PROGRAMS[4]] {
+        let v = match post(
+            RPC,
+            &rpc(
+                "getTokenAccountsByOwner",
+                json!([address, {"programId": program}, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
+            ),
+        ) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let Some(entries) = v.pointer("/result/value").and_then(Value::as_array) else {
+            return fail("Solana RPC omitted the trading account's token accounts");
+        };
+        for entry in entries {
+            let info = entry.pointer("/account/data/parsed/info");
+            let amount = info
+                .and_then(|i| i.pointer("/tokenAmount/amount"))
+                .and_then(Value::as_str);
+            let (Some(token_account), Some(mint), Some(amount)) = (
+                entry.get("pubkey").and_then(Value::as_str),
+                info.and_then(|i| i.get("mint")).and_then(Value::as_str),
+                amount,
+            ) else {
+                continue;
+            };
+            tokens.push(json!({
+                "mint": mint,
+                "tokenAccount": token_account,
+                "amount": amount,
+                "decimals": info.and_then(|i| i.pointer("/tokenAmount/decimals")),
+                "uiAmount": info.and_then(|i| i.pointer("/tokenAmount/uiAmountString")),
+                "rentLamports": entry.pointer("/account/lamports"),
+                "tokenProgram": program,
+                "empty": amount == "0",
+            }));
+        }
+    }
+    tokens.sort_by(|a, b| a["mint"].as_str().cmp(&b["mint"].as_str()));
+    petal::read_json_value(&json!({
+        "account": {"wallet": w, "account": owner.account, "address": address},
+        "tokens": tokens,
+        "note": "Sell a whole balance with sell.json {\"amount\":\"all\"}, which also closes the emptied token account. An empty account can be closed with close_token_account.json.",
+    }))
 }
 
 /// Accounts the transaction creates and the rent they hold.
@@ -6048,7 +6281,7 @@ mod tests {
             json!([{"mint": AMM_MINT, "name": "l", "symbol": "L"}]),
         );
         fake_host::install(host);
-        for (listing, mint) in [(Listing::New, BOND_MINT), (Listing::Live, AMM_MINT)] {
+        for (listing, mint) in [(Listing::Latest, BOND_MINT), (Listing::Live, AMM_MINT)] {
             let body = match coins(listing) {
                 DispatchResponse::Read(bytes) => bytes,
                 other => panic!("{other:?}"),
@@ -6059,6 +6292,183 @@ mod tests {
         fake_host::with(|host| {
             assert!(host.calls.iter().all(|c| c.method == "GET"));
             assert!(host.calls.iter().all(|c| c.url.starts_with(COIN_LISTINGS)));
+        });
+    }
+
+    const SOLD: u64 = 35_323_464_136;
+
+    /// The trading account's own token account for BOND_MINT as the sell
+    /// fixture uses it, and the token program it lives under.
+    fn fixture_token_account() -> (String, &'static str) {
+        let raw = B64
+            .decode(fixture("sell_bond")["transaction"].as_str().unwrap())
+            .unwrap();
+        let mut parsed = message(envelope(&raw).unwrap().message).unwrap();
+        append_lookup_addresses(&mut parsed, &test_lookup_tables()).unwrap();
+        [PROGRAMS[3], PROGRAMS[4]]
+            .into_iter()
+            .find_map(|program| {
+                let address = program_address(
+                    &[
+                        &pk(USER).unwrap(),
+                        &pk(program).unwrap(),
+                        &pk(BOND_MINT).unwrap(),
+                    ],
+                    &pk(PROGRAMS[2]).unwrap(),
+                )
+                .unwrap();
+                parsed
+                    .keys
+                    .contains(&address)
+                    .then(|| (bs58::encode(address).into_string(), program))
+            })
+            .expect("the sell fixture writes the trading account's token account")
+    }
+
+    fn host_serving_a_sell(balance: &str) -> FakeHost {
+        let mut raw = B64
+            .decode(fixture("sell_bond")["transaction"].as_str().unwrap())
+            .unwrap();
+        let at = raw.windows(8).position(|w| w == IX_SELL).unwrap();
+        raw[at + 8..at + 16].copy_from_slice(&SOLD.to_le_bytes());
+        raw[at + 16..at + 24].copy_from_slice(&955_737u64.to_le_bytes());
+        let mut response = fixture("sell_bond");
+        response["transaction"] = json!(B64.encode(raw));
+        let (token_account, program) = fixture_token_account();
+        let mut host = host_serving_a_buy();
+        host.reply_only(SWAP_URL, response);
+        host.reply(
+            &format!("{RPC} getAccountInfo"),
+            curve_account(1_072_993_493_000_000, 30_000_182_059, false),
+        );
+        host.reply(
+            &format!("{RPC} getTokenAccountsByOwner"),
+            json!({"result":{"value":[{"pubkey": token_account, "account": {
+                "owner": program, "lamports": 1_513_840,
+                "data": {"parsed": {"info": {"mint": BOND_MINT,
+                    "tokenAmount": {"amount": balance, "decimals": 6, "uiAmountString": "1"}}}}
+            }}]}}),
+        );
+        host
+    }
+
+    fn run_sell_all(operation: &str) -> DispatchResponse {
+        let body = json!({"operationId": operation, "mint": BOND_MINT, "amount": "all",
+            "minOutputAmount": "1", "slippagePct": 2});
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SELL")]),
+            Action::Sell,
+            owner(),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+    }
+
+    /// A sell of "all" sells exactly the balance of the trading account's own
+    /// token account and closes that account in the same transaction, so the
+    /// rent comes back without a second approval.
+    #[test]
+    fn selling_all_sells_the_balance_and_closes_the_account_in_one_transaction() {
+        fake_host::install(host_serving_a_sell(&SOLD.to_string()));
+        let response = run_sell_all("sell-all");
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let (token_account, program) = fixture_token_account();
+        fake_host::with(|host| {
+            let asked = &host.calls.iter().find(|c| c.url == SWAP_URL).unwrap().body;
+            assert_eq!(
+                asked["amount"],
+                json!(SOLD.to_string()),
+                "the builder is asked for the balance"
+            );
+            let request = &host.sign_requests[0];
+            let mut signed = message(&request.preimage).unwrap();
+            append_lookup_addresses(&mut signed, &test_lookup_tables()).unwrap();
+            let close = signed.instructions.last().unwrap();
+            assert_eq!(close.data, [9]);
+            assert_eq!(signed.keys[close.program], pk(program).unwrap());
+            assert_eq!(
+                account(&signed, close, 0).unwrap(),
+                &pk(&token_account).unwrap()
+            );
+            assert_eq!(account(&signed, close, 1).unwrap(), &pk(USER).unwrap());
+            assert_eq!(account(&signed, close, 2).unwrap(), &pk(USER).unwrap());
+            let sell = signed
+                .instructions
+                .iter()
+                .find(|ix| has_discriminator(ix, IX_SELL))
+                .unwrap();
+            assert_eq!(instruction_u64(sell, 8).unwrap(), SOLD);
+            let claim: Value = serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+            assert_eq!(
+                claim["declared_debits"][0]["amount"],
+                json!(SOLD.to_string())
+            );
+        });
+        let review = public_operation("sell-all")["review"].to_string();
+        assert!(
+            review.contains("closes the emptied token account"),
+            "{review}"
+        );
+    }
+
+    #[test]
+    fn selling_all_of_nothing_is_refused_before_building() {
+        fake_host::install(host_serving_a_sell("0"));
+        let message = dispatch_message(&run_sell_all("sell-none"));
+        assert!(message.contains("holds none"), "{message}");
+        fake_host::with(|host| {
+            assert!(host.calls.iter().all(|c| c.url != SWAP_URL));
+            assert!(host.sign_requests.is_empty());
+        });
+    }
+
+    #[test]
+    fn holdings_lists_token_accounts_under_both_programs() {
+        let mut host = host_serving_a_buy();
+        for (program, mint, amount) in [
+            (PROGRAMS[3], AMM_MINT, "0"),
+            (PROGRAMS[4], BOND_MINT, "35323464136"),
+        ] {
+            host.reply(
+                &format!("{RPC} getTokenAccountsByOwner"),
+                json!({"result":{"value":[{"pubkey": TOKEN_ACCOUNT, "account": {
+                    "owner": program, "lamports": 2_039_280,
+                    "data": {"parsed": {"info": {"mint": mint,
+                        "tokenAmount": {"amount": amount, "decimals": 6, "uiAmountString": "1"}}}}}}]}}),
+            );
+        }
+        fake_host::install(host);
+        let body = match holdings(&ctx(&[("wallet", WALLET)]), WALLET.to_owned()) {
+            DispatchResponse::Read(bytes) => bytes,
+            other => panic!("{other:?}"),
+        };
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["account"]["address"], json!(USER));
+        let tokens = v["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 2);
+        let bond = tokens
+            .iter()
+            .find(|t| t["mint"] == json!(BOND_MINT))
+            .unwrap();
+        assert_eq!(bond["amount"], json!("35323464136"));
+        assert_eq!(bond["empty"], json!(false));
+        let empty = tokens
+            .iter()
+            .find(|t| t["mint"] == json!(AMM_MINT))
+            .unwrap();
+        assert_eq!(empty["empty"], json!(true));
+        fake_host::with(|host| {
+            let asked = host.calls_for("getTokenAccountsByOwner");
+            assert_eq!(asked.len(), 2);
+            assert!(
+                asked
+                    .iter()
+                    .all(|c| c.rpc_params().unwrap()[0] == json!(USER))
+            );
         });
     }
 }

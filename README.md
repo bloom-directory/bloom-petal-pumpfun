@@ -51,15 +51,16 @@ PumpSwap) and the requested slippage.
 
 ```text
 status.json
-coins/new.json
+coins/latest.json
 coins/live.json
 coins/<mint>.json
 trade/<wallet>/preflight.json
+trade/<wallet>/holdings.json
 trade/<wallet>/{buy,sell,close_token_account}.json
 trade/<wallet>/operations/<operationId>.json
 ```
 
-`coins/new.json` lists the newest launches and `coins/live.json` the coins whose
+`coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
 creator is streaming, up to 50 each, without banned or NSFW coins. Names and
 symbols are the creator's own text, not unique, and cleaned of control and
 direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
@@ -108,6 +109,19 @@ ceremony that meets a busier market stays inside what the owner approved.
 Protected writes are sent only to Jito; ordinary writes use the declared public
 Solana RPC and fall back to the second RPC once. Protection is routing, not a
 guarantee.
+
+## Holdings and selling everything
+
+`trade/<wallet>/holdings.json` lists every token account the trading account
+holds under both token programs: mint, raw and display amount, rent, and
+whether it is empty.
+
+A sell may name `"amount":"all"`. When the transaction is built, the Petal
+reads the balance of the trading account's own associated token account for
+the mint, asks the builder to sell exactly that, and appends a `CloseAccount`
+for the emptied account, so its rent returns in the same transaction and the
+same approval. The operation id binds `"all"`; the resolved amount is what
+the claim declares and the review shows.
 
 ## Closing an empty token account
 
