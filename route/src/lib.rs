@@ -19,6 +19,11 @@ const ATA_RENT_ALLOWANCE_LAMPORTS: u64 = 2_100_000;
 /// this much less. Past it a trade fails and can be retried, which costs a
 /// network fee, not a tenth of the position.
 const MAX_SLIPPAGE_PCT: f64 = 10.0;
+/// The least a trade offers per compute unit, in micro-lamports, unless the
+/// request keeps the builder's price. Pump's builder always asks for about
+/// 0.001 SOL of priority, which doubles the cost of a small trade; recent
+/// fees on a trade's own accounts are usually far lower.
+const MIN_COMPUTE_UNIT_PRICE: u64 = 100_000;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const RPC: &str = "https://rpc.solanatracker.io/public";
@@ -75,6 +80,7 @@ fn sdk_message(e: &petal::SdkError) -> String {
 
 #[cfg(test)]
 mod fake_host;
+mod txedit;
 
 /// This crate's only boundary to the Bloom host.
 ///
@@ -426,6 +432,12 @@ struct Pending {
     api: Value,
     front: bool,
     network_fee_lamports: u64,
+    /// The most the network fee can be: the fee at the builder's own
+    /// compute-unit price. It is what the claim declares, so the approval's
+    /// ceiling holds when a rebuild picks a different price from the market.
+    /// Zero on records from before the Petal chose its own price.
+    #[serde(default)]
+    network_fee_cap_lamports: u64,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -467,6 +479,7 @@ fn build_pending(
     }
     let mut builder_request = request.clone();
     builder_request.remove("minOutputAmount");
+    builder_request.remove("priorityFee");
     let response = post(
         &format!("{BUILD}{}", a.path()),
         &Value::Object(builder_request),
@@ -477,6 +490,8 @@ fn build_pending(
         .ok_or_else(|| fail("builder omitted transaction"))?
         .to_owned();
     let parsed = validate_tx(&tx, user, a, request, &response)?;
+    let builder_fee = local_fee_floor(&parsed, request).map_err(fail)?;
+    let (tx, parsed) = economize(tx, parsed, request)?;
     let raw = B64
         .decode(&tx)
         .map_err(|_| fail("builder transaction is not base64"))?;
@@ -486,6 +501,7 @@ fn build_pending(
             .message,
     ));
     let network_fee_lamports = transaction_fee(&tx, request)?;
+    let network_fee_cap_lamports = builder_fee.max(network_fee_lamports);
     let mint = match a {
         Action::Buy => request.get("outputMint"),
         _ => request.get("inputMint"),
@@ -498,6 +514,7 @@ fn build_pending(
         request,
         &parsed,
         network_fee_lamports,
+        network_fee_cap_lamports,
         verified_mint_decimals(mint),
     )
     .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
@@ -515,12 +532,79 @@ fn build_pending(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         network_fee_lamports,
+        network_fee_cap_lamports,
         status: "built".into(),
         signature: None,
         approval: None,
         may_be_signed: false,
         review,
     })
+}
+
+/// The builder's transaction with its compute-unit price lowered to what
+/// recent transactions on the same writable accounts paid, never below
+/// `MIN_COMPUTE_UNIT_PRICE` and never above the builder's own price. Only the
+/// price bytes change, so every validated account and amount is unchanged.
+/// A request with `"priorityFee":"builder"` keeps the builder's price, and so
+/// does a fee RPC that will not answer: a missing estimate should cost money,
+/// not the trade.
+fn economize(
+    tx: String,
+    mut parsed: Msg,
+    request: &Map<String, Value>,
+) -> Result<(String, Msg), DispatchResponse> {
+    if request.get("priorityFee").and_then(Value::as_str) == Some("builder") {
+        return Ok((tx, parsed));
+    }
+    let compute = pk(PROGRAMS[0]).map_err(fail)?;
+    let position = parsed
+        .instructions
+        .iter()
+        .position(|ix| parsed.keys.get(ix.program) == Some(&compute) && ix.data.first() == Some(&3))
+        .ok_or_else(|| fail("compute-unit price missing"))?;
+    let builder_price = instruction_u64(&parsed.instructions[position], 1).map_err(fail)?;
+    let writable = (1..parsed.keys.len())
+        .filter(|index| parsed.writable(*index))
+        .map(|index| bs58::encode(parsed.keys[index]).into_string())
+        .take(128)
+        .collect::<Vec<_>>();
+    let Ok(market) = recent_compute_unit_price(&writable) else {
+        return Ok((tx, parsed));
+    };
+    let price = market.max(MIN_COMPUTE_UNIT_PRICE).min(builder_price);
+    if price == builder_price {
+        return Ok((tx, parsed));
+    }
+    parsed.instructions[position].data = [&[3u8][..], &price.to_le_bytes()].concat();
+    let raw = B64
+        .decode(&tx)
+        .map_err(|_| fail("builder transaction is not base64"))?;
+    let original = envelope(&raw).map_err(fail)?.message;
+    let (message, _) = txedit::rewrite(original, &parsed.instructions, None).map_err(fail)?;
+    let rebuilt = txedit::unsigned_transaction(&message).map_err(fail)?;
+    Ok((B64.encode(rebuilt), parsed))
+}
+/// The 90th percentile of the fees recent slots charged transactions that
+/// wrote these accounts, in micro-lamports per compute unit. Asked of the
+/// verifying RPC, the one of the two that serves this method.
+fn recent_compute_unit_price(accounts: &[String]) -> Result<u64, DispatchResponse> {
+    let response = post(
+        RPC_VERIFY,
+        &rpc("getRecentPrioritizationFees", json!([accounts])),
+    )?;
+    let mut fees = response
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| fail("Solana RPC omitted recent prioritization fees"))?
+        .iter()
+        .map(|entry| entry.get("prioritizationFee").and_then(Value::as_u64))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| fail("Solana RPC returned an invalid prioritization fee"))?;
+    fees.sort_unstable();
+    Ok(fees
+        .get((fees.len() * 9 / 10).min(fees.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0))
 }
 
 /// SOL has nine decimals. Anything else is presented in raw units with its
@@ -643,6 +727,7 @@ fn swap_review(
     request: &Map<String, Value>,
     message: &Msg,
     network_fee_lamports: u64,
+    network_fee_cap_lamports: u64,
     decimals: Option<u8>,
 ) -> Result<Vec<String>, String> {
     let (input, minimum_output) = swap_instruction_amounts(message, action)?;
@@ -707,10 +792,18 @@ fn swap_review(
     review.extend(assets);
     review.extend(amounts);
     review.push(fee_note.to_owned());
-    review.push(format!(
-        "Estimated network fee: {} (a cap, charged as used)",
-        lamports_display(network_fee_lamports)
-    ));
+    review.push(if network_fee_cap_lamports > network_fee_lamports {
+        format!(
+            "Network fee: about {}, at most {}",
+            lamports_display(network_fee_lamports),
+            lamports_display(network_fee_cap_lamports)
+        )
+    } else {
+        format!(
+            "Estimated network fee: {} (a cap, charged as used)",
+            lamports_display(network_fee_lamports)
+        )
+    });
     if account_rent > 0 {
         review.push(format!(
             "Rent for {ata_count} new token account(s), up to {}; recoverable by closing them while empty",
@@ -729,7 +822,7 @@ fn swap_review(
     // only buys would leave the owner to add those up.
     let overhead = tip
         .checked_add(account_rent)
-        .and_then(|value| value.checked_add(network_fee_lamports))
+        .and_then(|value| value.checked_add(network_fee_cap_lamports.max(network_fee_lamports)))
         .ok_or("native cost exceeds u64")?;
     review.push(if matches!(action, Action::Buy) {
         let total = input
@@ -942,6 +1035,7 @@ fn build_close_token_account_pending(
         }),
         front: false,
         network_fee_lamports,
+        network_fee_cap_lamports: network_fee_lamports,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1077,7 +1171,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
+    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.max(p.network_fee_cap_lamports).to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
@@ -1328,6 +1422,7 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "slippagePct",
             "frontRunningProtection",
             "tipAmount",
+            "priorityFee",
         ][..],
         Action::CloseTokenAccount => &["mint", "tokenAccount", "maxLamports"][..],
     };
@@ -1340,6 +1435,16 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         return Err(bad("tipAmount requires frontRunningProtection"));
     }
     r.insert("frontRunningProtection".into(), json!(front));
+    if matches!(a, Action::Buy | Action::Sell) {
+        let priority = match r.get("priorityFee") {
+            None => "economy",
+            Some(value) => match value.as_str() {
+                Some(choice @ ("economy" | "builder")) => choice,
+                _ => return Err(bad("priorityFee must be \"economy\" or \"builder\"")),
+            },
+        };
+        r.insert("priorityFee".into(), json!(priority));
+    }
     r.insert(
         "tipAmount".into(),
         Value::Number(
@@ -1966,13 +2071,31 @@ struct Msg {
     instructions: Vec<Ix>,
     blockhash: [u8; 32],
     required: usize,
+    readonly_signed: usize,
+    readonly_unsigned: usize,
+    /// How many of `keys` are static; the rest were loaded from tables.
+    static_len: usize,
     lookups: Vec<Lookup>,
+}
+impl Msg {
+    /// Whether the transaction locks `keys[index]` for writing.
+    fn writable(&self, index: usize) -> bool {
+        if index < self.static_len {
+            index < self.required.saturating_sub(self.readonly_signed)
+                || (index >= self.required
+                    && index < self.static_len.saturating_sub(self.readonly_unsigned))
+        } else {
+            let loaded_writable: usize = self.lookups.iter().map(|l| l.writable.len()).sum();
+            index < self.static_len + loaded_writable && index < self.keys.len()
+        }
+    }
 }
 struct Lookup {
     table: [u8; 32],
     writable: Vec<u8>,
     readonly: Vec<u8>,
 }
+#[derive(Clone)]
 struct Ix {
     program: usize,
     accounts: Vec<u8>,
@@ -2023,6 +2146,8 @@ fn message(b: &[u8]) -> Result<Msg, String> {
     }
     o += 1;
     let required = *b.get(o).ok_or("header missing")? as usize;
+    let readonly_signed = *b.get(o + 1).ok_or("header missing")? as usize;
+    let readonly_unsigned = *b.get(o + 2).ok_or("header missing")? as usize;
     o += 3;
     let n = short(b, &mut o)?;
     if n == 0 || n > 128 {
@@ -2092,10 +2217,13 @@ fn message(b: &[u8]) -> Result<Msg, String> {
         return Err("trailing message bytes".into());
     }
     Ok(Msg {
+        static_len: keys.len(),
         keys,
         instructions,
         blockhash,
         required,
+        readonly_signed,
+        readonly_unsigned,
         lookups,
     })
 }
@@ -2972,8 +3100,16 @@ mod tests {
             json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
         );
         let parsed = validate_tx(transaction, USER, Action::Buy, &request, &response).unwrap();
-        let review =
-            swap_review(&trader(), Action::Buy, &request, &parsed, 5_000, Some(6)).unwrap();
+        let review = swap_review(
+            &trader(),
+            Action::Buy,
+            &request,
+            &parsed,
+            5_000,
+            5_000,
+            Some(6),
+        )
+        .unwrap();
         let joined = review.join("\n");
         assert!(joined.starts_with("Buy on Pump.fun"), "{joined}");
         // The owner selected an account in Bloom, not an address. Naming only
@@ -3029,9 +3165,17 @@ mod tests {
         );
         // No verified scale here, so the amount stays in raw units and says so
         // rather than implying a decimal point the Petal could not check.
-        let review = swap_review(&trader(), Action::Sell, &request, &parsed, 5_000, None)
-            .unwrap()
-            .join("\n");
+        let review = swap_review(
+            &trader(),
+            Action::Sell,
+            &request,
+            &parsed,
+            5_000,
+            5_000,
+            None,
+        )
+        .unwrap()
+        .join("\n");
         let (sold, minimum) = swap_instruction_amounts(&parsed, Action::Sell).unwrap();
         assert!(
             review.contains(&format!("Selling token: {BOND_MINT}")),
@@ -3404,6 +3548,10 @@ mod tests {
             &format!("{USER}\n"),
         );
         host.reply(SWAP_URL, fixture("buy_bond"));
+        host.reply(
+            &format!("{RPC_VERIFY} getRecentPrioritizationFees"),
+            recent_fees(&[0; 150]),
+        );
         host.reply(
             &format!("{RPC} getFeeForMessage"),
             json!({"result":{"value":5_000}}),
@@ -4923,6 +5071,7 @@ mod tests {
                 &normalized,
                 &parsed,
                 5_000,
+                5_000,
                 live_decimals,
             )
             .unwrap_or_else(|error| panic!("{label}: review: {error}"));
@@ -5134,5 +5283,165 @@ mod tests {
             .clone();
         normalize(Action::Buy, USER, &mut defaulted).unwrap();
         assert_eq!(defaulted["slippagePct"], json!(2.0));
+    }
+
+    fn recent_fees(fees: &[u64]) -> Value {
+        json!({"result": fees
+            .iter()
+            .enumerate()
+            .map(|(slot, fee)| json!({"slot": slot, "prioritizationFee": fee}))
+            .collect::<Vec<_>>()})
+    }
+
+    fn compute_unit_price(preimage: &[u8]) -> u64 {
+        let parsed = message(preimage).unwrap();
+        let compute = pk(PROGRAMS[0]).unwrap();
+        let ix = parsed
+            .instructions
+            .iter()
+            .find(|ix| parsed.keys.get(ix.program) == Some(&compute) && ix.data.first() == Some(&3))
+            .expect("compute-unit price");
+        instruction_u64(ix, 1).unwrap()
+    }
+
+    fn builder_compute_unit_price() -> u64 {
+        let raw = B64
+            .decode(fixture("buy_bond")["transaction"].as_str().unwrap())
+            .unwrap();
+        compute_unit_price(envelope(&raw).unwrap().message)
+    }
+
+    #[test]
+    fn a_trade_pays_the_floor_price_when_recent_fees_are_lower() {
+        assert!(builder_compute_unit_price() > MIN_COMPUTE_UNIT_PRICE);
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("buy-economy", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(
+                compute_unit_price(&host.sign_requests[0].preimage),
+                MIN_COMPUTE_UNIT_PRICE
+            );
+            let asked = &host.calls_for("getRecentPrioritizationFees")[0];
+            assert_eq!(asked.url, RPC_VERIFY);
+            let accounts = asked.rpc_params().unwrap()[0].as_array().unwrap();
+            assert!(!accounts.is_empty());
+            assert!(
+                !accounts.contains(&json!(USER)),
+                "the payer is not a market signal"
+            );
+        });
+    }
+
+    #[test]
+    fn a_trade_follows_the_market_up_to_the_builders_price() {
+        let builder = builder_compute_unit_price();
+        for (recent, expected) in [
+            (MIN_COMPUTE_UNIT_PRICE * 3, MIN_COMPUTE_UNIT_PRICE * 3),
+            (builder * 2, builder),
+        ] {
+            let mut host = host_serving_a_buy();
+            host.reply_only(
+                &format!("{RPC_VERIFY} getRecentPrioritizationFees"),
+                recent_fees(&[recent; 150]),
+            );
+            fake_host::install(host);
+            assert_eq!(run_buy("buy-market", false), DispatchResponse::Write);
+            fake_host::with(|host| {
+                assert_eq!(
+                    compute_unit_price(&host.sign_requests[0].preimage),
+                    expected
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn the_builders_price_is_kept_on_request_or_without_an_estimate() {
+        let builder = builder_compute_unit_price();
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC_VERIFY} getRecentPrioritizationFees"),
+            json!({"error": {"code": -32603, "message": "unavailable"}}),
+        );
+        fake_host::install(host);
+        assert_eq!(run_buy("buy-no-estimate", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            assert_eq!(compute_unit_price(&host.sign_requests[0].preimage), builder);
+        });
+
+        fake_host::install(host_serving_a_buy());
+        let mut body: Value = serde_json::from_slice(&buy_body("buy-builder-fee", false)).unwrap();
+        body["priorityFee"] = json!("builder");
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_BUY")]),
+            Action::Buy,
+            owner(),
+            &serde_json::to_vec(&body).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| {
+            assert_eq!(compute_unit_price(&host.sign_requests[0].preimage), builder);
+            assert!(host.calls_for("getRecentPrioritizationFees").is_empty());
+            let sent_to_builder = &host.calls.iter().find(|c| c.url == SWAP_URL).unwrap().body;
+            assert!(sent_to_builder.get("priorityFee").is_none());
+        });
+    }
+
+    /// The approval's ceiling is set by the claim that prepared it. A rebuild
+    /// after the ceremony may pay a different market price, so the claim
+    /// declares the fee at the builder's price, which does not move, and the
+    /// transaction pays less.
+    #[test]
+    fn the_declared_fee_is_the_builders_cap_whatever_the_market_price() {
+        let mut host = host_serving_a_buy();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "grant".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("buy-cap", false)).contains("approval required"));
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC_VERIFY} getRecentPrioritizationFees"),
+                recent_fees(&[MIN_COMPUTE_UNIT_PRICE * 4; 150]),
+            );
+        });
+        assert_eq!(run_buy("buy-cap", false), DispatchResponse::Write);
+        fake_host::with(|host| {
+            let declared = host
+                .sign_requests
+                .iter()
+                .map(|request| {
+                    let claim: Value =
+                        serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+                    claim["declared_fee"]["amount"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let prices = host
+                .sign_requests
+                .iter()
+                .map(|request| compute_unit_price(&request.preimage))
+                .collect::<Vec<_>>();
+            assert_ne!(prices[0], prices[1], "the market moved between builds");
+            assert_eq!(declared[0], declared[1], "the declared fee did not");
+            let raw = B64
+                .decode(fixture("buy_bond")["transaction"].as_str().unwrap())
+                .unwrap();
+            let builder = message(envelope(&raw).unwrap().message).unwrap();
+            let request = normalized(
+                Action::Buy,
+                json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1","slippagePct":2}),
+            );
+            assert_eq!(declared[0], local_fee_floor(&builder, &request).unwrap());
+        });
     }
 }

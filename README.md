@@ -73,6 +73,14 @@ raised only that ceiling: the tolerance is on what the trade spends.
 `slippagePct` defaults to 2 and may not exceed 10: slippage is what a
 sandwich can take, and a trade that fails at 10% costs a network fee, not a
 tenth of the position.
+
+Pump's builder always asks for about 0.001 SOL of priority, whatever the trade
+size. Unless the request sets `"priorityFee":"builder"`, the Petal lowers the
+compute-unit price to the 90th percentile of what recent slots charged for the
+trade's own writable accounts, never below 100,000 micro-lamports per unit and
+never above the builder's price. Only those price bytes change. The approval
+and review still cap the fee at the builder's price, so a rebuild after the
+ceremony that meets a busier market stays inside what the owner approved.
 `SETUP.md` has the measurements, and their limits.
 
 Protected writes are sent only to Jito; ordinary writes use the declared public
