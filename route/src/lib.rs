@@ -557,9 +557,11 @@ fn build_pending(
         a,
         request,
         &parsed,
-        network_fee_lamports,
-        network_fee_cap_lamports,
-        created,
+        Costs {
+            network_fee_lamports,
+            network_fee_cap_lamports,
+            created,
+        },
         verified_mint_decimals(mint),
     )
     .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
@@ -784,11 +786,14 @@ fn swap_review(
     action: Action,
     request: &Map<String, Value>,
     message: &Msg,
-    network_fee_lamports: u64,
-    network_fee_cap_lamports: u64,
-    created: Created,
+    costs: Costs,
     decimals: Option<u8>,
 ) -> Result<Vec<String>, String> {
+    let Costs {
+        network_fee_lamports,
+        network_fee_cap_lamports,
+        created,
+    } = costs;
     let (input, minimum_output) = swap_instruction_amounts(message, action)?;
     let mint = match action {
         Action::Buy => request.get("outputMint"),
@@ -2530,6 +2535,14 @@ pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
     }))
 }
 
+/// What a trade costs besides the trade itself.
+#[derive(Clone, Copy, Default)]
+struct Costs {
+    network_fee_lamports: u64,
+    network_fee_cap_lamports: u64,
+    created: Created,
+}
+
 /// Accounts the transaction creates and the rent they hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Created {
@@ -3724,9 +3737,11 @@ mod tests {
             Action::Buy,
             &request,
             &parsed,
-            5_000,
-            5_000,
-            Created::default(),
+            Costs {
+                network_fee_lamports: 5_000,
+                network_fee_cap_lamports: 5_000,
+                created: Created::default(),
+            },
             Some(6),
         )
         .unwrap();
@@ -3790,9 +3805,11 @@ mod tests {
             Action::Sell,
             &request,
             &parsed,
-            5_000,
-            5_000,
-            Created::default(),
+            Costs {
+                network_fee_lamports: 5_000,
+                network_fee_cap_lamports: 5_000,
+                created: Created::default(),
+            },
             None,
         )
         .unwrap()
@@ -5692,9 +5709,11 @@ mod tests {
                 action,
                 &normalized,
                 &parsed,
-                5_000,
-                5_000,
-                Created::default(),
+                Costs {
+                    network_fee_lamports: 5_000,
+                    network_fee_cap_lamports: 5_000,
+                    created: Created::default(),
+                },
                 live_decimals,
             )
             .unwrap_or_else(|error| panic!("{label}: review: {error}"));
