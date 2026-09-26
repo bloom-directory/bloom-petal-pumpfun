@@ -438,6 +438,11 @@ struct Pending {
     /// Zero on records from before the Petal chose its own price.
     #[serde(default)]
     network_fee_cap_lamports: u64,
+    /// Accounts the transaction creates and the rent they take, measured by
+    /// simulation when it was built. `None` on records from before that, which
+    /// fall back to the token-account allowance.
+    #[serde(default)]
+    created: Option<Created>,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -492,6 +497,7 @@ fn build_pending(
     let parsed = validate_tx(&tx, user, a, request, &response)?;
     let builder_fee = local_fee_floor(&parsed, request).map_err(fail)?;
     let (tx, parsed) = economize(tx, parsed, request)?;
+    let created = created_accounts(&tx, &parsed)?;
     let raw = B64
         .decode(&tx)
         .map_err(|_| fail("builder transaction is not base64"))?;
@@ -515,6 +521,7 @@ fn build_pending(
         &parsed,
         network_fee_lamports,
         network_fee_cap_lamports,
+        created,
         verified_mint_decimals(mint),
     )
     .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
@@ -533,6 +540,7 @@ fn build_pending(
             .unwrap_or(false),
         network_fee_lamports,
         network_fee_cap_lamports,
+        created: Some(created),
         status: "built".into(),
         signature: None,
         approval: None,
@@ -728,6 +736,7 @@ fn swap_review(
     message: &Msg,
     network_fee_lamports: u64,
     network_fee_cap_lamports: u64,
+    created: Created,
     decimals: Option<u8>,
 ) -> Result<Vec<String>, String> {
     let (input, minimum_output) = swap_instruction_amounts(message, action)?;
@@ -738,15 +747,7 @@ fn swap_review(
     .and_then(Value::as_str)
     .ok_or("normalized swap mint missing")?;
     let tip = tip_lamports(request).map_err(|_| "invalid normalized tipAmount")?;
-    let associated = pk(PROGRAMS[2])?;
-    let ata_count = message
-        .instructions
-        .iter()
-        .filter(|ix| message.keys.get(ix.program) == Some(&associated))
-        .count() as u64;
-    let account_rent = ata_count
-        .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
-        .ok_or("account rent allowance exceeds u64")?;
+    let account_rent = created.lamports;
     // A Pump buy names a token amount and a ceiling on the SOL in, and only
     // the ceiling moves with slippage. So the spend is the figure that can
     // move against the owner between approving and landing, and the one they
@@ -806,7 +807,8 @@ fn swap_review(
     });
     if account_rent > 0 {
         review.push(format!(
-            "Rent for {ata_count} new token account(s), up to {}; recoverable by closing them while empty",
+            "Rent for {} new account(s) this creates: {}; a token account's rent comes back when it is closed empty",
+            created.count,
             lamports_display(account_rent)
         ));
     }
@@ -1036,6 +1038,7 @@ fn build_close_token_account_pending(
         front: false,
         network_fee_lamports,
         network_fee_cap_lamports: network_fee_lamports,
+        created: Some(Created::default()),
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1167,7 +1170,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let debits = match effects(a, &r, &parsed_message) {
+    let debits = match effects(a, &r, &parsed_message, p.created) {
         Ok(value) => value,
         Err(e) => return fail(e),
     };
@@ -1179,7 +1182,14 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     // Simulate before signing: an RPC that receives a signed transaction can
     // broadcast it, so a signature must never leave until this operation will
     // not build another transaction.
-    if let Err(e) = simulate(&p.tx) {
+    let declared_native = match declared_native_total(
+        &debits,
+        p.network_fee_lamports.max(p.network_fee_cap_lamports),
+    ) {
+        Ok(total) => total,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = simulate_within(&p.tx, &user, declared_native) {
         // The approval is kept: it is not bound to these bytes, and the
         // retry rebuilds them.
         p.status = "preflight_failed".into();
@@ -1552,17 +1562,26 @@ fn number(r: &Map<String, Value>, n: &str, min: u64) -> Result<String, DispatchR
         Ok(s)
     }
 }
-fn effects(a: Action, r: &Map<String, Value>, message: &Msg) -> Result<Vec<Value>, String> {
+fn effects(
+    a: Action,
+    r: &Map<String, Value>,
+    message: &Msg,
+    created: Option<Created>,
+) -> Result<Vec<Value>, String> {
     let tip = tip_lamports(r).map_err(|_| "invalid normalized tipAmount")?;
-    let associated = pk(PROGRAMS[2])?;
-    let ata_count = message
-        .instructions
-        .iter()
-        .filter(|ix| message.keys.get(ix.program) == Some(&associated))
-        .count() as u64;
-    let account_rent = ata_count
-        .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
-        .ok_or("account rent allowance exceeds u64")?;
+    let account_rent = match created {
+        Some(created) => created.lamports,
+        None => {
+            let associated = pk(PROGRAMS[2])?;
+            (message
+                .instructions
+                .iter()
+                .filter(|ix| message.keys.get(ix.program) == Some(&associated))
+                .count() as u64)
+                .checked_mul(ATA_RENT_ALLOWANCE_LAMPORTS)
+                .ok_or("account rent allowance exceeds u64")?
+        }
+    };
     let mut effects = match a {
         Action::Buy => {
             // The requested amount plus slippage, not the builder's quote:
@@ -2041,15 +2060,145 @@ fn transaction_fee(
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
 }
-fn simulate(tx: &str) -> Result<(), DispatchResponse> {
+/// Accounts the transaction creates and the rent they hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Created {
+    count: u64,
+    lamports: u64,
+}
+
+/// Simulate the unsigned transaction and read back the post-transaction
+/// state of `addresses`. Returns the simulation's own result and, for each
+/// address, its lamports afterwards (`None` if it does not exist).
+fn simulate_accounts(
+    tx: &str,
+    addresses: &[String],
+) -> Result<(Value, Vec<Option<u64>>), DispatchResponse> {
     let v = post(
         RPC,
         &rpc(
             "simulateTransaction",
-            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":COMMITMENT}]),
+            json!([tx,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":COMMITMENT,"accounts":{"encoding":"base64","addresses":addresses}}]),
         ),
     )?;
-    simulation_result(&v).map_err(fail)
+    if v.pointer("/result/value/err")
+        .is_some_and(|err| !err.is_null())
+    {
+        return Ok((v, Vec::new()));
+    }
+    let accounts = v
+        .pointer("/result/value/accounts")
+        .and_then(Value::as_array)
+        .filter(|accounts| accounts.len() == addresses.len())
+        .ok_or_else(|| fail("Solana RPC omitted the simulated accounts"))?
+        .iter()
+        .map(|account| {
+            if account.is_null() {
+                Ok(None)
+            } else {
+                account
+                    .get("lamports")
+                    .and_then(Value::as_u64)
+                    .map(Some)
+                    .ok_or_else(|| fail("Solana RPC returned a simulated account without lamports"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((v, accounts))
+}
+
+/// The accounts this transaction would create and the rent it would put in
+/// them. Pump's program creates some itself, such as the per-user volume
+/// account on a first buy, so the builder's instructions do not show them:
+/// every writable account that does not exist yet is simulated, and whatever
+/// it holds afterwards is what the trade spends on it. A simulation that
+/// fails measures nothing; signing then runs its own simulation and refuses
+/// a transaction that spends more than was declared.
+fn created_accounts(tx: &str, parsed: &Msg) -> Result<Created, DispatchResponse> {
+    let mut candidates = Vec::new();
+    for index in 1..parsed.keys.len() {
+        let address = bs58::encode(parsed.keys[index]).into_string();
+        if parsed.writable(index) && !candidates.contains(&address) {
+            candidates.push(address);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(Created::default());
+    }
+    let existing = post(
+        RPC,
+        &rpc(
+            "getMultipleAccounts",
+            json!([candidates, {"encoding":"base64","dataSlice":{"offset":0,"length":0},"commitment":COMMITMENT}]),
+        ),
+    )?;
+    let existing = existing
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == candidates.len())
+        .ok_or_else(|| fail("Solana RPC omitted the trade's accounts"))?;
+    let missing = candidates
+        .iter()
+        .zip(existing)
+        .filter(|(_, account)| account.is_null())
+        .map(|(address, _)| address.clone())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(Created::default());
+    }
+    let (_, after) = simulate_accounts(tx, &missing)?;
+    Ok(after
+        .iter()
+        .flatten()
+        .fold(Created::default(), |total, lamports| Created {
+            count: total.count + 1,
+            lamports: total.lamports.saturating_add(*lamports),
+        }))
+}
+
+/// Everything the claim declares in native SOL: its native debits and fee.
+fn declared_native_total(debits: &[Value], fee: u64) -> Result<u128, String> {
+    debits
+        .iter()
+        .filter(|debit| debit.pointer("/asset/asset").and_then(Value::as_str) == Some("native"))
+        .try_fold(u128::from(fee), |total, debit| {
+            debit
+                .get("amount")
+                .and_then(Value::as_str)
+                .and_then(|amount| amount.parse::<u128>().ok())
+                .map(|amount| total + amount)
+                .ok_or_else(|| "declared debit amount is invalid".to_owned())
+        })
+}
+
+/// Simulate the unsigned transaction and refuse it unless it succeeds and
+/// takes no more SOL from the trading account than the claim declares. The
+/// Broker holds the approval to what the claim declares, and cannot see what
+/// a program does inside the transaction; this is where that is checked.
+fn simulate_within(tx: &str, payer: &str, declared: u128) -> Result<(), DispatchResponse> {
+    let before = post(
+        RPC,
+        &rpc("getBalance", json!([payer, {"commitment":COMMITMENT}])),
+    )?
+    .pointer("/result/value")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| fail("Solana RPC omitted the trading account's balance"))?;
+    let (v, after) = simulate_accounts(tx, &[payer.to_owned()])?;
+    simulation_result(&v).map_err(fail)?;
+    let after = after
+        .first()
+        .copied()
+        .flatten()
+        .ok_or_else(|| fail("Solana RPC omitted the trading account's simulated balance"))?;
+    let spent = before.saturating_sub(after);
+    if u128::from(spent) > declared {
+        return Err(fail(format!(
+            "simulation failed: the transaction takes {} from the trading account, more than the {} declared for approval",
+            lamports_display(spent),
+            lamports_display(u64::try_from(declared).unwrap_or(u64::MAX))
+        )));
+    }
+    Ok(())
 }
 fn simulation_result(v: &Value) -> Result<(), String> {
     match v.pointer("/result/value/err") {
@@ -3107,6 +3256,7 @@ mod tests {
             &parsed,
             5_000,
             5_000,
+            Created::default(),
             Some(6),
         )
         .unwrap();
@@ -3172,6 +3322,7 @@ mod tests {
             &parsed,
             5_000,
             5_000,
+            Created::default(),
             None,
         )
         .unwrap()
@@ -3270,7 +3421,7 @@ mod tests {
             json!({"mint":BOND_MINT,"tokenAccount":token_account,"maxLamports":"2100000"}),
         );
         assert_eq!(
-            effects(Action::CloseTokenAccount, &request, &parsed).unwrap(),
+            effects(Action::CloseTokenAccount, &request, &parsed, None).unwrap(),
             vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":"2100000"})]
         );
 
@@ -3543,6 +3694,7 @@ mod tests {
     /// broadcast.
     fn host_serving_a_buy() -> FakeHost {
         let mut host = FakeHost::new(NOW_MS);
+        host.chain.payer = USER.to_owned();
         host.seed_vfs(
             &format!("wallets/{WALLET}/0/address.sol"),
             &format!("{USER}\n"),
@@ -5072,10 +5224,11 @@ mod tests {
                 &parsed,
                 5_000,
                 5_000,
+                Created::default(),
                 live_decimals,
             )
             .unwrap_or_else(|error| panic!("{label}: review: {error}"));
-            let debits = effects(action, &normalized, &parsed)
+            let debits = effects(action, &normalized, &parsed, None)
                 .unwrap_or_else(|error| panic!("{label}: effects: {error}"));
             let destinations = destinations(action, &parsed);
 
@@ -5443,5 +5596,73 @@ mod tests {
             );
             assert_eq!(declared[0], local_fee_floor(&builder, &request).unwrap());
         });
+    }
+
+    /// On a first trade Pump's program creates accounts of its own, paid from
+    /// the trading account and invisible in the builder's instructions. On
+    /// mainnet a first buy's review promised 0.004255 SOL and the trade took
+    /// 0.004865: a volume-rewards account nobody had counted. Whatever the
+    /// simulated transaction puts in accounts that did not exist is now
+    /// declared, reviewed and held to the approval.
+    #[test]
+    fn rent_for_every_account_a_trade_creates_is_declared_and_reviewed() {
+        let token_account = "CtWhHwZsCqNjuvAUSaMmLZirhJb3ygvbMFow5tTbMCBn";
+        let pump_account = "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7";
+        let mut host = host_serving_a_buy();
+        for (address, rent) in [(token_account, 1_513_840), (pump_account, 1_346_200)] {
+            host.chain.missing.insert(address.to_owned());
+            host.chain.created.insert(address.to_owned(), rent);
+        }
+        fake_host::install(host);
+        assert_eq!(run_buy("buy-first", false), DispatchResponse::Write);
+        let review = public_operation("buy-first")["review"].to_string();
+        assert!(
+            review.contains("Rent for 2 new account(s) this creates: 0.00286004 SOL"),
+            "{review}"
+        );
+        fake_host::with(|host| {
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            let mut request: Map<String, Value> =
+                serde_json::from_slice(&buy_body("buy-first", false)).unwrap();
+            request.remove("operationId");
+            normalize(Action::Buy, USER, &mut request).unwrap();
+            let trade = u64::try_from(max_buy_lamports(&request).unwrap()).unwrap();
+            assert_eq!(
+                claim["declared_debits"][0]["amount"],
+                json!((trade + 2_860_040).to_string())
+            );
+            let simulated = host.calls_for("simulateTransaction");
+            let measured = simulated[0].rpc_params().unwrap()[1]["accounts"]["addresses"]
+                .as_array()
+                .unwrap();
+            assert_eq!(measured, &vec![json!(token_account), json!(pump_account)]);
+        });
+    }
+
+    /// The Broker holds the approval to what the claim declares and cannot
+    /// see inside the transaction. So the last simulation before signing
+    /// reads the trading account's balance afterwards, and a transaction that
+    /// would take more than was declared is never signed.
+    #[test]
+    fn a_transaction_that_spends_more_than_declared_is_never_signed() {
+        let mut host = host_serving_a_buy();
+        host.chain.spend = 50_000_000;
+        fake_host::install(host);
+        let response = run_buy("buy-overspend", false);
+        let message = dispatch_message(&response);
+        assert!(message.contains("more than the"), "{message}");
+        fake_host::with(|host| {
+            assert!(host.sign_requests.is_empty());
+            assert!(host.calls_for("sendTransaction").is_empty());
+        });
+        assert_eq!(
+            public_operation("buy-overspend")["status"],
+            json!("preflight_failed")
+        );
+
+        // Within what was declared, it signs.
+        fake_host::with(|host| host.chain.spend = 1_000_000);
+        assert_eq!(run_buy("buy-overspend", false), DispatchResponse::Write);
     }
 }

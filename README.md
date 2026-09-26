@@ -8,7 +8,8 @@ of the Bloom account they already selected. There is **no session key, no
 separate wallet, no funding transfer and no standing budget.** An agent can
 propose a trade; only the owner can authorize one. The approval covers one
 operation of that kind, capped at the SOL ceiling the ceremony shows: the
-requested amount plus slippage, token-account rent, tip and network fee. After
+requested amount plus slippage, rent for every account the trade creates, tip
+and the network fee cap. After
 the owner approves, the Petal rebuilds the transaction with a fresh blockhash
 and signs it under that approval, because a blockhash lives about a minute and
 a ceremony can take most of it. The approval is scoped to this package, route,
@@ -28,9 +29,17 @@ What the owner sees before approving comes from the transaction itself, read
 back out of the bytes that were just validated: the trading account, the token,
 **the maximum the trade can spend** (or, for a sell, the amount sold and the
 least SOL the instruction may return), the tokens a buy names, the network fee,
-any rent for new token accounts, any Jito tip, and for a buy the worst-case
-total. These figures are the Petal's and are labelled as such — Bloom does not
-independently re-derive them.
+rent for every account the trade creates, any Jito tip, and for a buy the
+worst-case total. These figures are the Petal's and are labelled as such —
+Bloom does not independently re-derive them.
+
+Rent is measured, not estimated. Pump's program creates accounts the builder's
+instructions never mention — a first buy also opens a per-user volume-rewards
+account, about 0.00135 SOL — so the Petal asks which of the trade's writable
+accounts do not exist yet and simulates the transaction to see what each would
+hold. The last simulation before signing also reads the trading account's
+balance afterwards, and a transaction that would take more SOL than the claim
+declares is refused unsigned.
 
 ## Route tree
 
