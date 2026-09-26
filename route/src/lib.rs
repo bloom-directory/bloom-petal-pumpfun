@@ -14,6 +14,11 @@ const MAX: usize = 131072;
 const MAX_TX: usize = 1232;
 const MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000_000;
 const ATA_RENT_ALLOWANCE_LAMPORTS: u64 = 2_100_000;
+/// The most a trade may slip. Slippage is what a sandwich can take: on a buy
+/// the owner can pay this much more for the same tokens, and on a sell accept
+/// this much less. Past it a trade fails and can be retried, which costs a
+/// network fee, not a tenth of the position.
+const MAX_SLIPPAGE_PCT: f64 = 10.0;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const RPC: &str = "https://rpc.solanatracker.io/public";
@@ -1353,9 +1358,14 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             pk(&mint).map_err(bad)?;
             let amount = number(r, "amount", 1)?;
             number(r, "minOutputAmount", 1)?;
-            let slip = r.get("slippagePct").and_then(Value::as_f64).unwrap_or(2.0);
-            if !slip.is_finite() || !(0.0..=50.0).contains(&slip) {
-                return Err(bad("slippagePct must be 0..=50"));
+            let slip = match r.get("slippagePct") {
+                None => 2.0,
+                Some(value) => value
+                    .as_f64()
+                    .ok_or_else(|| bad("slippagePct must be a number"))?,
+            };
+            if !slip.is_finite() || !(0.0..=MAX_SLIPPAGE_PCT).contains(&slip) {
+                return Err(bad(format!("slippagePct must be 0..={MAX_SLIPPAGE_PCT}")));
             }
             r.insert(
                 "slippagePct".into(),
@@ -5097,5 +5107,32 @@ mod tests {
                 "{count} signatures for one payload"
             );
         }
+    }
+
+    #[test]
+    fn slippage_is_capped_and_must_be_a_number() {
+        let request = |slip: Value| {
+            let mut r = json!({"mint":BOND_MINT,"amount":"1000000","minOutputAmount":"1"});
+            r["slippagePct"] = slip;
+            r.as_object().unwrap().clone()
+        };
+        for ok in [json!(0), json!(2), json!(10)] {
+            assert!(
+                normalize(Action::Buy, USER, &mut request(ok.clone())).is_ok(),
+                "{ok}"
+            );
+        }
+        for refused in [json!(10.01), json!(50), json!(-1), json!("20")] {
+            assert!(
+                normalize(Action::Sell, USER, &mut request(refused.clone())).is_err(),
+                "{refused}"
+            );
+        }
+        let mut defaulted = json!({"mint":BOND_MINT,"amount":"1","minOutputAmount":"1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        normalize(Action::Buy, USER, &mut defaulted).unwrap();
+        assert_eq!(defaulted["slippagePct"], json!(2.0));
     }
 }

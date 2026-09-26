@@ -70,6 +70,9 @@ Optional request fields follow Pump's official agent API: `slippagePct`,
 `frontRunningProtection` and `tipAmount`. A Pump buy instruction names a token
 amount and a ceiling on the SOL in, and in every measured case `slippagePct`
 raised only that ceiling: the tolerance is on what the trade spends.
+`slippagePct` defaults to 2 and may not exceed 10: slippage is what a
+sandwich can take, and a trade that fails at 10% costs a network fee, not a
+tenth of the position.
 `SETUP.md` has the measurements, and their limits.
 
 Protected writes are sent only to Jito; ordinary writes use the declared public

@@ -169,7 +169,8 @@ So the tolerance is on what the trade spends. The pool can move against the
 owner between building and landing, and the program pays what the curve now
 asks, up to that ceiling; past it the trade fails rather than pay more, which
 is what both failed simulations in that run showed at the 2% default.
-A wider `slippagePct` buys the same tokens and risks more SOL.
+A wider `slippagePct` buys the same tokens and risks more SOL, which is why it
+is capped at 10.
 
 That is why the maximum spend is the figure the review states first and totals
 at the end: it is what can change after the owner has read it.
