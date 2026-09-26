@@ -24,6 +24,10 @@ const MAX_SLIPPAGE_PCT: f64 = 10.0;
 /// 0.001 SOL of priority, which doubles the cost of a small trade; recent
 /// fees on a trade's own accounts are usually far lower.
 const MIN_COMPUTE_UNIT_PRICE: u64 = 100_000;
+/// What a sell's floor may leave for Pump's own fees, in basis points, on
+/// top of the requested slippage. Measured on 26 September 2026: 125 on the
+/// bonding curve and 85 on PumpSwap.
+const SELL_FEE_ALLOWANCE_BPS: u128 = 200;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const RPC: &str = "https://rpc.solanatracker.io/public";
@@ -497,6 +501,9 @@ fn build_pending(
     let parsed = validate_tx(&tx, user, a, request, &response)?;
     let builder_fee = local_fee_floor(&parsed, request).map_err(fail)?;
     let (tx, parsed) = economize(tx, parsed, request)?;
+    if matches!(a, Action::Sell) {
+        verify_sell_floor(&parsed, request)?;
+    }
     let created = created_accounts(&tx, &parsed)?;
     let raw = B64
         .decode(&tx)
@@ -2060,6 +2067,148 @@ fn transaction_fee(
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
 }
+/// Refuse a sell whose floor the chain does not support. The builder sets
+/// the least SOL a sell may return, and the program enforces only that
+/// figure, so a builder that set it low would hand the difference to anyone
+/// who moves the price first. The Petal prices the sell itself from the
+/// curve's or pool's reserves and requires the floor to be at least that,
+/// less Pump's fees and the requested slippage.
+fn verify_sell_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), DispatchResponse> {
+    let pump = pk(PROGRAMS[5]).map_err(fail)?;
+    let amm = pk(PROGRAMS[6]).map_err(fail)?;
+    let mint = pk(request_text(request, "inputMint").map_err(fail)?).map_err(fail)?;
+    let ix = message
+        .instructions
+        .iter()
+        .find(|ix| {
+            has_discriminator(ix, IX_SELL)
+                && matches!(message.keys.get(ix.program), Some(p) if *p == pump || *p == amm)
+        })
+        .ok_or_else(|| fail("sell instruction missing"))?;
+    let sold = u128::from(instruction_u64(ix, 8).map_err(fail)?);
+    let floor = u128::from(instruction_u64(ix, 16).map_err(fail)?);
+    let (token_reserve, sol_reserve) = if message.keys.get(ix.program) == Some(&pump) {
+        curve_reserves(message, ix, &mint)?
+    } else {
+        pool_reserves(message, ix, &mint)?
+    };
+    let fair = sold * sol_reserve / (token_reserve + sold).max(1);
+    let slippage = request
+        .get("slippagePct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let slippage_millionths = (slippage * 1_000_000.0).ceil() as u128;
+    let least = fair * (10_000 - SELL_FEE_ALLOWANCE_BPS) / 10_000
+        * (100_000_000 - slippage_millionths.min(100_000_000))
+        / 100_000_000;
+    if floor < least {
+        return Err(fail(format!(
+            "unsafe builder transaction: it may return as little as {}, but the chain prices this sell at {} and allows at least {} after fees and slippage",
+            lamports_display(u64::try_from(floor).unwrap_or(u64::MAX)),
+            lamports_display(u64::try_from(fair).unwrap_or(u64::MAX)),
+            lamports_display(u64::try_from(least).unwrap_or(u64::MAX)),
+        )));
+    }
+    Ok(())
+}
+fn request_text<'a>(request: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
+    request
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("normalized {field} missing"))
+}
+fn account_data(address: &[u8; 32], owner: &[u8; 32]) -> Result<Vec<u8>, DispatchResponse> {
+    let address = bs58::encode(address).into_string();
+    let v = post(
+        RPC,
+        &rpc(
+            "getAccountInfo",
+            json!([address, {"encoding":"base64","commitment":COMMITMENT}]),
+        ),
+    )?;
+    if v.pointer("/result/value/owner").and_then(Value::as_str)
+        != Some(&bs58::encode(owner).into_string())
+    {
+        return Err(fail(format!(
+            "account {address} is missing or has an unexpected owner"
+        )));
+    }
+    v.pointer("/result/value/data/0")
+        .and_then(Value::as_str)
+        .and_then(|data| B64.decode(data).ok())
+        .ok_or_else(|| fail(format!("Solana RPC returned unreadable data for {address}")))
+}
+fn anchor_discriminator(name: &str) -> [u8; 8] {
+    let digest = Sha256::digest(format!("account:{name}").as_bytes());
+    digest[..8].try_into().expect("eight bytes")
+}
+fn u64_at(data: &[u8], offset: usize) -> Result<u128, DispatchResponse> {
+    data.get(offset..offset + 8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(|bytes| u128::from(u64::from_le_bytes(bytes)))
+        .ok_or_else(|| fail("account data is truncated"))
+}
+/// The bonding curve's virtual token and SOL reserves, read from the account
+/// the sell names, which must be the curve Pump derives for the mint and must
+/// not have graduated.
+fn curve_reserves(
+    message: &Msg,
+    ix: &Ix,
+    mint: &[u8; 32],
+) -> Result<(u128, u128), DispatchResponse> {
+    let pump = pk(PROGRAMS[5]).map_err(fail)?;
+    let curve = program_address(&[b"bonding-curve", mint], &pump).map_err(fail)?;
+    require_account(message, ix, 3, &curve, "sell bonding curve").map_err(fail)?;
+    let data = account_data(&curve, &pump)?;
+    if data.get(..8) != Some(&anchor_discriminator("BondingCurve")[..]) || data.get(48) != Some(&0)
+    {
+        return Err(fail("the bonding curve is not an active Pump curve"));
+    }
+    Ok((u64_at(&data, 8)?, u64_at(&data, 16)?))
+}
+/// The canonical pool's token and SOL balances. The pool account names its
+/// two vaults; the sell must use exactly those.
+fn pool_reserves(
+    message: &Msg,
+    ix: &Ix,
+    mint: &[u8; 32],
+) -> Result<(u128, u128), DispatchResponse> {
+    let amm = pk(PROGRAMS[6]).map_err(fail)?;
+    let pool = *account(message, ix, 0).map_err(fail)?;
+    let data = account_data(&pool, &amm)?;
+    let key_at = |offset: usize| -> Result<[u8; 32], DispatchResponse> {
+        data.get(offset..offset + 32)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| fail("pool account data is truncated"))
+    };
+    if data.get(..8) != Some(&anchor_discriminator("Pool")[..])
+        || key_at(43)? != *mint
+        || key_at(75)? != pk(SOL).map_err(fail)?
+    {
+        return Err(fail("the pool is not this coin's SOL pool"));
+    }
+    let (token_vault, sol_vault) = (key_at(139)?, key_at(171)?);
+    require_account(message, ix, 7, &token_vault, "pool token vault").map_err(fail)?;
+    require_account(message, ix, 8, &sol_vault, "pool SOL vault").map_err(fail)?;
+    let vaults = [token_vault, sol_vault].map(|vault| bs58::encode(vault).into_string());
+    let v = post(
+        RPC,
+        &rpc(
+            "getMultipleAccounts",
+            json!([vaults, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
+        ),
+    )?;
+    let balance = |index: usize| -> Result<u128, DispatchResponse> {
+        v.pointer(&format!(
+            "/result/value/{index}/data/parsed/info/tokenAmount/amount"
+        ))
+        .and_then(Value::as_str)
+        .and_then(|amount| amount.parse().ok())
+        .ok_or_else(|| fail("Solana RPC omitted a pool vault balance"))
+    };
+    Ok((balance(0)?, balance(1)?))
+}
+
 /// Accounts the transaction creates and the rent they hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Created {
@@ -5664,5 +5813,110 @@ mod tests {
         // Within what was declared, it signs.
         fake_host::with(|host| host.chain.spend = 1_000_000);
         assert_eq!(run_buy("buy-overspend", false), DispatchResponse::Write);
+    }
+
+    fn sell_message(name: &str, sold: u64, floor: u64) -> Msg {
+        let raw = B64
+            .decode(fixture(name)["transaction"].as_str().unwrap())
+            .unwrap();
+        let mut parsed = message(envelope(&raw).unwrap().message).unwrap();
+        append_lookup_addresses(&mut parsed, &test_lookup_tables()).unwrap();
+        let ix = parsed
+            .instructions
+            .iter_mut()
+            .find(|ix| has_discriminator(ix, IX_SELL))
+            .unwrap();
+        ix.data[8..16].copy_from_slice(&sold.to_le_bytes());
+        ix.data[16..24].copy_from_slice(&floor.to_le_bytes());
+        parsed
+    }
+
+    fn curve_account(virtual_tokens: u64, virtual_sol: u64, complete: bool) -> Value {
+        let mut data = anchor_discriminator("BondingCurve").to_vec();
+        for value in [virtual_tokens, virtual_sol, 0, 0, 0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.push(u8::from(complete));
+        json!({"result":{"value":{"owner":PROGRAMS[5],"data":[B64.encode(data),"base64"]}}})
+    }
+
+    /// Reserves, sale and builder floor from a mainnet sale on 26 September
+    /// 2026: the chain prices it at 987,587 lamports before Pump's 1.25% fee,
+    /// and the builder's 2% floor was 955,737.
+    #[test]
+    fn a_bonding_curve_sell_floor_is_checked_against_the_curve() {
+        let request = normalized(
+            Action::Sell,
+            json!({"mint":BOND_MINT,"amount":"35323464136","minOutputAmount":"1","slippagePct":2}),
+        );
+        let check = |floor: u64, complete: bool| {
+            let mut host = FakeHost::new(NOW_MS);
+            host.reply(
+                &format!("{RPC} getAccountInfo"),
+                curve_account(1_072_993_493_000_000, 30_000_182_059, complete),
+            );
+            fake_host::install(host);
+            verify_sell_floor(&sell_message("sell_bond", 35_323_464_136, floor), &request)
+        };
+        assert!(check(955_737, false).is_ok());
+        let low = dispatch_message(&check(900_000, false).unwrap_err());
+        assert!(
+            low.contains("chain prices this sell at 0.000987587 SOL"),
+            "{low}"
+        );
+        assert!(
+            check(955_737, true).is_err(),
+            "a graduated curve is not priced"
+        );
+    }
+
+    /// Pool reserves, sale and builder floor from a mainnet PumpSwap quote on
+    /// 26 September 2026: 21,178,473 lamports before the 0.85% fee, and a 2%
+    /// floor of 20,578,486.
+    #[test]
+    fn a_pool_sell_floor_is_checked_against_the_pools_vaults() {
+        let request = normalized(
+            Action::Sell,
+            json!({"mint":AMM_MINT,"amount":"1000000000","minOutputAmount":"1","slippagePct":2}),
+        );
+        let parsed = sell_message("sell_amm", 1_000_000_000, 0);
+        let ix = parsed
+            .instructions
+            .iter()
+            .find(|ix| has_discriminator(ix, IX_SELL))
+            .unwrap();
+        let vaults = [7, 8].map(|position| *account(&parsed, ix, position).unwrap());
+        let pool = |mint: &str, vaults: [[u8; 32]; 2]| {
+            let mut data = anchor_discriminator("Pool").to_vec();
+            data.resize(43, 0);
+            data.extend_from_slice(&pk(mint).unwrap());
+            data.extend_from_slice(&pk(SOL).unwrap());
+            data.extend_from_slice(&[0; 32]);
+            data.extend_from_slice(&vaults[0]);
+            data.extend_from_slice(&vaults[1]);
+            data.resize(300, 0);
+            json!({"result":{"value":{"owner":PROGRAMS[6],"data":[B64.encode(data),"base64"]}}})
+        };
+        let balances = json!({"result":{"value":[
+            {"data":{"parsed":{"info":{"tokenAmount":{"amount":"28437407161069"}}}}},
+            {"data":{"parsed":{"info":{"tokenAmount":{"amount":"602282052890"}}}}}
+        ]}});
+        let check = |floor: u64, pool_account: Value| {
+            let mut host = FakeHost::new(NOW_MS);
+            host.reply(&format!("{RPC} getAccountInfo"), pool_account);
+            host.reply(&format!("{RPC} getMultipleAccounts"), balances.clone());
+            fake_host::install(host);
+            verify_sell_floor(&sell_message("sell_amm", 1_000_000_000, floor), &request)
+        };
+        assert!(check(20_578_486, pool(AMM_MINT, vaults)).is_ok());
+        assert!(check(19_000_000, pool(AMM_MINT, vaults)).is_err());
+        assert!(
+            check(20_578_486, pool(BOND_MINT, vaults)).is_err(),
+            "another coin's pool"
+        );
+        assert!(
+            check(20_578_486, pool(AMM_MINT, [vaults[1], vaults[0]])).is_err(),
+            "vaults the sell does not use"
+        );
     }
 }

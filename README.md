@@ -41,6 +41,12 @@ hold. The last simulation before signing also reads the trading account's
 balance afterwards, and a transaction that would take more SOL than the claim
 declares is refused unsigned.
 
+A sell's floor — the least SOL it may return — is the builder's figure, and the
+program enforces only that. The Petal prices every sell itself from the
+bonding curve's or the pool's reserves on chain and refuses a floor below that
+price less 2% for Pump's fees (measured at 1.25% on the curve and 0.85% on
+PumpSwap) and the requested slippage.
+
 ## Route tree
 
 ```text
