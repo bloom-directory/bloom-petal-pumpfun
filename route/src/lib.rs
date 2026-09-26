@@ -30,6 +30,9 @@ const MIN_COMPUTE_UNIT_PRICE: u64 = 100_000;
 const SELL_FEE_ALLOWANCE_BPS: u128 = 200;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
+const COIN_LISTINGS: &str = "https://frontend-api-v3.pump.fun/coins";
+/// Most coins a discovery file lists.
+const LISTING_LIMIT: usize = 50;
 const RPC: &str = "https://rpc.solanatracker.io/public";
 const RPC_VERIFY: &str = "https://api.mainnet-beta.solana.com";
 const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";
@@ -2000,6 +2003,91 @@ fn probe_builder() -> BuilderCheck {
         },
     }
 }
+/// Which Pump listing a discovery file reads.
+#[derive(Clone, Copy)]
+pub enum Listing {
+    /// The newest launches, newest first.
+    New,
+    /// Coins whose creator is streaming now.
+    Live,
+}
+
+/// A discovery file: Pump's listing projected to the fields a trader needs,
+/// without banned or NSFW coins. Names and symbols are chosen by whoever
+/// launched the coin, are not unique, and are text an agent will read, so
+/// they are stripped of control, zero-width and direction-changing characters
+/// and shortened; a trade names the mint, never the name.
+pub fn coins(listing: Listing) -> DispatchResponse {
+    let (url, description) = match listing {
+        Listing::New => (
+            format!(
+                "{COIN_LISTINGS}?offset=0&limit={LISTING_LIMIT}&sort=created_timestamp&order=DESC&includeNsfw=false"
+            ),
+            "Newest Pump.fun launches, newest first",
+        ),
+        Listing::Live => (
+            format!(
+                "{COIN_LISTINGS}/currently-live?offset=0&limit={LISTING_LIMIT}&includeNsfw=false"
+            ),
+            "Pump.fun coins whose creator is streaming now",
+        ),
+    };
+    match fetch("GET", url, vec![]) {
+        Ok(v) => petal::read_json_value(&json!({
+            "description": description,
+            "note": "Names and symbols are chosen by the coin's creator and are not unique. Trade by mint, and read coins/<mint>.json first.",
+            "coins": project_listing(&v),
+        })),
+        Err(e) => e,
+    }
+}
+
+fn project_listing(v: &Value) -> Vec<Value> {
+    let text = |coin: &Value, field: &str, max: usize| -> String {
+        coin.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| {
+                !c.is_control()
+                    && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+            })
+            .take(max)
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    };
+    v.as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|coin| {
+            coin.get("is_banned").and_then(Value::as_bool) != Some(true)
+                && coin.get("nsfw").and_then(Value::as_bool) != Some(true)
+        })
+        .filter_map(|coin| {
+            let mint = coin.get("mint").and_then(Value::as_str)?;
+            pk(mint).ok()?;
+            Some(json!({
+                "mint": mint,
+                "name": text(coin, "name", 48),
+                "symbol": text(coin, "symbol", 16),
+                "createdMs": coin.get("created_timestamp").and_then(Value::as_u64),
+                "lastTradeMs": coin.get("last_trade_timestamp").and_then(Value::as_u64),
+                "marketCapSol": coin.get("market_cap").and_then(Value::as_f64),
+                "marketCapUsd": coin
+                    .get("usd_market_cap")
+                    .or_else(|| coin.get("market_cap_usd"))
+                    .and_then(Value::as_f64),
+                "graduated": coin.get("complete").and_then(Value::as_bool).unwrap_or(false),
+                "replies": coin.get("reply_count").and_then(Value::as_u64),
+                "creator": coin.get("creator").and_then(Value::as_str).filter(|c| pk(c).is_ok()),
+            }))
+        })
+        .take(LISTING_LIMIT)
+        .collect()
+}
+
 pub fn coin(m: &str) -> DispatchResponse {
     if pk(m).is_err() {
         return bad("invalid mint");
@@ -5918,5 +6006,59 @@ mod tests {
             check(20_578_486, pool(AMM_MINT, [vaults[1], vaults[0]])).is_err(),
             "vaults the sell does not use"
         );
+    }
+
+    #[test]
+    fn a_listing_drops_banned_and_nsfw_coins_and_cleans_creator_text() {
+        let listing = json!([
+            {"mint": BOND_MINT, "name": "Good\u{202E}coin\u{0007}", "symbol": "GOOD\u{200B}",
+             "created_timestamp": 5, "market_cap": 30.5, "usd_market_cap": 5000.0,
+             "complete": false, "reply_count": 3, "creator": USER},
+            {"mint": AMM_MINT, "name": "banned", "symbol": "B", "is_banned": true},
+            {"mint": AMM_MINT, "name": "nsfw", "symbol": "N", "nsfw": true},
+            {"mint": "not-a-mint", "name": "bad", "symbol": "X"},
+            {"mint": AMM_MINT, "name": "x".repeat(200), "symbol": "LONGSYMBOLLONGSYMBOL", "complete": true}
+        ]);
+        let coins = project_listing(&listing);
+        assert_eq!(coins.len(), 2);
+        assert_eq!(coins[0]["name"], json!("Goodcoin"));
+        assert_eq!(coins[0]["symbol"], json!("GOOD"));
+        assert_eq!(coins[0]["marketCapSol"], json!(30.5));
+        assert_eq!(coins[0]["creator"], json!(USER));
+        assert_eq!(coins[1]["name"].as_str().unwrap().chars().count(), 48);
+        assert_eq!(coins[1]["symbol"], json!("LONGSYMBOLLONGSY"));
+        assert_eq!(coins[1]["graduated"], json!(true));
+    }
+
+    #[test]
+    fn discovery_reads_only_pumps_listing_endpoints() {
+        let mut host = FakeHost::new(NOW_MS);
+        let new = format!(
+            "{COIN_LISTINGS}?offset=0&limit={LISTING_LIMIT}&sort=created_timestamp&order=DESC&includeNsfw=false"
+        );
+        let live = format!(
+            "{COIN_LISTINGS}/currently-live?offset=0&limit={LISTING_LIMIT}&includeNsfw=false"
+        );
+        host.reply(
+            &new,
+            json!([{"mint": BOND_MINT, "name": "n", "symbol": "N"}]),
+        );
+        host.reply(
+            &live,
+            json!([{"mint": AMM_MINT, "name": "l", "symbol": "L"}]),
+        );
+        fake_host::install(host);
+        for (listing, mint) in [(Listing::New, BOND_MINT), (Listing::Live, AMM_MINT)] {
+            let body = match coins(listing) {
+                DispatchResponse::Read(bytes) => bytes,
+                other => panic!("{other:?}"),
+            };
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["coins"][0]["mint"], json!(mint));
+        }
+        fake_host::with(|host| {
+            assert!(host.calls.iter().all(|c| c.method == "GET"));
+            assert!(host.calls.iter().all(|c| c.url.starts_with(COIN_LISTINGS)));
+        });
     }
 }

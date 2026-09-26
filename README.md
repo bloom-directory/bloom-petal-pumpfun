@@ -51,11 +51,18 @@ PumpSwap) and the requested slippage.
 
 ```text
 status.json
+coins/new.json
+coins/live.json
 coins/<mint>.json
 trade/<wallet>/preflight.json
 trade/<wallet>/{buy,sell,close_token_account}.json
 trade/<wallet>/operations/<operationId>.json
 ```
+
+`coins/new.json` lists the newest launches and `coins/live.json` the coins whose
+creator is streaming, up to 50 each, without banned or NSFW coins. Names and
+symbols are the creator's own text, not unique, and cleaned of control and
+direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
 
 Bloom mounts Petals only at `petals/`, so `<wallet>` is the wallet id in the
 path and the account is the one Bloom injects — account 0 on current Bloom.

@@ -28,7 +28,7 @@ paths = ["/agents/swap"]
 binding = "coins"
 host = "frontend-api-v3.pump.fun"
 methods = ["get"]
-paths = ["/coins-v2/*"]
+paths = ["/coins-v2/*", "/coins", "/coins/currently-live"]
 
 [[net.allow]]
 binding = "solana"
