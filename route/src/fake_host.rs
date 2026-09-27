@@ -17,7 +17,7 @@ use petal::{HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, SdkError,
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One HTTP request the route made, as the host saw it.
 #[derive(Clone, Debug)]
@@ -59,12 +59,35 @@ pub struct FakeHost {
     /// Make every store write after this many successful writes fail, to model
     /// a process that dies between a host effect and its durable record.
     pub fail_store_after: Option<usize>,
+    /// Account state behind `getMultipleAccounts`, `getBalance` and a
+    /// simulation's post-transaction accounts, when no reply is scripted.
+    pub chain: Chain,
+}
+
+/// Just enough account state to answer what a trade asks about its
+/// accounts: which do not exist yet, what the simulated transaction leaves in
+/// the ones it creates, and what it takes from the payer.
+#[derive(Default)]
+pub struct Chain {
+    pub payer: String,
+    pub balance: u64,
+    /// Lamports the simulated transaction takes from the payer.
+    pub spend: u64,
+    pub missing: BTreeSet<String>,
+    /// Lamports a created account holds after the simulated transaction.
+    pub created: BTreeMap<String, u64>,
+    /// What `getMultipleAccounts` returns for an address, when set.
+    pub accounts: BTreeMap<String, Value>,
 }
 
 impl FakeHost {
     pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms,
+            chain: Chain {
+                balance: 10_000_000_000,
+                ..Chain::default()
+            },
             ..Self::default()
         }
     }
@@ -172,7 +195,15 @@ impl FakeHost {
             Some(rpc) => format!("{} {}", call.url, rpc),
             None => call.url.clone(),
         };
+        let synthesized = if self.replies.contains_key(&key) {
+            None
+        } else {
+            self.synthesize(&call)
+        };
         self.calls.push(call);
+        if let Some(reply) = synthesized {
+            return Ok(json_response(&reply));
+        }
         let Some(replies) = self.replies.get(&key) else {
             return Err(SdkError::Message(format!(
                 "fake host: no reply scripted for {key}"
@@ -190,12 +221,80 @@ impl FakeHost {
                 self.calls.last().expect("the send was recorded"),
             ));
         }
-        let body = serde_json::to_vec(&reply).expect("reply serializes");
-        Ok(HttpResponse {
-            status: 200,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body,
-        })
+        if self.calls.last().and_then(Call::rpc_method) == Some("simulateTransaction") {
+            let call = self.calls.last().expect("recorded").clone();
+            self.fill_simulated_accounts(&call, &mut reply);
+        }
+        Ok(json_response(&reply))
+    }
+
+    fn account_view(&self, address: &str) -> Value {
+        if let Some(account) = self.chain.accounts.get(address) {
+            account.clone()
+        } else if self.chain.missing.contains(address) {
+            Value::Null
+        } else {
+            serde_json::json!({
+                "lamports": 1, "owner": "11111111111111111111111111111111",
+                "data": ["", "base64"], "executable": false, "space": 0
+            })
+        }
+    }
+
+    fn synthesize(&self, call: &Call) -> Option<Value> {
+        let params = call.rpc_params()?;
+        match call.rpc_method()? {
+            "getMultipleAccounts" => Some(serde_json::json!({"result": {"value": params[0]
+                .as_array()?
+                .iter()
+                .map(|address| self.account_view(address.as_str().unwrap_or_default()))
+                .collect::<Vec<_>>()}})),
+            "getBalance" => Some(serde_json::json!({"result": {"value": self.chain.balance}})),
+            _ => None,
+        }
+    }
+
+    /// A scripted simulation reply that says nothing about accounts gets the
+    /// requested accounts' post-transaction state from `chain`.
+    fn fill_simulated_accounts(&self, call: &Call, reply: &mut Value) {
+        let Some(addresses) = call
+            .rpc_params()
+            .and_then(|params| params.get(1))
+            .and_then(|config| config.pointer("/accounts/addresses"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let Some(value) = reply.pointer_mut("/result/value") else {
+            return;
+        };
+        if value.get("accounts").is_some() || !value.get("err").is_some_and(Value::is_null) {
+            return;
+        }
+        value["accounts"] = Value::Array(
+            addresses
+                .iter()
+                .map(|address| {
+                    let address = address.as_str().unwrap_or_default();
+                    if address == self.chain.payer {
+                        serde_json::json!({"lamports": self.chain.balance - self.chain.spend})
+                    } else {
+                        match self.chain.created.get(address) {
+                            Some(lamports) => serde_json::json!({"lamports": lamports}),
+                            None => Value::Null,
+                        }
+                    }
+                })
+                .collect(),
+        );
+    }
+}
+
+fn json_response(reply: &Value) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: serde_json::to_vec(reply).expect("reply serializes"),
     }
 }
 
