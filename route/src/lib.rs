@@ -2368,8 +2368,9 @@ fn full_balance(user: &str, mint: &str) -> Result<SellAll, DispatchResponse> {
     let owner = pk(user).map_err(fail)?;
     let mint_key = pk(mint).map_err(fail)?;
     let associated = pk(PROGRAMS[2]).map_err(fail)?;
+    // The primary RPC refuses getTokenAccountsByOwner; the verifying one serves it.
     let v = post(
-        RPC,
+        RPC_VERIFY,
         &rpc(
             "getTokenAccountsByOwner",
             json!([user, {"mint": mint}, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
@@ -2490,8 +2491,9 @@ pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
     };
     let mut tokens = Vec::new();
     for program in [PROGRAMS[3], PROGRAMS[4]] {
+        // The primary RPC refuses getTokenAccountsByOwner; the verifying one serves it.
         let v = match post(
-            RPC,
+            RPC_VERIFY,
             &rpc(
                 "getTokenAccountsByOwner",
                 json!([address, {"programId": program}, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
@@ -6361,7 +6363,7 @@ mod tests {
             curve_account(1_072_993_493_000_000, 30_000_182_059, false),
         );
         host.reply(
-            &format!("{RPC} getTokenAccountsByOwner"),
+            &format!("{RPC_VERIFY} getTokenAccountsByOwner"),
             json!({"result":{"value":[{"pubkey": token_account, "account": {
                 "owner": program, "lamports": 1_513_840,
                 "data": {"parsed": {"info": {"mint": BOND_MINT,
@@ -6453,7 +6455,7 @@ mod tests {
             (PROGRAMS[4], BOND_MINT, "35323464136"),
         ] {
             host.reply(
-                &format!("{RPC} getTokenAccountsByOwner"),
+                &format!("{RPC_VERIFY} getTokenAccountsByOwner"),
                 json!({"result":{"value":[{"pubkey": TOKEN_ACCOUNT, "account": {
                     "owner": program, "lamports": 2_039_280,
                     "data": {"parsed": {"info": {"mint": mint,
