@@ -93,9 +93,22 @@ Optional request fields follow Pump's official agent API: `slippagePct`,
 `frontRunningProtection` and `tipAmount`. A Pump buy instruction names a token
 amount and a ceiling on the SOL in, and in every measured case `slippagePct`
 raised only that ceiling: the tolerance is on what the trade spends.
-`slippagePct` defaults to 2 and may not exceed 10: slippage is what a
-sandwich can take, and a trade that fails at 10% costs a network fee, not a
-tenth of the position.
+`slippagePct` defaults to 1 and may not exceed 5. Slippage is what a sandwich
+or a sudden move can take. Measured on 27 September 2026 over 2-second
+windows, about how long a trade waits once approved, a wider tolerance buys
+few fills: on young coins the price either held or jumped 20% or more, so 1%
+failed 18% of the time and 10% still failed 15%; on larger curve coins 2%
+failed 20% and 5% failed 11%. A failed trade costs about 0.00013 SOL and a
+retry rebuilds at the new price.
+
+Swaps are protected by default. The builder adds Jito's don't-front account
+and a 0.00001 SOL tip (above the median landed tip), and the transaction is
+sent through Jito's block engine, which rejects any bundle that places a
+transaction ahead of it — how most sandwiches are built. It does not stop a
+validator outside Jito from reordering. `"frontRunningProtection":false` sends
+through the public RPC instead. `minOutputAmount` is optional: the Petal
+prices every sell against the chain and caps every buy's spend, and a floor
+the caller names is still enforced.
 
 Pump's builder always asks for about 0.001 SOL of priority, whatever the trade
 size. Unless the request sets `"priorityFee":"builder"`, the Petal lowers the
@@ -116,7 +129,9 @@ guarantee.
 holds under both token programs: mint, raw and display amount, rent, and
 whether it is empty.
 
-A sell may name `"amount":"all"`. When the transaction is built, the Petal
+A sell may name `"amount":"all"`, or a whole percentage such as `"50%"`,
+which sells that share of the balance rounded down and leaves the account
+open. When the transaction is built, the Petal
 reads the balance of the trading account's own associated token account for
 the mint, asks the builder to sell exactly that, and appends a `CloseAccount`
 for the emptied account, so its rent returns in the same transaction and the

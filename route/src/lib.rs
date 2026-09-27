@@ -14,11 +14,22 @@ const MAX: usize = 131072;
 const MAX_TX: usize = 1232;
 const MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000_000;
 const ATA_RENT_ALLOWANCE_LAMPORTS: u64 = 2_100_000;
-/// The most a trade may slip. Slippage is what a sandwich can take: on a buy
-/// the owner can pay this much more for the same tokens, and on a sell accept
-/// this much less. Past it a trade fails and can be retried, which costs a
-/// network fee, not a tenth of the position.
-const MAX_SLIPPAGE_PCT: f64 = 10.0;
+/// The most a trade may slip, and the default. Slippage is what a sandwich
+/// or a sudden move can take: on a buy the owner can pay this much more for
+/// the same tokens, and on a sell accept this much less. Measured on 27
+/// September 2026 over 2-second windows, which is about how long a trade
+/// waits once the owner approves: on coins under 30 SOL of market cap the
+/// price either did not move against a buyer or jumped 20% or more, so 1%
+/// failed 18% of the time and 10% still failed 15%; on larger curve coins 2%
+/// failed 20% and 5% failed 11%. A wider tolerance buys few fills and a lot
+/// of exposure, and a failed trade now costs about 0.00013 SOL to retry.
+const MAX_SLIPPAGE_PCT: f64 = 5.0;
+const DEFAULT_SLIPPAGE_PCT: f64 = 1.0;
+/// The Jito tip a protected trade pays unless the request names one: above
+/// the median landed tip on 27 September 2026 (0.0000075 SOL). Jito accepts
+/// nothing under 1,000 lamports.
+const DEFAULT_TIP_LAMPORTS: u64 = 10_000;
+const MIN_JITO_TIP_LAMPORTS: u64 = 1_000;
 /// The least a trade offers per compute unit, in micro-lamports, unless the
 /// request keeps the builder's price. Pump's builder always asks for about
 /// 0.001 SOL of priority, which doubles the cost of a small trade; recent
@@ -26,8 +37,8 @@ const MAX_SLIPPAGE_PCT: f64 = 10.0;
 const MIN_COMPUTE_UNIT_PRICE: u64 = 100_000;
 /// What a sell's floor may leave for Pump's own fees, in basis points, on
 /// top of the requested slippage. Measured on 26 September 2026: 125 on the
-/// bonding curve and 85 on PumpSwap.
-const SELL_FEE_ALLOWANCE_BPS: u128 = 200;
+/// bonding curve and 85 on PumpSwap; the rest is rounding headroom.
+const SELL_FEE_ALLOWANCE_BPS: u128 = 150;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const COIN_LISTINGS: &str = "https://frontend-api-v3.pump.fun/coins";
@@ -495,15 +506,17 @@ fn build_pending(
     if matches!(a, Action::CloseTokenAccount) {
         return build_close_token_account_pending(trader, request, digest);
     }
-    let sell_all = if matches!(a, Action::Sell)
-        && request.get("amount").and_then(Value::as_str) == Some("all")
+    let sell_all = match request
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(sell_share)
     {
-        Some(full_balance(
+        Some(pct) if matches!(a, Action::Sell) => Some(balance_share(
             user,
             request_text(request, "inputMint").map_err(fail)?,
-        )?)
-    } else {
-        None
+            pct,
+        )?),
+        _ => None,
     };
     let resolved;
     let request = match &sell_all {
@@ -531,8 +544,8 @@ fn build_pending(
     let builder_fee = local_fee_floor(&parsed, request).map_err(fail)?;
     let (tx, parsed) = economize(tx, parsed, request)?;
     let (tx, parsed) = match &sell_all {
-        Some(all) => append_close(&tx, parsed, all, user)?,
-        None => (tx, parsed),
+        Some(all) if all.closes => append_close(&tx, parsed, all, user)?,
+        _ => (tx, parsed),
     };
     if matches!(a, Action::Sell) {
         verify_sell_floor(&parsed, request)?;
@@ -568,7 +581,7 @@ fn build_pending(
     )
     .map_err(|error| fail(format!("cannot describe the built transaction: {error}")))?;
     let mut review = review;
-    if let Some(all) = &sell_all {
+    if let Some(all) = sell_all.as_ref().filter(|all| all.closes) {
         review.insert(
             review.len() - 1,
             format!(
@@ -1500,10 +1513,22 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
     if let Some(field) = r.keys().find(|field| !allowed.contains(&field.as_str())) {
         return Err(bad(format!("unsupported field {field}")));
     }
-    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(false);
-    let tip_lamports = tip_lamports(r)?;
+    // Swaps are sent through Jito with its "don't front" account unless the
+    // request opts out: the block engine then rejects any bundle that puts a
+    // transaction ahead of this one, which is how most sandwiches are built.
+    let swap = matches!(a, Action::Buy | Action::Sell);
+    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(swap);
+    let tip_lamports = match (front, r.contains_key("tipAmount")) {
+        (true, false) => DEFAULT_TIP_LAMPORTS,
+        _ => tip_lamports(r)?,
+    };
     if !front && tip_lamports != 0 {
         return Err(bad("tipAmount requires frontRunningProtection"));
+    }
+    if front && tip_lamports < MIN_JITO_TIP_LAMPORTS {
+        return Err(bad(
+            "tipAmount must be at least 0.000001 SOL with frontRunningProtection: Jito refuses smaller tips",
+        ));
     }
     r.insert("frontRunningProtection".into(), json!(front));
     if matches!(a, Action::Buy | Action::Sell) {
@@ -1532,16 +1557,21 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         Action::Buy | Action::Sell => {
             let mint = text(r, "mint", 32, 64)?;
             pk(&mint).map_err(bad)?;
-            let amount = if matches!(a, Action::Sell)
-                && r.get("amount").and_then(Value::as_str) == Some("all")
-            {
-                "all".to_owned()
-            } else {
-                number(r, "amount", 1)?
+            let amount = match r.get("amount").and_then(Value::as_str) {
+                Some(share) if matches!(a, Action::Sell) && sell_share(share).is_some() => {
+                    share.to_owned()
+                }
+                _ => number(r, "amount", 1)?,
             };
-            number(r, "minOutputAmount", 1)?;
+            // Optional: the chain-priced floor and the maximum spend are the
+            // protections. A caller's own floor is still enforced when given.
+            if r.contains_key("minOutputAmount") {
+                number(r, "minOutputAmount", 1)?;
+            } else {
+                r.insert("minOutputAmount".into(), json!("1"));
+            }
             let slip = match r.get("slippagePct") {
-                None => 2.0,
+                None => DEFAULT_SLIPPAGE_PCT,
                 Some(value) => value
                     .as_f64()
                     .ok_or_else(|| bad("slippagePct must be a number"))?,
@@ -1580,6 +1610,20 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
         }
     }
     Ok(())
+}
+/// A sell of a share of the balance: `"all"`, or a whole percentage from
+/// `"1%"` to `"100%"`. Returns the percentage.
+fn sell_share(amount: &str) -> Option<u64> {
+    if amount == "all" {
+        return Some(100);
+    }
+    let pct = amount.strip_suffix('%')?;
+    if pct.is_empty() || pct.len() > 3 || !pct.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pct.parse::<u64>()
+        .ok()
+        .filter(|pct| (1..=100).contains(pct))
 }
 fn optional_bool(r: &Map<String, Value>, n: &str) -> Result<Option<bool>, DispatchResponse> {
     r.get(n)
@@ -2354,13 +2398,40 @@ fn pool_reserves(
     Ok((balance(0)?, balance(1)?))
 }
 
-/// What a sell of `"all"` resolved to when it was built.
+/// What a sell of `"all"` or a percentage resolved to when it was built.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SellAll {
     amount: String,
     token_account: String,
     token_program: String,
     rent_lamports: u64,
+    /// Whether the sell empties the account and closes it. Only `"all"` and
+    /// `"100%"` do; a record from before percentages is always a full sell.
+    #[serde(default = "full_sell")]
+    closes: bool,
+}
+fn full_sell() -> bool {
+    true
+}
+
+/// `pct` percent of the trading account's balance of `mint`, rounded down.
+fn balance_share(user: &str, mint: &str, pct: u64) -> Result<SellAll, DispatchResponse> {
+    let mut all = full_balance(user, mint)?;
+    if pct < 100 {
+        let balance = all
+            .amount
+            .parse::<u128>()
+            .map_err(|_| fail("invalid token balance"))?;
+        let share = balance * u128::from(pct) / 100;
+        if share == 0 {
+            return Err(bad(format!(
+                "{pct}% of the balance of {mint} is less than one unit"
+            )));
+        }
+        all.amount = share.to_string();
+        all.closes = false;
+    }
+    Ok(all)
 }
 
 /// The trading account's whole balance of `mint`, in its own associated
@@ -2416,6 +2487,7 @@ fn full_balance(user: &str, mint: &str) -> Result<SellAll, DispatchResponse> {
             token_account: address.to_owned(),
             token_program: program.to_owned(),
             rent_lamports: rent,
+            closes: true,
         });
     }
     Err(bad(format!(
@@ -3595,6 +3667,12 @@ mod tests {
             .as_object()
             .expect("request must be an object")
             .clone();
+        // The builder fixtures are unprotected; protection has its own tests.
+        if !matches!(action, Action::CloseTokenAccount) {
+            request
+                .entry("frontRunningProtection")
+                .or_insert(json!(false));
+        }
         if normalize(action, user, &mut request).is_err() {
             panic!("normalization failed");
         }
@@ -4217,8 +4295,10 @@ mod tests {
             "minOutputAmount": "1",
             "slippagePct": 2,
         });
-        if protected {
-            request["frontRunningProtection"] = json!(true);
+        // Protection is the default. The unprotected fixtures carry no Jito
+        // tip, so a test that is not about protection opts out.
+        if !protected {
+            request["frontRunningProtection"] = json!(false);
         }
         serde_json::to_vec(&request).expect("request serializes")
     }
@@ -4428,7 +4508,9 @@ mod tests {
 
     #[test]
     fn a_protected_buy_is_sent_to_jito_as_the_same_standard_request() {
-        fake_host::install(host_serving_a_buy());
+        let mut host = host_serving_a_buy();
+        host.reply_only(SWAP_URL, fixture("buy_bond_protected"));
+        fake_host::install(host);
         let response = run_buy("buy-jito", true);
         assert_eq!(
             response,
@@ -4438,6 +4520,22 @@ mod tests {
         );
 
         fake_host::with(|host| {
+            let asked = &host.calls.iter().find(|c| c.url == SWAP_URL).unwrap().body;
+            assert_eq!(
+                asked["frontRunningProtection"],
+                json!(true),
+                "protection is the default"
+            );
+            assert_eq!(
+                asked["tipAmount"],
+                json!(0.00001),
+                "with the default Jito tip"
+            );
+            let signed = message(&host.sign_requests[0].preimage).unwrap();
+            assert!(
+                signed.keys.contains(&pk(JITO_DONT_FRONT).unwrap()),
+                "the signed transaction carries Jito's don't-front account"
+            );
             let sends = host.calls_for("sendTransaction");
             assert_eq!(sends.len(), 1);
             assert_eq!(sends[0].url, JITO);
@@ -5911,13 +6009,13 @@ mod tests {
             r["slippagePct"] = slip;
             r.as_object().unwrap().clone()
         };
-        for ok in [json!(0), json!(2), json!(10)] {
+        for ok in [json!(0), json!(1), json!(5)] {
             assert!(
                 normalize(Action::Buy, USER, &mut request(ok.clone())).is_ok(),
                 "{ok}"
             );
         }
-        for refused in [json!(10.01), json!(50), json!(-1), json!("20")] {
+        for refused in [json!(5.01), json!(10), json!(50), json!(-1), json!("2")] {
             assert!(
                 normalize(Action::Sell, USER, &mut request(refused.clone())).is_err(),
                 "{refused}"
@@ -5928,7 +6026,66 @@ mod tests {
             .unwrap()
             .clone();
         normalize(Action::Buy, USER, &mut defaulted).unwrap();
-        assert_eq!(defaulted["slippagePct"], json!(2.0));
+        assert_eq!(defaulted["slippagePct"], json!(1.0));
+    }
+
+    #[test]
+    fn swaps_are_protected_by_default_and_closes_are_not() {
+        let mut buy = json!({"mint":BOND_MINT,"amount":"1000000"})
+            .as_object()
+            .unwrap()
+            .clone();
+        normalize(Action::Buy, USER, &mut buy).unwrap();
+        assert_eq!(buy["frontRunningProtection"], json!(true));
+        assert_eq!(buy["tipAmount"], json!(0.00001));
+        assert_eq!(buy["minOutputAmount"], json!("1"), "a floor is optional");
+
+        let mut opted_out = json!({"mint":BOND_MINT,"amount":"1","frontRunningProtection":false})
+            .as_object()
+            .unwrap()
+            .clone();
+        normalize(Action::Sell, USER, &mut opted_out).unwrap();
+        assert_eq!(opted_out["tipAmount"], json!(0.0));
+
+        let mut too_small = json!({"mint":BOND_MINT,"amount":"1","tipAmount":0.0000005})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            normalize(Action::Buy, USER, &mut too_small).is_err(),
+            "Jito refuses tips under 1,000 lamports"
+        );
+
+        let mut close =
+            json!({"mint":BOND_MINT,"tokenAccount":TOKEN_ACCOUNT,"maxLamports":"2100000"})
+                .as_object()
+                .unwrap()
+                .clone();
+        normalize(Action::CloseTokenAccount, USER, &mut close).unwrap();
+        assert_eq!(close["frontRunningProtection"], json!(false));
+    }
+
+    #[test]
+    fn a_sell_may_name_a_share_of_the_balance() {
+        for (amount, share) in [
+            ("all", Some(100)),
+            ("100%", Some(100)),
+            ("50%", Some(50)),
+            ("1%", Some(1)),
+        ] {
+            assert_eq!(sell_share(amount), share, "{amount}");
+        }
+        for amount in ["0%", "101%", "50.5%", "%", "half", "-5%", "1000%"] {
+            assert_eq!(sell_share(amount), None, "{amount}");
+        }
+        let mut buy = json!({"mint":BOND_MINT,"amount":"50%"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            normalize(Action::Buy, USER, &mut buy).is_err(),
+            "only a sell names a share"
+        );
     }
 
     fn recent_fees(fees: &[u64]) -> Value {
@@ -6377,7 +6534,7 @@ mod tests {
 
     fn run_sell_all(operation: &str) -> DispatchResponse {
         let body = json!({"operationId": operation, "mint": BOND_MINT, "amount": "all",
-            "minOutputAmount": "1", "slippagePct": 2});
+            "slippagePct": 2, "frontRunningProtection": false});
         execute(
             &ctx(&[("bloom.route_id", "ROUTE_SELL")]),
             Action::Sell,
@@ -6493,5 +6650,40 @@ mod tests {
                     .all(|c| c.rpc_params().unwrap()[0] == json!(USER))
             );
         });
+    }
+
+    /// A percentage sells that share of the balance, rounded down, and leaves
+    /// the token account open because it is not empty.
+    #[test]
+    fn selling_a_percentage_sells_that_share_and_keeps_the_account() {
+        fake_host::install(host_serving_a_sell(&(SOLD * 2).to_string()));
+        let body = json!({"operationId": "sell-half", "mint": BOND_MINT, "amount": "50%",
+            "slippagePct": 2, "frontRunningProtection": false});
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SELL")]),
+            Action::Sell,
+            owner(),
+            &serde_json::to_vec(&body).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| {
+            let asked = &host.calls.iter().find(|c| c.url == SWAP_URL).unwrap().body;
+            assert_eq!(asked["amount"], json!(SOLD.to_string()));
+            let signed = message(&host.sign_requests[0].preimage).unwrap();
+            assert!(
+                signed.instructions.iter().all(|ix| ix.data != [9]),
+                "a partial sell does not close the account"
+            );
+        });
+        let review = public_operation("sell-half")["review"].to_string();
+        assert!(
+            !review.contains("closes the emptied token account"),
+            "{review}"
+        );
     }
 }
