@@ -31,8 +31,10 @@ const SELL_FEE_ALLOWANCE_BPS: u128 = 200;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
 const COIN_LISTINGS: &str = "https://frontend-api-v3.pump.fun/coins";
-/// Most coins a discovery file lists.
-const LISTING_LIMIT: usize = 50;
+/// Most coins a discovery file lists. Pump's live listing carries stream
+/// metadata, about 3 KB a coin on 26 September 2026, and a response must fit
+/// the Petal's 128 KiB read: 50 did not, 25 is about 75 KB.
+const LISTING_LIMIT: usize = 25;
 const RPC: &str = "https://rpc.solanatracker.io/public";
 const RPC_VERIFY: &str = "https://api.mainnet-beta.solana.com";
 const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";

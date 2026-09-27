@@ -61,7 +61,7 @@ trade/<wallet>/operations/<operationId>.json
 ```
 
 `coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
-creator is streaming, up to 50 each, without banned or NSFW coins. Names and
+creator is streaming, up to 25 each, without banned or NSFW coins. Names and
 symbols are the creator's own text, not unique, and cleaned of control and
 direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
 
