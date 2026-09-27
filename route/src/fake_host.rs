@@ -76,6 +76,8 @@ pub struct Chain {
     pub missing: BTreeSet<String>,
     /// Lamports a created account holds after the simulated transaction.
     pub created: BTreeMap<String, u64>,
+    /// What `getMultipleAccounts` returns for an address, when set.
+    pub accounts: BTreeMap<String, Value>,
 }
 
 impl FakeHost {
@@ -227,7 +229,9 @@ impl FakeHost {
     }
 
     fn account_view(&self, address: &str) -> Value {
-        if self.chain.missing.contains(address) {
+        if let Some(account) = self.chain.accounts.get(address) {
+            account.clone()
+        } else if self.chain.missing.contains(address) {
             Value::Null
         } else {
             serde_json::json!({

@@ -60,6 +60,14 @@ trade/<wallet>/{buy,sell,close_token_account}.json
 trade/<wallet>/operations/<operationId>.json
 ```
 
+`coins/<mint>.json` is a safety summary rather than Pump's raw record: the
+price, market cap and curve progress read from the chain now, whether the coin
+has graduated, its age, the creator and the share of supply the creator still
+holds — tokens they can sell into buyers — plus plain warnings (the creator
+holds 5% or more, the coin is under an hour old, it has no links, Pump banned
+it, or no curve or pool exists). Only `https://` links are kept, and the
+creator's description is not passed through.
+
 `coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
 creator is streaming, up to 25 each, without banned or NSFW coins. Names and
 symbols are the creator's own text, not unique, and cleaned of control and
@@ -126,8 +134,9 @@ guarantee.
 ## Holdings and selling everything
 
 `trade/<wallet>/holdings.json` lists every token account the trading account
-holds under both token programs: mint, raw and display amount, rent, and
-whether it is empty.
+holds under both token programs: mint, raw and display amount, rent, whether
+it is empty, and for a Pump coin what selling the whole position returns at
+the current curve or pool price, before Pump's fee and slippage.
 
 A sell may name `"amount":"all"`, or a whole percentage such as `"50%"`,
 which sells that share of the balance rounded down and leaves the account
