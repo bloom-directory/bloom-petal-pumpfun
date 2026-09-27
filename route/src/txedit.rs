@@ -63,10 +63,9 @@ pub(crate) fn rewrite(
     program: Option<&[u8; 32]>,
 ) -> Result<(Vec<u8>, Option<usize>), String> {
     let layout = layout(message)?;
-    let static_keys = message[layout.keys_end - layout.static_count * 32..layout.keys_end]
-        .chunks_exact(32)
-        .collect::<Vec<_>>();
-    let existing = program.and_then(|p| static_keys.iter().position(|key| *key == p));
+    let (static_keys, _) =
+        message[layout.keys_end - layout.static_count * 32..layout.keys_end].as_chunks::<32>();
+    let existing = program.and_then(|p| static_keys.iter().position(|key| key == p));
     let added = program.is_some() && existing.is_none();
     if added && layout.static_count >= 127 {
         return Err("no room for another static key".into());
