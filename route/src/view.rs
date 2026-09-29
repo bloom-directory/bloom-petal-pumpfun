@@ -44,7 +44,7 @@ pub fn front_page() -> DispatchResponse {
 fn listing_at(listing: Listing, format: Format, prefix: &str) -> DispatchResponse {
     let data = match listing_value(listing) {
         Ok(data) => data,
-        Err(e) => return e,
+        Err(e) => return unavailable(&e, format, prefix),
     };
     let coins = data["coins"].as_array().cloned().unwrap_or_default();
     let now = host::now_ms();
@@ -173,9 +173,13 @@ fn progress_cell(coin: &Value) -> String {
 // ------------------------------------------------------------------- coin
 
 pub fn coin_page(m: &str, format: Format) -> DispatchResponse {
+    // An invalid mint is the reader's mistake, not an outage.
+    if pk(m).is_err() {
+        return bad("invalid mint");
+    }
     let (summary, record) = match coin_value(m) {
         Ok(found) => found,
-        Err(e) => return e,
+        Err(e) => return unavailable(&e, format, ""),
     };
     // A page is still worth showing without its chart or trades.
     let chart = insight::chart_from(m, &record).ok();
@@ -772,7 +776,7 @@ const b=document.getElementById('copy');if(b)b.onclick=()=>{navigator.clipboard.
 pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
     let data = match holdings_value(c, w.clone()) {
         Ok(data) => data,
-        Err(e) => return e,
+        Err(e) => return unavailable(&e, format, "../../coins/"),
     };
     let now = host::now_ms();
     let tokens = data["tokens"].as_array().cloned().unwrap_or_default();
@@ -898,6 +902,28 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
 }
 
 // ------------------------------------------------------------ page chrome
+
+/// A page that says what could not be read, instead of a read error a
+/// browser would show as a broken file. The public RPC and Pump's API both
+/// refuse bursts, so the usual cure is a reload.
+fn unavailable(error: &DispatchResponse, format: Format, prefix: &str) -> DispatchResponse {
+    let reason = dispatch_message(error);
+    match format {
+        Format::Markdown => markdown(format!(
+            "# Could not load this just now\n\n{}\n\nPump's API and the public Solana RPC refuse bursts of requests; read the file again in a few seconds.\n",
+            cell(&reason)
+        )),
+        Format::Html => page(
+            "Could not load · Pump.fun",
+            &nav_from(prefix, ""),
+            &format!(
+                "<section class=card><h1>Could not load this just now</h1><p class=muted>{}</p><p>Pump's API and the public Solana RPC refuse bursts of requests. Reload in a few seconds.</p></section>",
+                html(&reason)
+            ),
+            "",
+        ),
+    }
+}
 
 fn nav(active: &str) -> String {
     nav_from("", active)
@@ -1408,6 +1434,21 @@ mod tests {
         install();
         let md = text(holdings(&ctx, "main".into(), Format::Markdown));
         assert!(md.contains("1 empty token account(s)"), "{md}");
+    }
+
+    /// When Pump or the RPC refuses, a person gets a page that says so, not
+    /// a broken file; an invalid mint is still an error.
+    #[test]
+    fn an_outage_reads_as_a_page_not_a_broken_file() {
+        fake_host::install(FakeHost::new(NOW));
+        let page = text(listing(Listing::Live, Format::Html));
+        assert!(page.contains("Could not load this just now"), "{page}");
+        let md = text(coin_page(MINT, Format::Markdown));
+        assert!(md.starts_with("# Could not load this just now"), "{md}");
+        assert!(matches!(
+            coin_page("not/a/mint", Format::Html),
+            DispatchResponse::Error { .. }
+        ));
     }
 
     #[test]
