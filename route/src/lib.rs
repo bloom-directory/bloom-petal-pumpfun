@@ -398,7 +398,18 @@ fn fetch_within(
         Ok(v)
     }
 }
+/// A POST to `url`. A read from the primary RPC falls back to the verifying
+/// one when the primary fails outright: the primary is a free public
+/// endpoint that has gone down whole, and one outage should not stop every
+/// trade. Checks that compare the two RPCs use `post_exact`, so each side
+/// really is asked.
 fn post(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
+    match post_exact(url, v) {
+        Err(_) if url == RPC => post_exact(RPC_VERIFY, v),
+        result => result,
+    }
+}
+fn post_exact(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
     fetch(
         "POST",
         url.into(),
@@ -994,7 +1005,7 @@ fn token_account_fact(
     rpc_url: &str,
     token_account: &str,
 ) -> Result<TokenAccountFact, DispatchResponse> {
-    let value = post(
+    let value = post_exact(
         rpc_url,
         &rpc(
             "getAccountInfo",
@@ -3638,7 +3649,7 @@ fn hydrate_lookups(message: &mut Msg, _response: &Value) -> Result<(), DispatchR
 
 #[cfg(not(test))]
 fn fetch_lookup_table(url: &str, table: &str) -> Result<Vec<Value>, DispatchResponse> {
-    let value = post(
+    let value = post_exact(
         url,
         &rpc(
             "getAccountInfo",
@@ -7522,6 +7533,34 @@ mod tests {
             DispatchResponse::Write,
             "{}",
             dispatch_message(&response)
+        );
+    }
+
+    /// When the primary RPC fails outright, a read goes to the verifying
+    /// RPC instead; a check that compares the two still asks the primary.
+    #[test]
+    fn a_failed_primary_rpc_read_falls_back_but_cross_checks_do_not() {
+        let mut host = FakeHost::new(NOW_MS);
+        let down =
+            json!({"jsonrpc":"2.0","error":{"code":-32603,"message":"Upstream returned non-JSON"}});
+        host.reply(&format!("{RPC} getMultipleAccounts"), down.clone());
+        host.reply(&format!("{RPC} getAccountInfo"), down);
+        host.reply(
+            &format!("{RPC_VERIFY} getAccountInfo"),
+            empty_token_account(),
+        );
+        fake_host::install(host);
+        assert_eq!(markets(&[pk(BOND_MINT).unwrap()]).unwrap(), vec![None]);
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("getMultipleAccounts")
+                    .iter()
+                    .any(|c| c.url == RPC_VERIFY)
+            );
+        });
+        assert!(
+            token_account_fact(RPC, TOKEN_ACCOUNT).is_err(),
+            "no fallback inside a cross-check"
         );
     }
 
