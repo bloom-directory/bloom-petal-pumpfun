@@ -52,12 +52,18 @@ const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";
 const SOL: &str = "So11111111111111111111111111111111111111112";
 #[cfg(not(test))]
 const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e1111111111111111111111111";
-const CLASSES: [&str; 3] = ["pumpfun.buy", "pumpfun.sell", "pumpfun.close_token_account"];
-/// Every program a supported transaction may call. Coin creation, fee
-/// collection and fee sharing were removed with their routes, and their
-/// programs went with them: `pfeeUxB6…` (fee sharing) and `AgenTMiC…`
-/// (tokenized agent) are no longer reachable from any instruction this Petal
-/// will sign.
+const CLASSES: [&str; 4] = [
+    "pumpfun.buy",
+    "pumpfun.sell",
+    "pumpfun.close_token_account",
+    "pumpfun.launch",
+];
+/// Every program a supported transaction may call. Fee collection, fee
+/// sharing and tokenized agents are not supported, and their programs are not
+/// here: `pfeeUxB6…` (fee sharing) and `AgenTMiC…` (tokenized agent) are not
+/// reachable from any instruction this Petal will sign. A launch calls only
+/// Pump's own `create_v2`, which reaches Token-2022 and the Mayhem program
+/// itself.
 const PROGRAMS: [&str; 7] = [
     "ComputeBudget111111111111111111111111111111",
     "11111111111111111111111111111111",
@@ -101,6 +107,7 @@ fn sdk_message(e: &petal::SdkError) -> String {
 #[cfg(test)]
 mod fake_host;
 pub mod insight;
+mod launch;
 mod txedit;
 
 /// This crate's only boundary to the Bloom host.
@@ -207,13 +214,6 @@ mod host {
     };
 }
 
-pub fn body(b: &[u8]) -> Result<(), DispatchResponse> {
-    if b.len() <= MAX {
-        Ok(())
-    } else {
-        Err(bad("body exceeds 128 KiB"))
-    }
-}
 fn ident(s: &str, n: &str) -> Result<String, DispatchResponse> {
     if s.is_empty()
         || s.len() > 96
@@ -430,6 +430,7 @@ pub enum Action {
     Buy,
     Sell,
     CloseTokenAccount,
+    Launch,
 }
 impl Action {
     fn class(self) -> &'static str {
@@ -437,12 +438,14 @@ impl Action {
             Self::Buy => CLASSES[0],
             Self::Sell => CLASSES[1],
             Self::CloseTokenAccount => CLASSES[2],
+            Self::Launch => CLASSES[3],
         }
     }
     fn path(self) -> &'static str {
         match self {
             Self::Buy | Self::Sell => "/agents/swap",
             Self::CloseTokenAccount => "",
+            Self::Launch => "/agents/create-coin",
         }
     }
     fn label(self) -> &'static str {
@@ -450,6 +453,7 @@ impl Action {
             Self::Buy => "Buy",
             Self::Sell => "Sell",
             Self::CloseTokenAccount => "Close token account",
+            Self::Launch => "Launch",
         }
     }
 }
@@ -476,6 +480,11 @@ struct Pending {
     /// token account it empties and closes in the same transaction.
     #[serde(default)]
     sell_all: Option<SellAll>,
+    /// For a launch: the metadata URI the coin names. An uploaded image is
+    /// uploaded once, when the launch is first built, and every rebuild names
+    /// the same URI.
+    #[serde(default)]
+    metadata_uri: Option<String>,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -510,10 +519,15 @@ fn build_pending(
     trader: &Trader<'_>,
     request: &Map<String, Value>,
     digest: String,
+    metadata_uri: Option<String>,
 ) -> Result<Pending, DispatchResponse> {
     let user = trader.address;
-    if matches!(a, Action::CloseTokenAccount) {
-        return build_close_token_account_pending(trader, request, digest);
+    match a {
+        Action::CloseTokenAccount => {
+            return build_close_token_account_pending(trader, request, digest);
+        }
+        Action::Launch => return launch::build(trader, request, digest, metadata_uri),
+        Action::Buy | Action::Sell => {}
     }
     let sell_all = match request
         .get("amount")
@@ -617,6 +631,7 @@ fn build_pending(
         network_fee_cap_lamports,
         created: Some(created),
         sell_all,
+        metadata_uri: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -781,7 +796,7 @@ fn swap_instruction_amounts(message: &Msg, action: Action) -> Result<(u64, u64),
     let pump = pk(PROGRAMS[5])?;
     let amm = pk(PROGRAMS[6])?;
     let discriminator = match action {
-        Action::Buy => IX_BUY,
+        Action::Buy | Action::Launch => IX_BUY,
         Action::Sell => IX_SELL,
         Action::CloseTokenAccount => return Err("close has no swap instruction".into()),
     };
@@ -797,7 +812,7 @@ fn swap_instruction_amounts(message: &Msg, action: Action) -> Result<(u64, u64),
         })
         .ok_or("validated swap instruction missing")?;
     match action {
-        Action::Buy => Ok((instruction_u64(swap, 16)?, instruction_u64(swap, 8)?)),
+        Action::Buy | Action::Launch => Ok((instruction_u64(swap, 16)?, instruction_u64(swap, 8)?)),
         _ => Ok((instruction_u64(swap, 8)?, instruction_u64(swap, 16)?)),
     }
 }
@@ -1119,6 +1134,7 @@ fn build_close_token_account_pending(
         network_fee_cap_lamports: network_fee_lamports,
         created: Some(Created::default()),
         sell_all: None,
+        metadata_uri: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1187,7 +1203,8 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
                 )
             {
                 let approval = v.approval.take();
-                v = match build_pending(a, &trader, &r, digest.clone()) {
+                let metadata_uri = v.metadata_uri.take();
+                v = match build_pending(a, &trader, &r, digest.clone(), metadata_uri) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
@@ -1202,7 +1219,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             v
         }
         Ok(None) => {
-            let p = match build_pending(a, &trader, &r, digest) {
+            let p = match build_pending(a, &trader, &r, digest, None) {
                 Ok(value) => value,
                 Err(e) => return e,
             };
@@ -1518,6 +1535,17 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "priorityFee",
         ][..],
         Action::CloseTokenAccount => &["mint", "tokenAccount", "maxLamports"][..],
+        Action::Launch => &[
+            "name",
+            "symbol",
+            "description",
+            "twitter",
+            "telegram",
+            "website",
+            "uri",
+            "image",
+            "amount",
+        ][..],
     };
     if let Some(field) = r.keys().find(|field| !allowed.contains(&field.as_str())) {
         return Err(bad(format!("unsupported field {field}")));
@@ -1604,6 +1632,7 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             r.insert("amount".into(), json!(amount));
             r.remove("mint");
         }
+        Action::Launch => launch::normalize(r)?,
         Action::CloseTokenAccount => {
             let mint = text(r, "mint", 32, 64)?;
             let token_account = text(r, "tokenAccount", 32, 64)?;
@@ -1703,7 +1732,7 @@ fn effects(
         }
     };
     let mut effects = match a {
-        Action::Buy => {
+        Action::Buy | Action::Launch => {
             // The requested amount plus slippage, not the builder's quote:
             // `validate_buy_cost` holds the built maximum under it, and it does
             // not move when a rebuild re-quotes, so the approval's ceiling
@@ -1731,7 +1760,7 @@ fn effects(
     let auxiliary_native = tip
         .checked_add(account_rent)
         .ok_or("native debit exceeds u64")?;
-    if auxiliary_native > 0 && !matches!(a, Action::Buy) {
+    if auxiliary_native > 0 && !matches!(a, Action::Buy | Action::Launch) {
         effects.push(json!({
             "asset":{"chain":"solana","asset":"native"},
             "amount":auxiliary_native.to_string()
@@ -2160,14 +2189,17 @@ fn clean_text(value: &Value, field: &str, max: usize) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
-        })
+        .filter(|c| !hidden(*c))
         .take(max)
         .collect::<String>()
         .trim()
         .to_owned()
+}
+/// A character that can hide or disguise text: control, zero-width and
+/// direction-changing characters.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
 }
 fn project_listing(v: &Value) -> Vec<Value> {
     let text = clean_text;
@@ -3375,8 +3407,10 @@ fn test_lookup_tables() -> Map<String, Value> {
             "16":"MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e",
             "18":"13ec7XdrjF3h3YcqBTFDSReRcUFwbCnJaAQspM4j6DDJ",
             "19":"BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s",
+            "22":"7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
             "26":"CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
             "27":"FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+            "29":"5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
             "32":"3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
             "36":"A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
             "41":"8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6",
@@ -3624,6 +3658,7 @@ fn validate_auxiliary_instructions(
             }
             let mint_allowed = match action {
                 Action::Buy | Action::Sell => account_mint == mint || account_mint == &wrapped_mint,
+                Action::Launch => account_mint == mint,
                 Action::CloseTokenAccount => false,
             };
             if !mint_allowed {
@@ -3693,13 +3728,18 @@ fn validate_protocol_instructions(
     let amm = pk(PROGRAMS[6])?;
     let wrapped_mint = pk(SOL)?;
     let mut primary = 0usize;
+    let mut created = 0usize;
     for ix in &message.instructions {
         let program = message
             .keys
             .get(ix.program)
             .ok_or("program is lookup-loaded")?;
         match action {
-            Action::Buy if program == &pump && has_discriminator(ix, IX_BUY) => {
+            Action::Launch if program == &pump && has_discriminator(ix, launch::IX_CREATE_V2) => {
+                launch::validate_create(message, ix, payer, mint, request)?;
+                created += 1;
+            }
+            Action::Buy | Action::Launch if program == &pump && has_discriminator(ix, IX_BUY) => {
                 require_account(message, ix, 2, mint, "buy mint")?;
                 require_payer_token_account(message, ix, 5, 8, payer, mint, "buy recipient")?;
                 require_account(message, ix, 6, payer, "buy user")?;
@@ -3758,8 +3798,11 @@ fn validate_protocol_instructions(
             _ => {}
         }
     }
-    if matches!(action, Action::Buy | Action::Sell) && primary != 1 {
+    if matches!(action, Action::Buy | Action::Sell | Action::Launch) && primary != 1 {
         return Err("swap transaction must contain exactly one matching swap".into());
+    }
+    if matches!(action, Action::Launch) && created != 1 {
+        return Err("launch transaction must create exactly one coin".into());
     }
     Ok(())
 }
@@ -3803,8 +3846,12 @@ fn validate_minimum_output(ix: &Ix, offset: usize, requested: u64) -> Result<(),
     }
 }
 pub fn route_action(c: &Ctx, b: &[u8], a: Action) -> DispatchResponse {
-    if let Err(e) = body(b) {
-        return e;
+    let limit = match a {
+        Action::Launch => launch::BODY_MAX,
+        _ => MAX,
+    };
+    if b.len() > limit {
+        return bad(format!("body exceeds {} KiB", limit / 1024));
     }
     let w = match wallet(c) {
         Ok(v) => v,
@@ -7116,5 +7163,223 @@ mod tests {
                 "launch"
             ])
         );
+    }
+
+    const CREATE_URL: &str = "https://fun-block.pump.fun/agents/create-coin";
+    const IPFS_URL: &str = "https://pump.fun/api/ipfs";
+    /// The metadata URI the create fixture names.
+    const LAUNCH_URI: &str =
+        "https://ipfs.io/ipfs/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+    /// A one-pixel PNG.
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    fn host_serving_a_launch() -> FakeHost {
+        let mut host = host_serving_a_buy();
+        host.reply(CREATE_URL, fixture("create"));
+        host.reply(IPFS_URL, json!({"metadataUri": LAUNCH_URI, "metadata": {}}));
+        let mint = fixture("create")["mintPublicKey"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        host.chain.missing.insert(mint.clone());
+        host.chain.created.insert(mint, 4_000_000);
+        host
+    }
+
+    fn launch_body(operation: &str, fields: Value) -> Vec<u8> {
+        let mut request = json!({"operationId": operation, "name": "Bloom Test",
+            "symbol": "BLMT", "amount": "1000000"});
+        for (key, value) in fields.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        serde_json::to_vec(&request).unwrap()
+    }
+
+    fn run_launch(operation: &str, fields: Value) -> DispatchResponse {
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_LAUNCH")]),
+            Action::Launch,
+            owner(),
+            &launch_body(operation, fields),
+        )
+    }
+
+    /// A launch with an image pins it through Pump, has the builder make the
+    /// coin, checks the transaction it returns, and sends it with both
+    /// signatures: the new mint's from the builder and the owner's.
+    #[test]
+    fn a_launch_pins_the_image_and_sends_the_checked_create() {
+        fake_host::install(host_serving_a_launch());
+        let response = run_launch(
+            "launch-1",
+            json!({"image": PNG, "description": "a test", "website": "https://example.com"}),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let mint = fixture("create")["mintPublicKey"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fake_host::with(|host| {
+            let upload = host.calls.iter().find(|c| c.url == IPFS_URL).unwrap();
+            let form = upload.body.as_str().unwrap();
+            assert!(
+                form.contains("name=\"name\"\r\n\r\nBloom Test\r\n"),
+                "{form}"
+            );
+            assert!(form.contains("name=\"website\"\r\n\r\nhttps://example.com"));
+            assert!(form.contains("Content-Type: image/png"));
+            let built = &host
+                .calls
+                .iter()
+                .find(|c| c.url == CREATE_URL)
+                .unwrap()
+                .body;
+            assert_eq!(built["uri"], json!(LAUNCH_URI));
+            assert_eq!(built["creator"], json!(USER));
+            assert_eq!(built["mayhemMode"], json!(false));
+            assert!(built.get("image").is_none(), "the image goes to IPFS only");
+
+            let sends = host.calls_for("sendTransaction");
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].url, RPC, "a launch is not sent through Jito");
+            let sent = B64
+                .decode(sends[0].rpc_params().unwrap()[0].as_str().unwrap())
+                .unwrap();
+            let env = envelope_signed(&sent);
+            verify_ed25519(USER, env.1, &sent[1..65]).expect("the owner's signature");
+            verify_ed25519(&mint, env.1, &sent[65..129]).expect("the mint's signature");
+
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            assert_eq!(claim["operation_class"], json!("pumpfun.launch"));
+            assert_eq!(
+                claim["declared_debits"][0]["amount"],
+                json!((1_010_000u64 + 4_000_000).to_string()),
+                "the first buy plus 1% and the measured rent"
+            );
+        });
+        let record = public_operation("launch-1");
+        assert_eq!(record["status"], json!("submitted"));
+        assert_eq!(record["api"]["mintPublicKey"], json!(mint));
+        assert_eq!(record["api"]["metadataUri"], json!(LAUNCH_URI));
+        let review = record["review"].to_string();
+        for expected in [
+            "Name: Bloom Test",
+            "Symbol: BLMT",
+            "First buy",
+            "Rent for 1 new account",
+        ] {
+            assert!(review.contains(expected), "{expected}: {review}");
+        }
+    }
+
+    /// The signed bytes' message, skipping both signatures.
+    fn envelope_signed(raw: &[u8]) -> (usize, &[u8]) {
+        assert_eq!(raw[0], 2, "two signatures");
+        (1, &raw[1 + 128..])
+    }
+
+    /// The image is pinned once. The rebuild after the ceremony names the
+    /// same metadata instead of pinning it again.
+    #[test]
+    fn a_launch_pins_its_image_once_across_the_rebuild() {
+        let mut host = host_serving_a_launch();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "approval-1".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        let first = run_launch("launch-2", json!({"image": PNG}));
+        assert!(matches!(first, DispatchResponse::Error { .. }), "{first:?}");
+        let second = run_launch("launch-2", json!({"image": PNG}));
+        assert_eq!(
+            second,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&second)
+        );
+        fake_host::with(|host| {
+            assert_eq!(host.calls.iter().filter(|c| c.url == IPFS_URL).count(), 1);
+            assert_eq!(host.calls.iter().filter(|c| c.url == CREATE_URL).count(), 2);
+        });
+    }
+
+    /// A builder transaction that names anything other than the request, or
+    /// whose bytes were changed after the mint signed them, signs nothing.
+    #[test]
+    fn a_launch_that_differs_from_the_request_signs_nothing() {
+        fake_host::install(host_serving_a_launch());
+        let response = run_launch("launch-3", json!({"uri": LAUNCH_URI, "name": "Other Name"}));
+        assert!(
+            dispatch_message(&response).contains("create name differs"),
+            "{}",
+            dispatch_message(&response)
+        );
+
+        let mut tampered = fixture("create");
+        let mut raw = B64
+            .decode(tampered["transaction"].as_str().unwrap())
+            .unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        tampered["transaction"] = json!(B64.encode(raw));
+        let mut host = host_serving_a_launch();
+        host.reply_only(CREATE_URL, tampered);
+        fake_host::install(host);
+        let response = run_launch("launch-4", json!({"uri": LAUNCH_URI}));
+        assert!(
+            dispatch_message(&response).contains("unsafe builder transaction"),
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| assert!(host.sign_requests.is_empty()));
+    }
+
+    #[test]
+    fn a_launch_request_is_checked_before_anything_is_sent() {
+        fake_host::install(host_serving_a_launch());
+        for (fields, expected) in [
+            (json!({}), "exactly one of uri"),
+            (
+                json!({"uri": LAUNCH_URI, "image": PNG}),
+                "exactly one of uri",
+            ),
+            (json!({"uri": "http://example.com/m.json"}), "https://"),
+            (
+                json!({"uri": LAUNCH_URI, "symbol": "FOURTEENBYTES!"}),
+                "symbol must be 1 to 13",
+            ),
+            (
+                json!({"uri": LAUNCH_URI, "name": "Bloom\u{202E}Test"}),
+                "direction-changing",
+            ),
+            (
+                json!({"uri": LAUNCH_URI, "description": "x"}),
+                "belong in the metadata",
+            ),
+            (json!({"image": "aGVsbG8="}), "PNG, JPEG, GIF or WebP"),
+            (json!({"image": PNG, "twitter": "x.com/me"}), "https://"),
+            (
+                json!({"uri": LAUNCH_URI, "amount": "0"}),
+                "amount too small",
+            ),
+            (
+                json!({"uri": LAUNCH_URI, "mayhemMode": true}),
+                "unsupported field",
+            ),
+        ] {
+            let response = run_launch("launch-bad", fields.clone());
+            assert!(
+                dispatch_message(&response).contains(expected),
+                "{fields}: {}",
+                dispatch_message(&response)
+            );
+        }
+        fake_host::with(|host| assert!(host.calls.is_empty(), "{:?}", host.calls.len()));
     }
 }

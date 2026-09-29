@@ -2,10 +2,10 @@
 
 ## Scope
 
-Buy or sell an existing coin from the Bloom account already selected, and
-optionally close an empty token account afterwards. Each of those is one owner
-approval. Coin creation, fee collection and fee-sharing configuration are not in
-this release and their routes have been removed.
+Buy or sell an existing coin from the Bloom account already selected, launch a
+new coin from it, and optionally close an empty token account afterwards. Each
+of those is one owner approval. Fee collection and fee-sharing configuration
+are not in this release and their routes have been removed.
 
 ## Compatibility
 

@@ -15,9 +15,8 @@ and signs it under that approval, because a blockhash lives about a minute and
 a ceremony can take most of it. The approval is scoped to this package, route,
 account and kind of trade, and capped in SOL; it does not name the coin.
 
-Coin creation, fee collection and fee-sharing configuration are not part of this
-release. Their routes are gone, not merely disabled. Creation acceptance is
-tracked in [PM #33](https://github.com/bloom-directory/pm/issues/33).
+Fee collection and fee-sharing configuration are not part of this release.
+Their routes are gone, not merely disabled.
 
 ## What a write costs
 
@@ -59,7 +58,7 @@ coins/<mint>/chart.svg
 coins/<mint>/trades.json
 trade/<wallet>/preflight.json
 trade/<wallet>/holdings.json
-trade/<wallet>/{buy,sell,close_token_account}.json
+trade/<wallet>/{buy,sell,launch,close_token_account}.json
 trade/<wallet>/operations/<operationId>.json
 ```
 
@@ -170,6 +169,44 @@ the mint, asks the builder to sell exactly that, and appends a `CloseAccount`
 for the emptied account, so its rent returns in the same transaction and the
 same approval. The operation id binds `"all"`; the resolved amount is what
 the claim declares and the review shows.
+
+## Launching a coin
+
+Write to `trade/<wallet>/launch.json`:
+
+```json
+{"operationId":"launch-1","name":"My Coin","symbol":"MYC","amount":"10000000",
+ "image":"<base64 PNG, JPEG, GIF or WebP, at most 512 KiB>",
+ "description":"optional","twitter":"https://…","telegram":"https://…","website":"https://…"}
+```
+
+or name metadata you already host with `"uri":"https://…"` in place of the
+image, description and links. The selected account pays and becomes the
+coin's creator, so Pump's creator fees go to it. `amount` is the first buy in
+lamports; Pump requires one, and it happens in the same transaction the curve
+is created in, at the opening price, so nothing can trade ahead of it.
+
+An image is pinned to IPFS with the metadata through Pump's own upload, the
+way pump.fun does it, when the launch is first built and before the owner
+approves; the rebuild after approval names the same metadata. That upload is
+public even if the launch is never approved.
+
+Pump's builder makes the transaction and signs it with a mint key it draws for
+the new coin. The Petal checks it as built: two signers, the trading account
+paying, the mint's signature valid over the exact message, and only
+`create_v2` for the requested name, symbol and metadata with the trading
+account as creator and Mayhem mode, cashback, creator fee and holder rewards
+off, the creator's token account, and one buy of the new coin within 1% of
+`amount`. Any change to the bytes would void the mint's signature, so a launch
+pays the builder's priority fee (about 0.001 SOL) and goes through the public
+RPC; Jito protects nothing here. The mint key has no power once the coin
+exists, because the mint is created with no mint or freeze authority.
+
+The review shows the name, symbol, metadata, first buy, network fee, measured
+rent (0.0087 SOL for the mint, curve and accounts, simulated on 29 September
+2026) and total; a launch with a 0.001 SOL first buy came to 0.0097 SOL. Each rebuild
+draws a new mint, so the coin's address is the one in the signed transaction:
+read `operations/<operationId>.json`, `api.mintPublicKey`.
 
 ## Closing an empty token account
 
