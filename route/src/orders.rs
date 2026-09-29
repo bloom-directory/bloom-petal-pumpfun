@@ -23,6 +23,9 @@ use super::*;
 pub(crate) const RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
 const NONCE_SPACE: u64 = 80;
+/// Compute units a slot creation or a cancel is given; each uses a few
+/// thousand.
+const OWN_COMPUTE_UNITS: u32 = 20_000;
 /// Order slots a trading account may have.
 pub(crate) const SLOTS: u64 = 4;
 /// Pump's fee is 1.25% on the curve and 0.85% on PumpSwap. An order's
@@ -568,7 +571,32 @@ fn own_transaction(
         .and_then(Value::as_str)
         .and_then(|b| pk(b).ok())
         .ok_or_else(|| fail("Solana RPC omitted the latest blockhash"))?;
-    let message = txedit::plain_message(header, keys, &blockhash, instructions).map_err(fail)?;
+    // A priority fee at the market price for these accounts, so the
+    // transaction lands on a busy network before its blockhash expires.
+    let writable = (1..keys.len() - usize::from(header[2]))
+        .map(|i| bs58::encode(keys[i]).into_string())
+        .collect::<Vec<_>>();
+    let price = recent_compute_unit_price(&writable)
+        .unwrap_or(0)
+        .max(MIN_COMPUTE_UNIT_PRICE);
+    let mut keys = keys.to_vec();
+    keys.push(pk(PROGRAMS[0]).map_err(fail)?);
+    let budget = keys.len() - 1;
+    let mut all = vec![
+        Ix {
+            program: budget,
+            accounts: Vec::new(),
+            data: [&[2u8][..], &OWN_COMPUTE_UNITS.to_le_bytes()].concat(),
+        },
+        Ix {
+            program: budget,
+            accounts: Vec::new(),
+            data: [&[3u8][..], &price.to_le_bytes()].concat(),
+        },
+    ];
+    all.extend_from_slice(instructions);
+    let header = [header[0], header[1], header[2] + 1];
+    let message = txedit::plain_message(header, &keys, &blockhash, &all).map_err(fail)?;
     super::message(&message).map_err(fail)?;
     let network_fee_lamports = quote_message_fee(&message)?;
     review.push(format!(

@@ -7798,8 +7798,14 @@ mod tests {
                 )
                 .unwrap();
             let parsed = message(&raw[65..]).unwrap();
-            assert_eq!(parsed.instructions.len(), 1);
-            assert_eq!(parsed.instructions[0].data, [4, 0, 0, 0]);
+            assert_eq!(
+                parsed.instructions.len(),
+                3,
+                "priority fee, then the advance"
+            );
+            assert_eq!(parsed.instructions[0].data[0], 2);
+            assert_eq!(parsed.instructions[1].data[0], 3);
+            assert_eq!(parsed.instructions[2].data, [4, 0, 0, 0]);
             assert_eq!(parsed.keys[1], pk(&slot0()).unwrap());
         });
         assert_eq!(
