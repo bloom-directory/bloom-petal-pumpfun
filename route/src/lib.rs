@@ -414,8 +414,12 @@ fn send_public(tx: &str) -> Result<Value, DispatchResponse> {
         RPC,
         json!({"encoding":"base64","skipPreflight":false,"preflightCommitment":COMMITMENT}),
     );
+    // A blockhash one of the primary's nodes has not seen is that node's
+    // lag, not a failure of the transaction, and the other routes may carry
+    // it; anything else it refuses in preflight would fail on chain.
     if let Ok(v) = &primary
         && v.pointer("/error/code").and_then(Value::as_i64) == Some(-32002)
+        && v.pointer("/error/data/err").and_then(Value::as_str) != Some("BlockhashNotFound")
     {
         return Err(fail(format!(
             "the RPC refused the transaction in preflight: {}",
@@ -7620,6 +7624,30 @@ mod tests {
         let response = run_buy("buy-refused", false);
         assert!(dispatch_message(&response).contains("refused the transaction in preflight"));
         fake_host::with(|host| assert_eq!(host.broadcasts(), 1));
+    }
+
+    /// A primary node that has not seen the blockhash yet does not stop the
+    /// transaction: the other routes carry it without a preflight.
+    #[test]
+    fn a_lagging_primary_node_does_not_stop_the_send() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} sendTransaction"),
+            json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found","data":{"err":"BlockhashNotFound"}},"id":1}),
+        );
+        host.reply(
+            &format!("{RPC_VERIFY} sendTransaction"),
+            json!({"result": "$signature"}),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-lagging", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| assert_eq!(host.calls_for("sendTransaction").len(), 3));
     }
 
     const NONCE_VALUE: [u8; 32] = [8; 32];
