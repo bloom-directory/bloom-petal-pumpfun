@@ -2288,9 +2288,13 @@ pub fn coin(m: &str) -> DispatchResponse {
         warnings.push("Pump.fun has banned this coin".to_owned());
     }
     if market.is_none() {
-        warnings.push(
-            "No active Pump curve or pool was found on chain; it cannot be traded here".to_owned(),
-        );
+        warnings.push(match curve_quote(&mint) {
+            Some(quote) => format!(
+                "This coin is priced in the token {quote}, not SOL; it cannot be traded here, and its price is not shown"
+            ),
+            None => "No active Pump curve or pool was found on chain; it cannot be traded here"
+                .to_owned(),
+        });
     }
     if let Some(pct) = creator_pct.filter(|pct| *pct >= CREATOR_WARN_PCT) {
         warnings.push(format!(
@@ -2501,6 +2505,27 @@ impl Market {
     }
 }
 
+/// Where a bonding curve records its quote mint: after the creator and the
+/// Mayhem and cashback flags. A curve from before quote mints, or one whose
+/// quote is all zeros or wrapped SOL, is priced in SOL.
+const CURVE_QUOTE_OFFSET: usize = 83;
+fn quoted_in_sol(curve: &[u8]) -> bool {
+    match key_at(curve, CURVE_QUOTE_OFFSET) {
+        None => true,
+        Some(quote) => quote == [0; 32] || pk(SOL).is_ok_and(|sol| quote == sol),
+    }
+}
+/// The token a coin's curve is priced in, when it is not SOL.
+fn curve_quote(mint: &[u8; 32]) -> Option<String> {
+    let curve = program_address(&[b"bonding-curve", mint], &pk(PROGRAMS[5]).ok()?).ok()?;
+    let data = owned_data(
+        accounts_data(&[curve], "base64").ok()?.first()?,
+        &pk(PROGRAMS[5]).ok()?,
+    )?;
+    let quote = key_at(&data, CURVE_QUOTE_OFFSET)?;
+    (!quoted_in_sol(&data)).then(|| bs58::encode(quote).into_string())
+}
+
 /// The pool Pump creates when a coin graduates: index 0, owned by the Pump
 /// program's pool authority for the mint, quoted in wrapped SOL.
 fn canonical_pool(mint: &[u8; 32]) -> Result<[u8; 32], String> {
@@ -2554,6 +2579,9 @@ fn markets(mints: &[[u8; 32]]) -> Result<Vec<Option<Market>>, DispatchResponse> 
         let curve = owned_data(account, &pump)
             .filter(|data| data.get(..8) == Some(&anchor_discriminator("BondingCurve")[..]));
         match curve {
+            // A curve priced in another token is not a SOL market; Pump's
+            // program refuses to trade it for SOL.
+            Some(data) if !quoted_in_sol(&data) => {}
             Some(data) if data.get(48) == Some(&0) => {
                 found[index] = match (u64_at(&data, 8), u64_at(&data, 16), u64_at(&data, 24)) {
                     (Some(tokens), Some(sol), Some(real_tokens)) if tokens > 0 => {
@@ -7138,6 +7166,45 @@ mod tests {
             assert_eq!(asked[0]["params"][0], json!("create"));
             assert!(host.calls_for("getTokenAccountsByOwner").is_empty());
         });
+    }
+
+    /// Pump curves can now be priced in a token other than SOL. The program
+    /// refuses to trade those for SOL, so the summary shows no SOL price for
+    /// one and says which token it is priced in.
+    #[test]
+    fn a_coin_priced_in_another_token_is_not_shown_as_a_sol_market() {
+        let quote = "DJTu7vi8norVzdVAffgvb39VP7wjKeTsgaMBJrzfxvoF";
+        let mut host = FakeHost::new(NOW_MS);
+        coin_with_supply(&mut host);
+        let mut data = anchor_discriminator("BondingCurve").to_vec();
+        for value in [
+            1_073_000_000_000_000u64,
+            472_430_926,
+            793_100_000_000_000,
+            1,
+            0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.push(0);
+        data.extend_from_slice(&pk(USER).unwrap());
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&pk(quote).unwrap());
+        host.chain.accounts.insert(
+            curve_address(BOND_MINT),
+            json!({"owner": PROGRAMS[5], "data": [B64.encode(data), "base64"]}),
+        );
+        fake_host::install(host);
+        let (v, _) = summary();
+        assert_eq!(v["priceSol"], json!(null));
+        assert!(
+            v["warnings"]
+                .to_string()
+                .contains(&format!("priced in the token {quote}")),
+            "{}",
+            v["warnings"]
+        );
+        assert_eq!(markets(&[pk(BOND_MINT).unwrap()]).unwrap(), vec![None]);
     }
 
     /// Every risk check is best effort: when none can be made the summary

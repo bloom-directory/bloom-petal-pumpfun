@@ -517,7 +517,7 @@ fn chart(m: &str) -> Result<Chart, DispatchResponse> {
     })
 }
 
-/// `coins/<mint>/candles.json`: recent price candles, at an interval chosen
+/// `market/<mint>/candles.json`: recent price candles, at an interval chosen
 /// from the coin's age.
 pub fn candles(m: &str) -> DispatchResponse {
     let chart = match chart(m) {
@@ -541,7 +541,7 @@ pub fn candles(m: &str) -> DispatchResponse {
     }))
 }
 
-/// `coins/<mint>/chart.svg`: the same candles drawn as market cap in SOL on
+/// `market/<mint>/chart.svg`: the same candles drawn as market cap in SOL on
 /// a log scale, which keeps a coin that moved a hundredfold readable.
 pub fn chart_svg(m: &str) -> DispatchResponse {
     match chart(m) {
@@ -671,7 +671,7 @@ fn xml(text: &str) -> String {
         .collect()
 }
 
-/// `coins/<mint>/trades.json`: the latest trades, newest first, with who
+/// `market/<mint>/trades.json`: the latest trades, newest first, with who
 /// traded and a tally of buying against selling.
 pub fn trades(m: &str) -> DispatchResponse {
     if pk(m).is_err() {

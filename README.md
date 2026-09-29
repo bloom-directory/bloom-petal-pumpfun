@@ -1,7 +1,10 @@
 # Pump.fun Petal
 
-A mainnet Pump.fun integration for Bloom. It reads coin state and buys or sells
-existing coins through Pump's automatic bonding-curve/PumpSwap routing.
+A mainnet Pump.fun integration for Bloom. It reads coin state and risks,
+charts coins, buys or sells them through Pump's automatic
+bonding-curve/PumpSwap routing, and launches new ones. It trades only coins
+priced in SOL; Pump's program refuses to trade a coin whose curve is priced in
+another token for SOL, and the coin summary says which token that is.
 
 Every write is one operation the owner approves in Bloom, signed with the key
 of the Bloom account they already selected. There is **no session key, no
@@ -53,9 +56,9 @@ status.json
 coins/latest.json
 coins/live.json
 coins/<mint>.json
-coins/<mint>/candles.json
-coins/<mint>/chart.svg
-coins/<mint>/trades.json
+market/<mint>/candles.json
+market/<mint>/chart.svg
+market/<mint>/trades.json
 trade/<wallet>/preflight.json
 trade/<wallet>/holdings.json
 trade/<wallet>/{buy,sell,launch,close_token_account}.json
@@ -84,7 +87,7 @@ at most six of them; `launchBlockPartial` says the block held more. Pump's own
 sniper and bundler flags and third-party risk scores are not used: on a coin
 rugged within 20 seconds of launch, both called it clean.
 
-`coins/<mint>/candles.json` has up to 120 price candles in SOL per token, one
+`market/<mint>/candles.json` has up to 120 price candles in SOL per token, one
 minute each for a coin under two hours old, five minutes under ten hours, and an
 hour after that. `chart.svg` draws them as market cap on a log scale.
 `trades.json` lists the latest 50 trades, with the wallet, side, SOL, tokens,
