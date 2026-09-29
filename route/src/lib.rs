@@ -52,11 +52,14 @@ const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";
 const SOL: &str = "So11111111111111111111111111111111111111112";
 #[cfg(not(test))]
 const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e1111111111111111111111111";
-const CLASSES: [&str; 4] = [
+const CLASSES: [&str; 7] = [
     "pumpfun.buy",
     "pumpfun.sell",
     "pumpfun.close_token_account",
     "pumpfun.launch",
+    "pumpfun.limit_order",
+    "pumpfun.order_slot",
+    "pumpfun.cancel_order",
 ];
 /// Every program a supported transaction may call. Fee collection, fee
 /// sharing and tokenized agents are not supported, and their programs are not
@@ -108,6 +111,7 @@ fn sdk_message(e: &petal::SdkError) -> String {
 mod fake_host;
 pub mod insight;
 mod launch;
+pub mod orders;
 mod txedit;
 pub mod view;
 
@@ -432,6 +436,9 @@ pub enum Action {
     Sell,
     CloseTokenAccount,
     Launch,
+    LimitOrder,
+    OrderSlot,
+    CancelOrder,
 }
 impl Action {
     fn class(self) -> &'static str {
@@ -440,12 +447,15 @@ impl Action {
             Self::Sell => CLASSES[1],
             Self::CloseTokenAccount => CLASSES[2],
             Self::Launch => CLASSES[3],
+            Self::LimitOrder => CLASSES[4],
+            Self::OrderSlot => CLASSES[5],
+            Self::CancelOrder => CLASSES[6],
         }
     }
     fn path(self) -> &'static str {
         match self {
-            Self::Buy | Self::Sell => "/agents/swap",
-            Self::CloseTokenAccount => "",
+            Self::Buy | Self::Sell | Self::LimitOrder => "/agents/swap",
+            Self::CloseTokenAccount | Self::OrderSlot | Self::CancelOrder => "",
             Self::Launch => "/agents/create-coin",
         }
     }
@@ -455,6 +465,16 @@ impl Action {
             Self::Sell => "Sell",
             Self::CloseTokenAccount => "Close token account",
             Self::Launch => "Launch",
+            Self::LimitOrder => "Limit order",
+            Self::OrderSlot => "Order slot",
+            Self::CancelOrder => "Cancel order",
+        }
+    }
+    /// What the transaction does on chain: a limit order is a buy or a sell.
+    fn semantic(self, request: &Map<String, Value>) -> Self {
+        match self {
+            Self::LimitOrder => orders::side(request),
+            other => other,
         }
     }
 }
@@ -486,6 +506,15 @@ struct Pending {
     /// the same URI.
     #[serde(default)]
     metadata_uri: Option<String>,
+    /// For a limit order: its limit, slot and nonce, and once approved the
+    /// signed transaction the Petal sends when the price gets there.
+    #[serde(default)]
+    order: Option<orders::Order>,
+    /// The transaction signing simulates to bound what it can spend, when
+    /// that is not the one signed: a limit order is simulated at today's
+    /// price, because at its limit it would not succeed yet.
+    #[serde(default)]
+    simulate_tx: Option<String>,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -521,15 +550,26 @@ fn build_pending(
     request: &Map<String, Value>,
     digest: String,
     metadata_uri: Option<String>,
+    operation: &str,
+) -> Result<Pending, DispatchResponse> {
+    match a {
+        Action::CloseTokenAccount => build_close_token_account_pending(trader, request, digest),
+        Action::Launch => launch::build(trader, request, digest, metadata_uri),
+        Action::LimitOrder => orders::build(trader, request, digest, operation),
+        Action::OrderSlot => orders::build_slot(trader, request, digest),
+        Action::CancelOrder => orders::build_cancel(trader, request, digest),
+        Action::Buy | Action::Sell => build_swap(a, trader, request, digest),
+    }
+}
+
+/// A buy or sell from Pump's builder, validated, priced and reviewed.
+fn build_swap(
+    a: Action,
+    trader: &Trader<'_>,
+    request: &Map<String, Value>,
+    digest: String,
 ) -> Result<Pending, DispatchResponse> {
     let user = trader.address;
-    match a {
-        Action::CloseTokenAccount => {
-            return build_close_token_account_pending(trader, request, digest);
-        }
-        Action::Launch => return launch::build(trader, request, digest, metadata_uri),
-        Action::Buy | Action::Sell => {}
-    }
     let sell_all = match request
         .get("amount")
         .and_then(Value::as_str)
@@ -633,6 +673,8 @@ fn build_pending(
         created: Some(created),
         sell_all,
         metadata_uri: None,
+        order: None,
+        simulate_tx: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -799,7 +841,10 @@ fn swap_instruction_amounts(message: &Msg, action: Action) -> Result<(u64, u64),
     let discriminator = match action {
         Action::Buy | Action::Launch => IX_BUY,
         Action::Sell => IX_SELL,
-        Action::CloseTokenAccount => return Err("close has no swap instruction".into()),
+        Action::CloseTokenAccount
+        | Action::LimitOrder
+        | Action::OrderSlot
+        | Action::CancelOrder => return Err("this action has no swap instruction to read".into()),
     };
     let swap = message
         .instructions
@@ -1136,6 +1181,8 @@ fn build_close_token_account_pending(
         created: Some(Created::default()),
         sell_all: None,
         metadata_uri: None,
+        order: None,
+        simulate_tx: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1205,7 +1252,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             {
                 let approval = v.approval.take();
                 let metadata_uri = v.metadata_uri.take();
-                v = match build_pending(a, &trader, &r, digest.clone(), metadata_uri) {
+                v = match build_pending(a, &trader, &r, digest.clone(), metadata_uri, &op) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
@@ -1220,7 +1267,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             v
         }
         Ok(None) => {
-            let p = match build_pending(a, &trader, &r, digest, None) {
+            let p = match build_pending(a, &trader, &r, digest, None, &op) {
                 Ok(value) => value,
                 Err(e) => return e,
             };
@@ -1236,7 +1283,15 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     };
     if matches!(
         p.status.as_str(),
-        "submitted" | "broadcast_attempted" | "confirmed" | "finalized" | "chain_failed"
+        "submitted"
+            | "broadcast_attempted"
+            | "confirmed"
+            | "finalized"
+            | "chain_failed"
+            | "open"
+            | "filled"
+            | "cancelled"
+            | "dead"
     ) {
         return DispatchResponse::Write;
     }
@@ -1271,11 +1326,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     if let Some(all) = &p.sell_all {
         r.insert("amount".into(), json!(all.amount));
     }
-    let debits = match effects(a, &r, &parsed_message, p.created) {
+    let semantic = a.semantic(&r);
+    let debits = match effects(semantic, &r, &parsed_message, p.created) {
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let declared_destinations = destinations(a, &parsed_message);
+    let declared_destinations = destinations(semantic, &parsed_message);
     // Bloom refuses a claim naming a destination outside wallet policy, but
     // only after the owner has approved. Say so before asking.
     if !p.may_be_signed
@@ -1298,7 +1354,8 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(total) => total,
         Err(e) => return fail(e),
     };
-    if let Err(e) = simulate_within(&p.tx, &user, declared_native) {
+    let simulated = p.simulate_tx.clone().unwrap_or_else(|| p.tx.clone());
+    if let Err(e) = simulate_within(&simulated, &user, declared_native) {
         // The approval is kept: it is not bound to these bytes, and the
         // retry rebuilds them.
         p.status = "preflight_failed".into();
@@ -1441,6 +1498,23 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     signed[env.sig_offset..env.sig_offset + 64].copy_from_slice(&sig);
     let tx = B64.encode(signed);
     let signature = bs58::encode(sig).into_string();
+    // A limit order is kept, not sent: a check sends it when the price
+    // reaches its limit.
+    if let Some(order) = p.order.as_mut() {
+        order.signed = Some(tx);
+        order.state = "open".into();
+        order.note = Some("waiting for a check".into());
+        p.status = "open".into();
+        p.signature = Some(signature);
+        p.approval = None;
+        if let Err(e) = put(&key, &p, true) {
+            return e;
+        }
+        if let Err(e) = publish(&owner, &op, a, &p) {
+            return e;
+        }
+        return DispatchResponse::Write;
+    }
     p.status = "broadcast_attempted".into();
     p.signature = Some(signature.clone());
     p.approval = None;
@@ -1470,6 +1544,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
+            if matches!(a, Action::CancelOrder)
+                && let Some(order) = r.get("order").and_then(Value::as_str)
+                && let Err(e) = orders::cancelled(&owner, order)
+            {
+                return e;
+            }
             p.status = "submitted".into();
             if let Err(e) = put(&key, &p, true) {
                 return e;
@@ -1533,6 +1613,21 @@ fn verify_ed25519(address: &str, message: &[u8], signature: &[u8]) -> Result<(),
 }
 
 fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), DispatchResponse> {
+    if matches!(a, Action::LimitOrder) {
+        let allowed = [
+            "mint",
+            "amount",
+            "side",
+            "marketCapSol",
+            "slot",
+            "frontRunningProtection",
+            "tipAmount",
+        ];
+        if let Some(field) = r.keys().find(|field| !allowed.contains(&field.as_str())) {
+            return Err(bad(format!("unsupported field {field}")));
+        }
+        return orders::normalize(user, r);
+    }
     let allowed = match a {
         Action::Buy | Action::Sell => &[
             "mint",
@@ -1544,6 +1639,9 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "priorityFee",
         ][..],
         Action::CloseTokenAccount => &["mint", "tokenAccount", "maxLamports"][..],
+        Action::OrderSlot => &["slot"][..],
+        Action::CancelOrder => &["order"][..],
+        Action::LimitOrder => &[][..],
         Action::Launch => &[
             "name",
             "symbol",
@@ -1642,6 +1740,9 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             r.remove("mint");
         }
         Action::Launch => launch::normalize(r)?,
+        Action::OrderSlot => orders::normalize_slot(r)?,
+        Action::CancelOrder => orders::normalize_cancel(r)?,
+        Action::LimitOrder => {}
         Action::CloseTokenAccount => {
             let mint = text(r, "mint", 32, 64)?;
             let token_account = text(r, "tokenAccount", 32, 64)?;
@@ -1765,11 +1866,19 @@ fn effects(
             "asset":{"chain":"solana","asset":"native"},
             "amount":r.get("maxLamports").and_then(Value::as_str).ok_or("close maxLamports missing")?
         })],
+        // An order slot's rent stays in an account the trading account owns,
+        // but it leaves the trading account, so it is declared.
+        Action::OrderSlot => vec![
+            json!({"asset":{"chain":"solana","asset":"native"},"amount":account_rent.to_string()}),
+        ],
+        // A cancel moves nothing but the fee.
+        Action::CancelOrder => Vec::new(),
+        Action::LimitOrder => return Err("a limit order declares the debits of its side".into()),
     };
     let auxiliary_native = tip
         .checked_add(account_rent)
         .ok_or("native debit exceeds u64")?;
-    if auxiliary_native > 0 && !matches!(a, Action::Buy | Action::Launch) {
+    if auxiliary_native > 0 && matches!(a, Action::Sell | Action::CloseTokenAccount) {
         effects.push(json!({
             "asset":{"chain":"solana","asset":"native"},
             "amount":auxiliary_native.to_string()
@@ -1802,6 +1911,14 @@ fn destinations(action: Action, message: &Msg) -> Vec<Value> {
         if Some(program) == system.as_ref()
             && let Ok(destination) = account(message, ix, 1)
             && tips.contains(destination)
+        {
+            values.insert(bs58::encode(destination).into_string());
+        }
+        // Creating an order slot moves its rent into the new account.
+        if matches!(action, Action::OrderSlot)
+            && Some(program) == system.as_ref()
+            && ix.data.starts_with(&[3, 0, 0, 0])
+            && let Ok(destination) = account(message, ix, 1)
         {
             values.insert(bs58::encode(destination).into_string());
         }
@@ -3819,7 +3936,7 @@ fn validate_auxiliary_instructions(
             let mint_allowed = match action {
                 Action::Buy | Action::Sell => account_mint == mint || account_mint == &wrapped_mint,
                 Action::Launch => account_mint == mint,
-                Action::CloseTokenAccount => false,
+                _ => false,
             };
             if !mint_allowed {
                 return Err("associated-token mint is unrelated to the request".into());
@@ -7406,6 +7523,274 @@ mod tests {
             "{}",
             dispatch_message(&response)
         );
+    }
+
+    const NONCE_VALUE: [u8; 32] = [8; 32];
+
+    fn nonce_account(authority: &str) -> Value {
+        let mut data = 1u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&pk(authority).unwrap());
+        data.extend_from_slice(&NONCE_VALUE);
+        data.extend_from_slice(&5_000u64.to_le_bytes());
+        json!({"owner": PROGRAMS[1], "lamports": 1_447_680, "data": [B64.encode(data), "base64"]})
+    }
+
+    fn slot0() -> String {
+        bs58::encode(orders::slot_address(&pk(USER).unwrap(), 0).unwrap()).into_string()
+    }
+
+    fn host_with_order_slot() -> FakeHost {
+        let mut host = host_serving_a_buy();
+        host.chain.accounts.insert(slot0(), nonce_account(USER));
+        host.chain.accounts.insert(
+            BOND_MINT.to_owned(),
+            json!({"owner": PROGRAMS[4], "lamports": 1,
+                "data": {"parsed": {"info": {"supply": "1000000000000000", "decimals": 6}}}}),
+        );
+        host
+    }
+
+    fn place_order(operation: &str, cap: f64) -> DispatchResponse {
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_LIMIT")]),
+            Action::LimitOrder,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": operation, "mint": BOND_MINT,
+                "amount": "1000000", "side": "buy", "marketCapSol": cap,
+                "frontRunningProtection": false}))
+            .unwrap(),
+        )
+    }
+
+    fn stored_order(operation: &str) -> orders::Order {
+        let pending: Value =
+            fake_host::with(|host| host.secret_json(&secret_key(&owner(), operation)).unwrap());
+        serde_json::from_value(pending["order"].clone()).unwrap()
+    }
+
+    fn check_orders() {
+        assert_eq!(
+            orders::check(&ctx(&[("wallet", WALLET)]), WALLET.to_owned()),
+            DispatchResponse::Write
+        );
+    }
+
+    /// A limit buy is approved and signed now and kept, not sent: its
+    /// blockhash is the slot's nonce, its first instruction advances that
+    /// nonce, and its amounts buy only at the limit. A check sends it once a
+    /// simulation says it would fill, and a later check confirms it.
+    #[test]
+    fn a_limit_buy_is_signed_now_and_sent_when_the_price_gets_there() {
+        fake_host::install(host_with_order_slot());
+        let response = place_order("order-1", 20.0);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let order = stored_order("order-1");
+        assert_eq!((order.state.as_str(), order.slot), ("open", 0));
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("sendTransaction").is_empty(),
+                "an order is not sent when placed"
+            );
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            assert_eq!(claim["operation_class"], json!("pumpfun.limit_order"));
+        });
+        let signed = B64.decode(order.signed.as_deref().unwrap()).unwrap();
+        assert_eq!(signed[0], 1, "one signature, filled in");
+        assert!(signed[1..65].iter().any(|b| *b != 0));
+        let mut parsed = message(&signed[65..]).unwrap();
+        append_lookup_addresses(&mut parsed, &test_lookup_tables()).unwrap();
+        assert_eq!(parsed.blockhash, NONCE_VALUE);
+        let advance = &parsed.instructions[0];
+        assert_eq!(parsed.keys[advance.program], pk(PROGRAMS[1]).unwrap());
+        assert_eq!(
+            parsed.keys[usize::from(advance.accounts[0])],
+            pk(&slot0()).unwrap()
+        );
+        let buy = parsed
+            .instructions
+            .iter()
+            .find(|ix| has_discriminator(ix, IX_BUY))
+            .unwrap();
+        let expected = (1_000_000.0_f64 / 1.015 / (20.0 * 1e9 / 1e15)).floor() as u64;
+        assert_eq!(
+            instruction_u64(buy, 8).unwrap(),
+            expected,
+            "tokens at the limit"
+        );
+        assert_eq!(
+            instruction_u64(buy, 16).unwrap(),
+            1_000_000,
+            "spends at most the amount"
+        );
+        let review = public_operation("order-1")["review"].to_string();
+        assert!(
+            review.contains("Limit buy") && review.contains("at or below 20.00 SOL"),
+            "{review}"
+        );
+
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":{"InstructionError":[3,{"Custom":6002}]}}}}),
+            );
+        });
+        check_orders();
+        let order = stored_order("order-1");
+        assert_eq!(order.state, "open");
+        assert!(order.note.unwrap().contains("not reached"));
+
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":null}}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("order-1").state, "submitted");
+        let signed = stored_order_signed("order-1");
+        fake_host::with(|host| {
+            let sent = host.calls_for("sendTransaction");
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].rpc_params().unwrap()[0], json!(signed));
+            host.reply(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"result":{"value":[{"err":null,"confirmationStatus":"confirmed"}]}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("order-1").state, "filled");
+    }
+
+    fn stored_order_signed(operation: &str) -> String {
+        stored_order(operation).signed.unwrap()
+    }
+
+    /// One slot holds one open order; a second waits for another slot.
+    #[test]
+    fn a_slot_holds_one_open_order() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("order-a", 20.0), DispatchResponse::Write);
+        let second = place_order("order-b", 20.0);
+        assert!(
+            dispatch_message(&second).contains("no free order slot"),
+            "{}",
+            dispatch_message(&second)
+        );
+    }
+
+    /// A graduated coin's curve order can never fill and says so.
+    #[test]
+    fn an_order_for_a_graduated_curve_is_retired() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("order-g", 20.0), DispatchResponse::Write);
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":{"InstructionError":[3,{"Custom":6005}]}}}}),
+            );
+        });
+        check_orders();
+        let order = stored_order("order-g");
+        assert_eq!(order.state, "dead");
+        assert!(order.note.unwrap().contains("graduated"));
+    }
+
+    /// Cancelling advances the slot's nonce with a transaction the Petal
+    /// builds itself, and marks the order cancelled once it is sent.
+    #[test]
+    fn cancelling_advances_the_nonce_and_frees_the_slot() {
+        let mut host = host_with_order_slot();
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        fake_host::install(host);
+        assert_eq!(place_order("order-c", 20.0), DispatchResponse::Write);
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_CANCEL")]),
+            Action::CancelOrder,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "cancel-c", "order": "order-c"})).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        assert_eq!(stored_order("order-c").state, "cancelled");
+        fake_host::with(|host| {
+            let sent = host.calls_for("sendTransaction");
+            let raw = B64
+                .decode(
+                    sent.last().unwrap().rpc_params().unwrap()[0]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            let parsed = message(&raw[65..]).unwrap();
+            assert_eq!(parsed.instructions.len(), 1);
+            assert_eq!(parsed.instructions[0].data, [4, 0, 0, 0]);
+            assert_eq!(parsed.keys[1], pk(&slot0()).unwrap());
+        });
+        assert_eq!(
+            place_order("order-d", 20.0),
+            DispatchResponse::Write,
+            "the slot is free again"
+        );
+    }
+
+    /// Creating a slot declares its rent and names the new account as the
+    /// destination the rent goes to.
+    #[test]
+    fn creating_an_order_slot_declares_its_rent_and_account() {
+        let mut host = host_with_order_slot();
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.reply(
+            &format!("{RPC} getMinimumBalanceForRentExemption"),
+            json!({"result": 1_447_680}),
+        );
+        fake_host::install(host);
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+            Action::OrderSlot,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "slot-1", "slot": 1})).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let slot1 =
+            bs58::encode(orders::slot_address(&pk(USER).unwrap(), 1).unwrap()).into_string();
+        fake_host::with(|host| {
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            assert_eq!(
+                claim["declared_destinations"],
+                json!([{"chain":"solana","destination":slot1}])
+            );
+            assert_eq!(claim["declared_debits"][0]["amount"], json!("1447680"));
+        });
+        let existing = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+            Action::OrderSlot,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "slot-0", "slot": 0})).unwrap(),
+        );
+        assert!(dispatch_message(&existing).contains("already exists"));
     }
 
     const CREATE_URL: &str = "https://fun-block.pump.fun/agents/create-coin";
