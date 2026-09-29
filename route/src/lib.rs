@@ -1275,7 +1275,15 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":destinations(a,&parsed_message),"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.max(p.network_fee_cap_lamports).to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
+    let declared_destinations = destinations(a, &parsed_message);
+    // Bloom refuses a claim naming a destination outside wallet policy, but
+    // only after the owner has approved. Say so before asking.
+    if !p.may_be_signed
+        && let Err(e) = destinations_allowed(&owner, &declared_destinations, p.front)
+    {
+        return e;
+    }
+    let claim = json!({"package_hash":c.package_hash,"route":route,"operation_class":a.class(),"crypto_suite":"ed25519-message","payload_digest":hex::encode(batch),"ordered_hashes":[hex::encode(hash)],"declared_debits":debits,"declared_destinations":declared_destinations,"declared_fee":{"kind":"fee","chain":"solana","asset":"native","amount":p.network_fee_lamports.max(p.network_fee_cap_lamports).to_string()},"nonce":hex::encode(&Sha256::digest([p.digest.as_bytes(),&env.blockhash].concat())[..16]),"claim_assurance":{"kind":"machine_asserted"}});
     let claim_jcs = match serde_jcs::to_vec(&claim) {
         Ok(value) => value,
         Err(e) => return fail(format!("signing claim cannot be canonicalized: {e}")),
@@ -1808,6 +1816,60 @@ fn destinations(action: Action, message: &Msg) -> Vec<Value> {
         .into_iter()
         .map(|destination| json!({"chain":"solana","destination":destination}))
         .collect()
+}
+/// Refuse, before any approval is asked for, a transaction that pays a
+/// destination the wallet's policy does not allow: Bloom would refuse its
+/// claim only after the owner approved. A policy the Petal cannot read is
+/// left to Bloom to enforce.
+fn destinations_allowed(
+    owner: &TradeOwner,
+    declared: &[Value],
+    protected: bool,
+) -> Result<(), DispatchResponse> {
+    let path = format!("wallets/{}/policy.json", owner.wallet);
+    let Some(policy) = host::vfs_read(&path, MAX)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return Ok(());
+    };
+    let Some(allowed) = policy.get("allowed_destinations").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let permitted = |destination: &str| {
+        allowed.iter().any(|entry| {
+            entry.get("chain").and_then(Value::as_str) == Some("solana")
+                && entry.get("destination").and_then(Value::as_str) == Some(destination)
+        })
+    };
+    let missing = declared
+        .iter()
+        .filter_map(|d| d.get("destination").and_then(Value::as_str))
+        .filter(|d| !permitted(d))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let tips_missing = JITO_TIPS
+        .iter()
+        .filter(|tip| !permitted(tip))
+        .collect::<Vec<_>>();
+    let tip_advice = if protected && !tips_missing.is_empty() {
+        format!(
+            " Front-running protection pays one of Jito's tip accounts, chosen anew each time the transaction is built, so allow all of them ({}), or send with \"frontRunningProtection\":false.",
+            tips_missing
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+    Err(deny(format!(
+        "wallet policy does not allow {}; Bloom would refuse this transaction after approval. Add it to allowed_destinations in {path} with `bloom wallet update-policy`.{tip_advice}",
+        missing.join(", ")
+    )))
 }
 fn publish(owner: &TradeOwner, o: &str, a: Action, p: &Pending) -> Result<(), DispatchResponse> {
     put(
@@ -7301,6 +7363,48 @@ mod tests {
                 "creatorHistory",
                 "launch"
             ])
+        );
+    }
+
+    /// A protected trade whose tip accounts the wallet policy does not
+    /// allow is refused before any approval is asked for, and says how to fix
+    /// it; the same trade unprotected goes ahead.
+    #[test]
+    fn a_trade_outside_wallet_policy_is_refused_before_approval() {
+        let policy = json!({"allowed_destinations": [
+            {"chain": "solana", "destination": PROGRAMS[5]},
+            {"chain": "solana", "destination": PROGRAMS[6]}]});
+        let mut host = host_serving_a_buy();
+        host.reply_only(SWAP_URL, fixture("buy_bond_protected"));
+        host.seed_vfs(
+            &format!("wallets/{WALLET}/policy.json"),
+            &policy.to_string(),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-policy", true);
+        let message = dispatch_message(&response);
+        assert!(
+            message.contains("wallet policy does not allow"),
+            "{message}"
+        );
+        assert!(
+            message.contains("allow all of them") && message.contains(JITO_TIPS[0]),
+            "{message}"
+        );
+        fake_host::with(|host| assert!(host.sign_requests.is_empty()));
+
+        let mut host = host_serving_a_buy();
+        host.seed_vfs(
+            &format!("wallets/{WALLET}/policy.json"),
+            &policy.to_string(),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-policy-2", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
         );
     }
 

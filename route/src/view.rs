@@ -865,7 +865,10 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                 .iter()
                 .map(|t| {
                     let mint = t["mint"].as_str().unwrap_or("");
-                    let (symbol, name) = names.get(mint).cloned().unwrap_or_default();
+                    let (symbol, name) = names
+                        .get(mint)
+                        .cloned()
+                        .unwrap_or_else(|| ("?".into(), "unknown token".into()));
                     vec![
                         format!("{} {}", cell(&symbol), cell(&name)),
                         t["uiAmount"]
@@ -902,7 +905,10 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                 .iter()
                 .map(|t| {
                     let mint = t["mint"].as_str().unwrap_or("");
-                    let (symbol, name) = names.get(mint).cloned().unwrap_or_default();
+                    let (symbol, name) = names
+                        .get(mint)
+                        .cloned()
+                        .unwrap_or_else(|| ("?".into(), "unknown token".into()));
                     let image = Some(image_link(mint, 86));
                     format!(
                         "<tr><td><a class=coin href=\"../../coins/{mint}.html\">{avatar}<span><b>{sym}</b><br><span class=muted>{name}</span></span></a></td><td class=num>{amount}</td><td class=num>{worth}</td><td><code>{short}</code></td></tr>",
@@ -1131,7 +1137,7 @@ fn cell(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '|' => '¦',
-            '`' | '<' | '>' | '*' | '_' | '[' | ']' | '#' => '·',
+            '`' | '<' | '>' => '·',
             c => c,
         })
         .collect()
@@ -1510,6 +1516,7 @@ mod tests {
     #[test]
     fn creator_text_cannot_escape_its_cell_or_tag() {
         assert_eq!(cell("a|b`<c>"), "a¦b··c·");
+        assert_eq!(cell("test_do_not_buy"), "test_do_not_buy");
         assert_eq!(width("火🐸a"), 5);
         assert_eq!(
             html("<script>'x'&\"y\"</script>"),
