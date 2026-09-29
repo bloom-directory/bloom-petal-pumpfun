@@ -155,6 +155,17 @@ impl FakeHost {
         self.calls.iter().filter_map(Call::rpc_method).collect()
     }
 
+    /// How many distinct transactions were broadcast. One transaction
+    /// carried on several routes is one broadcast.
+    pub fn broadcasts(&self) -> usize {
+        self.calls_for("sendTransaction")
+            .iter()
+            .filter_map(|c| c.rpc_params().and_then(|p| p.get(0)).cloned())
+            .map(|tx| tx.to_string())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     /// The calls that carried a given JSON-RPC method.
     pub fn calls_for(&self, rpc_method: &str) -> Vec<&Call> {
         self.calls

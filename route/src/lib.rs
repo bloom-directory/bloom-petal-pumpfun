@@ -398,30 +398,56 @@ fn fetch_within(
         Ok(v)
     }
 }
-/// Send a signed transaction through the public RPCs, which rebroadcast it
-/// until its blockhash expires. The primary preflights at the commitment the
-/// blockhash was read and simulated at (the finalized default lags and
-/// reports a young blockhash as not found). The
-/// verifying RPC is a pool of nodes, and one may not have seen the block its
-/// sibling gave the blockhash from, so the fallback skips a preflight that
-/// the Petal's own simulation, moments before signing, already did.
+/// Send a signed transaction through the public RPCs. The primary
+/// preflights at the commitment the blockhash was read and simulated at (the
+/// finalized default lags and reports a young blockhash as not found). A
+/// transaction it refuses in preflight stops there: it would only fail on
+/// chain and still cost its fee. Otherwise the same signed bytes also go to
+/// the verifying RPC, without a preflight its pool of nodes can fail on a
+/// blockhash one of them has not seen, and to Jito's block engine. On mainnet
+/// the primary accepted transactions and never forwarded them; one signature
+/// lands at most once, however many routes carry it.
 fn send_public(tx: &str) -> Result<Value, DispatchResponse> {
-    post_exact(
+    let send =
+        |url: &str, options: Value| post_raw(url, &rpc("sendTransaction", json!([tx, options])));
+    let primary = send(
         RPC,
-        &rpc(
-            "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"preflightCommitment":COMMITMENT}]),
-        ),
+        json!({"encoding":"base64","skipPreflight":false,"preflightCommitment":COMMITMENT}),
+    );
+    if let Ok(v) = &primary
+        && v.pointer("/error/code").and_then(Value::as_i64) == Some(-32002)
+    {
+        return Err(fail(format!(
+            "the RPC refused the transaction in preflight: {}",
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("simulation failed")
+        )));
+    }
+    let verify = send(
+        RPC_VERIFY,
+        json!({"encoding":"base64","skipPreflight":true}),
+    );
+    let jito = send(JITO, json!({"encoding":"base64"}));
+    [primary, verify, jito]
+        .into_iter()
+        .flatten()
+        .find(|v| v.get("result").is_some())
+        .ok_or_else(|| fail("no RPC accepted the transaction"))
+}
+/// A JSON POST whose JSON-RPC error, if any, is returned rather than raised.
+fn post_raw(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
+    let r = host::http(
+        &HttpRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
+        },
+        MAX,
     )
-    .or_else(|_| {
-        post_exact(
-            RPC_VERIFY,
-            &rpc(
-                "sendTransaction",
-                json!([tx,{"encoding":"base64","skipPreflight":true}]),
-            ),
-        )
-    })
+    .map_err(|e| fail(sdk_message(&e)))?;
+    serde_json::from_slice(&r.body).map_err(|e| fail(format!("invalid remote JSON: {e}")))
 }
 
 /// A POST to `url`. A read from the primary RPC falls back to the verifying
@@ -4954,7 +4980,7 @@ mod tests {
                 host.rpc_methods()
             );
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 1, "exactly one broadcast attempt");
+            assert_eq!(host.broadcasts(), 1, "exactly one broadcast");
             let send = sends[0];
             assert_eq!(send.url, RPC, "an unprotected buy uses the public RPC");
             assert_eq!(send.method, "POST");
@@ -5024,7 +5050,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unprotected_buy_retries_a_rejected_send_once_on_the_verify_rpc() {
+    fn an_unprotected_buy_is_carried_by_every_route_when_the_primary_fails() {
         let mut host = host_serving_a_buy();
         host.reply_only(
             &format!("{RPC} sendTransaction"),
@@ -5049,9 +5075,10 @@ mod tests {
 
         fake_host::with(|host| {
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 2, "one rejected send, one retry");
+            assert_eq!(sends.len(), 3, "the primary, the verifying RPC and Jito");
             assert_eq!(sends[0].url, RPC);
             assert_eq!(sends[1].url, RPC_VERIFY);
+            assert_eq!(sends[2].url, JITO);
             let params = |i: usize| sends[i].rpc_params().unwrap().clone();
             assert_eq!(
                 params(0)[0],
@@ -5267,7 +5294,7 @@ mod tests {
                 "the retry signs a rebuilt transaction"
             );
             assert_eq!(host.calls_for("getLatestBlockhash").len(), 2);
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5353,7 +5380,7 @@ mod tests {
         fake_host::with(|host| {
             assert_eq!(builder_calls(host), 2, "the retry rebuilt the transaction");
             assert_eq!(host.sign_requests.len(), 1);
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5400,7 +5427,7 @@ mod tests {
                 envelope(&raw).unwrap().message,
                 "only the stored message is signed"
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5430,7 +5457,7 @@ mod tests {
         );
         fake_host::with(|host| {
             assert_eq!(
-                host.calls_for("sendTransaction").len(),
+                host.broadcasts(),
                 1,
                 "a changed request under a used id must not produce a second payment"
             );
@@ -5449,11 +5476,7 @@ mod tests {
         assert_eq!(run_buy("buy-once", false), DispatchResponse::Write);
 
         fake_host::with(|host| {
-            assert_eq!(
-                host.calls_for("sendTransaction").len(),
-                1,
-                "one economic intent, one broadcast"
-            );
+            assert_eq!(host.broadcasts(), 1, "one economic intent, one broadcast");
             assert_eq!(
                 host.sign_requests.len(),
                 1,
@@ -5687,7 +5710,7 @@ mod tests {
                 1,
                 "the builder must not be asked to quote a second transaction"
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
 
         let settled = fake_host::with(|host| {
@@ -5776,7 +5799,7 @@ mod tests {
                 host.sign_requests[0].preimage,
                 host.sign_requests[1].preimage
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5819,7 +5842,7 @@ mod tests {
                 host.sign_requests[1].preimage,
                 host.sign_requests[2].preimage
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5880,7 +5903,7 @@ mod tests {
             assert_eq!(builder_calls(host), 3, "each retry rebuilt");
             assert_eq!(host.sign_requests.len(), 2);
             assert!(host.sign_requests.iter().all(|r| r.approval_hint.is_none()));
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5941,11 +5964,7 @@ mod tests {
         assert_eq!(public_operation("buy-poll")["status"], json!("finalized"));
 
         fake_host::with(|host| {
-            assert_eq!(
-                host.calls_for("sendTransaction").len(),
-                1,
-                "polling never re-broadcasts"
-            );
+            assert_eq!(host.broadcasts(), 1, "polling never re-broadcasts");
         });
     }
 
@@ -6207,7 +6226,7 @@ mod tests {
                 "account 1 never adopted it"
             );
             assert_eq!(
-                host.calls_for("sendTransaction").len(),
+                host.broadcasts(),
                 1,
                 "one broadcast, from the account that owns the operation"
             );
@@ -7588,6 +7607,21 @@ mod tests {
         );
     }
 
+    /// A transaction the primary refuses in preflight would only fail on
+    /// chain, so it is not handed to any other route.
+    #[test]
+    fn a_preflight_refusal_is_not_forwarded() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} sendTransaction"),
+            json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed"},"id":1}),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-refused", false);
+        assert!(dispatch_message(&response).contains("refused the transaction in preflight"));
+        fake_host::with(|host| assert_eq!(host.broadcasts(), 1));
+    }
+
     const NONCE_VALUE: [u8; 32] = [8; 32];
 
     fn nonce_account(authority: &str) -> Value {
@@ -7720,7 +7754,7 @@ mod tests {
         let signed = stored_order_signed("order-1");
         fake_host::with(|host| {
             let sent = host.calls_for("sendTransaction");
-            assert_eq!(sent.len(), 1);
+            assert_eq!(host.broadcasts(), 1);
             assert_eq!(sent[0].rpc_params().unwrap()[0], json!(signed));
             host.reply(
                 &format!("{RPC} getSignatureStatuses"),
@@ -7942,8 +7976,11 @@ mod tests {
             assert!(built.get("image").is_none(), "the image goes to IPFS only");
 
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 1);
-            assert_eq!(sends[0].url, RPC, "a launch is not sent through Jito");
+            assert_eq!(host.broadcasts(), 1);
+            assert_eq!(
+                sends[0].url, RPC,
+                "a launch is sent through the public RPC first"
+            );
             let sent = B64
                 .decode(sends[0].rpc_params().unwrap()[0].as_str().unwrap())
                 .unwrap();
