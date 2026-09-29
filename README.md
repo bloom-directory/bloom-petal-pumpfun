@@ -54,6 +54,9 @@ status.json
 coins/latest.json
 coins/live.json
 coins/<mint>.json
+coins/<mint>/candles.json
+coins/<mint>/chart.svg
+coins/<mint>/trades.json
 trade/<wallet>/preflight.json
 trade/<wallet>/holdings.json
 trade/<wallet>/{buy,sell,close_token_account}.json
@@ -62,11 +65,32 @@ trade/<wallet>/operations/<operationId>.json
 
 `coins/<mint>.json` is a safety summary rather than Pump's raw record: the
 price, market cap and curve progress read from the chain now, whether the coin
-has graduated, its age, the creator and the share of supply the creator still
-holds — tokens they can sell into buyers — plus plain warnings (the creator
-holds 5% or more, the coin is under an hour old, it has no links, Pump banned
-it, or no curve or pool exists). Only `https://` links are kept, and the
-creator's description is not passed through.
+has graduated, its age and creator, plain warnings, and a `risk` block. Only
+`https://` links are kept, and the creator's description is not passed through.
+
+| `risk` field | Source | Warns when |
+|---|---|---|
+| `creatorHoldsPct` | the creator's associated token accounts, on chain | 5% or more: tokens they can sell into buyers |
+| `creatorBoughtAtLaunchPct` | the creation block's transactions | the creator now holds less than half of it |
+| `launchBlockBuyers`, `launchBlockBoughtPct` | other fee payers in the creation block | they bought 10% or more, which is how a bundled launch looks |
+| `top10HoldPct`, `holders` | Pump's holder index, less the curve and pool | the ten largest own 30% or more |
+| `creatorOtherCoins`, `creatorGraduatedCoins` | Pump's listing filtered by creator | five or more other coins and none graduated |
+| `mintAuthority`, `freezeAuthority`, `tokenExtensions` | the mint account, on chain | anyone can mint or freeze, or the mint has an extension Pump coins lack |
+| `belowAllTimeHighPct` | Pump's market caps | 50% or more below the high |
+
+Each check is best effort; one that could not be made is named in
+`risk.unchecked` and the rest still report. The creation block is read only
+while the coin is on its curve and its curve has fewer than 1,000 transactions,
+at most six of them; `launchBlockPartial` says the block held more. Pump's own
+sniper and bundler flags and third-party risk scores are not used: on a coin
+rugged within 20 seconds of launch, both called it clean.
+
+`coins/<mint>/candles.json` has up to 120 price candles in SOL per token, one
+minute each for a coin under two hours old, five minutes under ten hours, and an
+hour after that. `chart.svg` draws them as market cap on a log scale.
+`trades.json` lists the latest 50 trades, with the wallet, side, SOL, tokens,
+venue and transaction, and tallies buying against selling. All three come from
+Pump's trade index at `swap-api.pump.fun`.
 
 `coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
 creator is streaming, up to 25 each, without banned or NSFW coins. Names and
