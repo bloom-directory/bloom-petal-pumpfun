@@ -479,6 +479,7 @@ pub(crate) fn build_slot(
         [1, 0, 3],
         &keys,
         &instructions,
+        tip_lamports(request)?,
         digest,
         Created {
             count: 1,
@@ -549,6 +550,7 @@ pub(crate) fn build_cancel(
         [1, 0, 2],
         &keys,
         &instructions,
+        tip_lamports(request)?,
         digest,
         Created::default(),
         review_head,
@@ -563,11 +565,50 @@ fn own_transaction(
     header: [u8; 3],
     keys: &[[u8; 32]],
     instructions: &[Ix],
+    tip: u64,
     digest: String,
     created: Created,
     mut review: Vec<String>,
     api: Value,
 ) -> Result<Pending, DispatchResponse> {
+    // With a tip, the transaction goes through Jito's block engine, as
+    // protected trades do. On mainnet the public RPCs accepted these
+    // transactions and none of them reached a block. The tip account joins
+    // the writable keys, and the indices of the read-only keys move up.
+    let mut keys = keys.to_vec();
+    let mut instructions = instructions.to_vec();
+    let mut header = header;
+    if tip > 0 {
+        let tip_account = pk(JITO_TIPS[0]).map_err(fail)?;
+        let at = keys.len() - usize::from(header[2]);
+        keys.insert(at, tip_account);
+        for ix in &mut instructions {
+            if ix.program >= at {
+                ix.program += 1;
+            }
+            for account in &mut ix.accounts {
+                if usize::from(*account) >= at {
+                    *account += 1;
+                }
+            }
+        }
+        let system = keys
+            .iter()
+            .position(|k| *k == pk(PROGRAMS[1]).unwrap_or_default())
+            .ok_or_else(|| fail("the System program is missing"))?;
+        instructions.push(Ix {
+            program: system,
+            accounts: vec![0, u8::try_from(at).map_err(|_| fail("too many keys"))?],
+            data: [&2u32.to_le_bytes()[..], &tip.to_le_bytes()].concat(),
+        });
+        review.push(format!(
+            "Jito tip: {}; sent through Jito's block engine",
+            lamports_display(tip)
+        ));
+        header = [header[0], header[1], header[2]];
+    }
+    let keys = &keys[..];
+    let instructions = &instructions[..];
     let latest = post(
         RPC,
         &rpc("getLatestBlockhash", json!([{"commitment":COMMITMENT}])),
@@ -611,7 +652,11 @@ fn own_transaction(
     ));
     review.push(format!(
         "Most this can cost in total: {}",
-        lamports_display(network_fee_lamports.saturating_add(created.lamports))
+        lamports_display(
+            network_fee_lamports
+                .saturating_add(created.lamports)
+                .saturating_add(tip)
+        )
     ));
     let _ = trader;
     Ok(Pending {
@@ -619,7 +664,7 @@ fn own_transaction(
         tx: B64.encode(txedit::unsigned_transaction(&message).map_err(fail)?),
         message_sha256: hex::encode(Sha256::digest(&message)),
         api,
-        front: false,
+        front: tip > 0,
         network_fee_lamports,
         network_fee_cap_lamports: network_fee_lamports,
         created: Some(created),

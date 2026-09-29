@@ -1696,8 +1696,8 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "priorityFee",
         ][..],
         Action::CloseTokenAccount => &["mint", "tokenAccount", "maxLamports"][..],
-        Action::OrderSlot => &["slot"][..],
-        Action::CancelOrder => &["order"][..],
+        Action::OrderSlot => &["slot", "frontRunningProtection", "tipAmount"][..],
+        Action::CancelOrder => &["order", "frontRunningProtection", "tipAmount"][..],
         Action::LimitOrder => &[][..],
         Action::Launch => &[
             "name",
@@ -1717,8 +1717,13 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
     // Swaps are sent through Jito with its "don't front" account unless the
     // request opts out: the block engine then rejects any bundle that puts a
     // transaction ahead of this one, which is how most sandwiches are built.
-    let swap = matches!(a, Action::Buy | Action::Sell);
-    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(swap);
+    // Swaps, and the order slot and cancel transactions the Petal builds
+    // itself, go through Jito unless the request opts out.
+    let jito = matches!(
+        a,
+        Action::Buy | Action::Sell | Action::OrderSlot | Action::CancelOrder
+    );
+    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(jito);
     let tip_lamports = match (front, r.contains_key("tipAmount")) {
         (true, false) => DEFAULT_TIP_LAMPORTS,
         _ => tip_lamports(r)?,
@@ -1925,10 +1930,12 @@ fn effects(
         })],
         // An order slot's rent stays in an account the trading account owns,
         // but it leaves the trading account, so it is declared.
-        Action::OrderSlot => vec![
-            json!({"asset":{"chain":"solana","asset":"native"},"amount":account_rent.to_string()}),
-        ],
-        // A cancel moves nothing but the fee.
+        Action::OrderSlot => vec![json!({"asset":{"chain":"solana","asset":"native"},
+            "amount":account_rent.checked_add(tip).ok_or("native debit exceeds u64")?.to_string()})],
+        // A cancel moves nothing but the fee and the tip.
+        Action::CancelOrder if tip > 0 => {
+            vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":tip.to_string()})]
+        }
         Action::CancelOrder => Vec::new(),
         Action::LimitOrder => return Err("a limit order declares the debits of its side".into()),
     };
@@ -7863,12 +7870,16 @@ mod tests {
             let parsed = message(&raw[65..]).unwrap();
             assert_eq!(
                 parsed.instructions.len(),
-                3,
-                "priority fee, then the advance"
+                4,
+                "priority fee, the advance, the tip"
             );
             assert_eq!(parsed.instructions[0].data[0], 2);
             assert_eq!(parsed.instructions[1].data[0], 3);
             assert_eq!(parsed.instructions[2].data, [4, 0, 0, 0]);
+            assert_eq!(
+                parsed.keys[usize::from(parsed.instructions[3].accounts[1])],
+                pk(JITO_TIPS[0]).unwrap()
+            );
             assert_eq!(parsed.keys[1], pk(&slot0()).unwrap());
         });
         assert_eq!(
@@ -7909,11 +7920,22 @@ mod tests {
         fake_host::with(|host| {
             let claim: Value =
                 serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            let mut expected = vec![
+                json!({"chain":"solana","destination":slot1}),
+                json!({"chain":"solana","destination":JITO_TIPS[0]}),
+            ];
+            expected.sort_by_key(|d| d["destination"].as_str().unwrap().to_owned());
+            assert_eq!(claim["declared_destinations"], json!(expected));
             assert_eq!(
-                claim["declared_destinations"],
-                json!([{"chain":"solana","destination":slot1}])
+                claim["declared_debits"][0]["amount"],
+                json!((1_447_680 + 10_000).to_string())
             );
-            assert_eq!(claim["declared_debits"][0]["amount"], json!("1447680"));
+            let sent = host.calls_for("sendTransaction");
+            assert_eq!(
+                sent.last().unwrap().url,
+                JITO,
+                "the Petal's own transactions go through Jito"
+            );
         });
         let existing = execute(
             &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
