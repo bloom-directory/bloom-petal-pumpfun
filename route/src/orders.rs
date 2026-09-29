@@ -26,6 +26,12 @@ const NONCE_SPACE: u64 = 80;
 /// Compute units a slot creation or a cancel is given; each uses a few
 /// thousand.
 const OWN_COMPUTE_UNITS: u32 = 20_000;
+/// The least a slot creation or cancel pays per compute unit, in
+/// micro-lamports: 0.00004 SOL for the whole transaction, near what the
+/// builder pays per unit for trades. New accounts have
+/// no fee history to price from, and at the trades' floor a slot creation
+/// sat unlanded on mainnet until its blockhash expired.
+const OWN_COMPUTE_UNIT_PRICE: u64 = 2_000_000;
 /// Order slots a trading account may have.
 pub(crate) const SLOTS: u64 = 4;
 /// Pump's fee is 1.25% on the curve and 0.85% on PumpSwap. An order's
@@ -578,7 +584,7 @@ fn own_transaction(
         .collect::<Vec<_>>();
     let price = recent_compute_unit_price(&writable)
         .unwrap_or(0)
-        .max(MIN_COMPUTE_UNIT_PRICE);
+        .max(OWN_COMPUTE_UNIT_PRICE);
     let mut keys = keys.to_vec();
     keys.push(pk(PROGRAMS[0]).map_err(fail)?);
     let budget = keys.len() - 1;

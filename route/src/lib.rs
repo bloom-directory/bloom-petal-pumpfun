@@ -398,9 +398,10 @@ fn fetch_within(
         Ok(v)
     }
 }
-/// Send a signed transaction through the public RPCs. The primary
-/// preflights at the commitment the blockhash was read and simulated at (the
-/// finalized default lags and reports a young blockhash as not found). The
+/// Send a signed transaction through the public RPCs, which rebroadcast it
+/// until its blockhash expires. The primary preflights at the commitment the
+/// blockhash was read and simulated at (the finalized default lags and
+/// reports a young blockhash as not found). The
 /// verifying RPC is a pool of nodes, and one may not have seen the block its
 /// sibling gave the blockhash from, so the fallback skips a preflight that
 /// the Petal's own simulation, moments before signing, already did.
@@ -409,7 +410,7 @@ fn send_public(tx: &str) -> Result<Value, DispatchResponse> {
         RPC,
         &rpc(
             "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
+            json!([tx,{"encoding":"base64","skipPreflight":false,"preflightCommitment":COMMITMENT}]),
         ),
     )
     .or_else(|_| {
