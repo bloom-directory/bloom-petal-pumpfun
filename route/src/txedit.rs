@@ -108,6 +108,135 @@ pub(crate) fn rewrite(
     Ok((out, index))
 }
 
+/// The durable-nonce form of `message`: its first instruction advances
+/// `nonce_account` (whose authority is the fee payer, static key 0), and its
+/// recent blockhash is the nonce's value, so the signed transaction stays
+/// valid until the nonce is advanced, by this transaction or a cancel.
+///
+/// The nonce account joins the writable unsigned static keys, and the
+/// recent-blockhashes sysvar (and the System program, if the builder only
+/// loaded it from a table) join the read-only unsigned ones. Every account
+/// index is moved to match. Instructions and lookups are otherwise copied.
+pub(crate) fn with_durable_nonce(
+    message: &[u8],
+    instructions: &[Ix],
+    nonce_account: &[u8; 32],
+    nonce_value: &[u8; 32],
+    system_program: &[u8; 32],
+    recent_blockhashes: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let layout = layout(message)?;
+    let [_, required, readonly_signed, readonly_unsigned] = message[..4] else {
+        return Err("message header missing".into());
+    };
+    let static_count = layout.static_count;
+    let (static_keys, _) =
+        message[layout.keys_end - static_count * 32..layout.keys_end].as_chunks::<32>();
+    if static_keys.contains(nonce_account) || static_keys.contains(recent_blockhashes) {
+        return Err("the builder's message already names the nonce accounts".into());
+    }
+    let writable_end = static_count
+        .checked_sub(usize::from(readonly_unsigned))
+        .filter(|end| *end >= usize::from(required))
+        .ok_or("inconsistent message header")?;
+    let system = static_keys.iter().position(|key| key == system_program);
+    let appended = 1 + usize::from(system.is_none());
+    if static_count + 1 + appended > 127 {
+        return Err("no room for the nonce keys".into());
+    }
+    let moved = |index: usize| -> Result<u8, String> {
+        let moved = if index < writable_end {
+            index
+        } else if index < static_count {
+            index + 1
+        } else {
+            index + 1 + appended
+        };
+        u8::try_from(moved).map_err(|_| "account index overflow".to_string())
+    };
+    let mut keys: Vec<[u8; 32]> = static_keys.to_vec();
+    keys.insert(writable_end, *nonce_account);
+    keys.push(*recent_blockhashes);
+    if system.is_none() {
+        keys.push(*system_program);
+    }
+    let system_index = match system {
+        Some(index) => moved(index)?,
+        None => u8::try_from(keys.len() - 1).map_err(|_| "account index overflow")?,
+    };
+    let advance = Ix {
+        program: usize::from(system_index),
+        accounts: vec![
+            u8::try_from(writable_end).map_err(|_| "account index overflow")?,
+            u8::try_from(static_count + 1).map_err(|_| "account index overflow")?,
+            0,
+        ],
+        data: vec![4, 0, 0, 0],
+    };
+    let mut out = Vec::with_capacity(message.len() + 160);
+    out.extend_from_slice(&[
+        0x80,
+        required,
+        readonly_signed,
+        readonly_unsigned
+            .checked_add(u8::try_from(appended).map_err(|_| "key count overflow")?)
+            .ok_or("read-only key count overflow")?,
+    ]);
+    encode_short(keys.len(), &mut out);
+    for key in &keys {
+        out.extend_from_slice(key);
+    }
+    out.extend_from_slice(nonce_value);
+    encode_short(instructions.len() + 1, &mut out);
+    for ix in std::iter::once(&advance).chain(instructions) {
+        let program = if std::ptr::eq(ix, &advance) {
+            u8::try_from(ix.program).map_err(|_| "program index overflow")?
+        } else {
+            moved(ix.program)?
+        };
+        out.push(program);
+        encode_short(ix.accounts.len(), &mut out);
+        for account in &ix.accounts {
+            if std::ptr::eq(ix, &advance) {
+                out.push(*account);
+            } else {
+                out.push(moved(usize::from(*account))?);
+            }
+        }
+        encode_short(ix.data.len(), &mut out);
+        out.extend_from_slice(&ix.data);
+    }
+    out.extend_from_slice(&message[layout.instructions.1..]);
+    Ok(out)
+}
+
+/// A v0 message with no address lookups: `header` is (required signers,
+/// read-only signed, read-only unsigned), and each instruction names its
+/// program and accounts by index into `keys`.
+pub(crate) fn plain_message(
+    header: [u8; 3],
+    keys: &[[u8; 32]],
+    blockhash: &[u8; 32],
+    instructions: &[Ix],
+) -> Result<Vec<u8>, String> {
+    let mut out = vec![0x80, header[0], header[1], header[2]];
+    encode_short(keys.len(), &mut out);
+    for key in keys {
+        out.extend_from_slice(key);
+    }
+    out.extend_from_slice(blockhash);
+    encode_short(instructions.len(), &mut out);
+    for ix in instructions {
+        out.push(u8::try_from(ix.program).map_err(|_| "program index overflow")?);
+        encode_short(ix.accounts.len(), &mut out);
+        out.extend_from_slice(&ix.accounts);
+        encode_short(ix.data.len(), &mut out);
+        out.extend_from_slice(&ix.data);
+    }
+    out.push(0);
+    Ok(out)
+}
+
 /// An unsigned transaction carrying `message`, with one zeroed signature slot
 /// per required signer.
 pub(crate) fn unsigned_transaction(message: &[u8]) -> Result<Vec<u8>, String> {
@@ -167,6 +296,67 @@ mod tests {
                     *a
                 };
                 assert_eq!(*b, expected);
+            }
+        }
+    }
+
+    /// The durable form of a builder message keeps every account an
+    /// instruction names, adds the nonce advance first, and carries the
+    /// nonce as its blockhash.
+    #[test]
+    fn the_durable_nonce_form_keeps_every_account_and_advances_first() {
+        let tables = super::super::test_lookup_tables();
+        for name in [
+            "buy_bond",
+            "buy_amm",
+            "sell_bond",
+            "sell_amm",
+            "buy_bond_protected",
+        ] {
+            let original = fixture_message(name);
+            let mut before = parse(&original).unwrap();
+            super::super::append_lookup_addresses(&mut before, &tables).unwrap();
+            let (nonce, value, system, sysvar) = ([7u8; 32], [8u8; 32], [0u8; 32], [6u8; 32]);
+            let durable = with_durable_nonce(
+                &original,
+                &before.instructions,
+                &nonce,
+                &value,
+                &system,
+                &sysvar,
+            )
+            .unwrap();
+            let mut after = parse(&durable).unwrap();
+            super::super::append_lookup_addresses(&mut after, &tables).unwrap();
+            assert_eq!(after.blockhash, value, "{name}");
+            assert_eq!(after.required, before.required);
+            let advance = &after.instructions[0];
+            assert_eq!(after.keys[advance.program], system, "{name}");
+            assert_eq!(advance.data, [4, 0, 0, 0]);
+            let named = |m: &super::super::Msg, ix: &Ix| {
+                ix.accounts
+                    .iter()
+                    .map(|a| m.keys[usize::from(*a)])
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(named(&after, advance), vec![nonce, sysvar, before.keys[0]]);
+            assert!(
+                after.writable(usize::from(advance.accounts[0])),
+                "the nonce account is writable"
+            );
+            assert!(!after.writable(usize::from(advance.accounts[1])));
+            assert_eq!(after.instructions.len(), before.instructions.len() + 1);
+            for (b, a) in before.instructions.iter().zip(&after.instructions[1..]) {
+                assert_eq!(before.keys[b.program], after.keys[a.program], "{name}");
+                assert_eq!(named(&before, b), named(&after, a), "{name}");
+                assert_eq!(b.data, a.data);
+                for (ib, ia) in b.accounts.iter().zip(&a.accounts) {
+                    assert_eq!(
+                        before.writable(usize::from(*ib)),
+                        after.writable(usize::from(*ia)),
+                        "{name}: writability is preserved"
+                    );
+                }
             }
         }
     }

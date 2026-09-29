@@ -5,6 +5,6 @@ petal::route_file!(
             Ok(v) => v,
             Err(e) => return e,
         };
-        crate::view::holdings(c, w, crate::view::Format::Html)
+        crate::orders::list(c, w)
     }
 );

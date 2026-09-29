@@ -289,6 +289,8 @@ pub(crate) fn build(
         created: Some(created),
         sell_all: None,
         metadata_uri: Some(uri),
+        order: None,
+        simulate_tx: None,
         status: "built".into(),
         signature: None,
         approval: None,

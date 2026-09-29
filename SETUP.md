@@ -55,6 +55,7 @@ Bloom compares every destination a claim declares against
 | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
 | all eight Jito tip accounts | a protected write | every buy and sell, unless `"frontRunningProtection":false` |
 | the trading account's own Solana address | `close_token_account` | returning the rent — see below |
+| each order slot's address | `order_slot` | creating the slot; `orders.json` lists the addresses |
 
 Which Pump program a given mint routes through depends on whether it has
 migrated, and the Petal does not choose — the builder does. Allow both, or read

@@ -71,6 +71,7 @@ coins/<mint>.{md,html,json}                 price, chart, risks, trades
 market/<mint>/{candles,trades}.json         the chart and trades as data
 trade/<wallet>/holdings.{md,html,json}      what the account holds, and its worth
 trade/<wallet>/{buy,sell,launch,close_token_account}.json
+trade/<wallet>/{limit,order_slot,cancel_order,check_orders}.json, orders.json
 trade/<wallet>/preflight.json
 trade/<wallet>/operations/<operationId>.json
 status.json
@@ -222,6 +223,47 @@ rent (0.0087 SOL for the mint, curve and accounts, simulated on 29 September
 2026) and total; a launch with a 0.001 SOL first buy came to 0.0097 SOL. Each rebuild
 draws a new mint, so the coin's address is the one in the signed transaction:
 read `operations/<operationId>.json`, `api.mintPublicKey`.
+
+## Limit orders
+
+A limit buy fills only while the market cap is at or below a level; a limit
+sell (take-profit) only once it is at or above one. You approve an order once,
+when you place it, and it stays valid until it fills or you cancel it.
+
+```sh
+# once: an order slot, a nonce account the trading account owns (0.00106 SOL rent)
+echo '{"operationId":"slot-0","slot":0}' > trade/<wallet>/order_slot.json
+# place: buy 0.05 SOL of a coin once its market cap is at or below 30 SOL
+echo '{"operationId":"dip-1","mint":"<mint>","side":"buy","amount":"50000000","marketCapSol":30}' > trade/<wallet>/limit.json
+# check, from an agent or a timer: sends any order whose price has arrived
+echo '{}' > trade/<wallet>/check_orders.json
+cat trade/<wallet>/orders.json
+# cancel
+echo '{"operationId":"cancel-1","order":"dip-1"}' > trade/<wallet>/cancel_order.json
+```
+
+An order is an ordinary Pump buy or sell from the builder, validated as any
+trade is, with two changes. Its amounts are set to the limit, so Pump's own
+program refuses it until the price is there: a buy names the tokens its SOL
+buys at the limit, and a sell names the least SOL its tokens fetch at the
+limit, both with 1.5% left for Pump's fee so the fill is at the limit or
+better. And its recent blockhash is the slot's durable nonce, with the
+nonce's advance as its first instruction, so the signed transaction does not
+expire. The Petal stores it and a check simulates it, sending it only when the
+simulation succeeds; Pump's "price not reached" errors leave it waiting, and
+a coin that graduated off its curve retires a curve order. Cancelling
+advances the nonce, which voids the stored transaction. When the order is
+signed, the Petal simulates it at today's price to hold what it can spend to
+the approval, as for any trade.
+
+One slot holds one open order, because landing or cancelling anything on a
+nonce advances it; there are four slots. Each slot's address must be an
+allowed destination in the wallet policy, since its rent moves into it; the
+Petal names it before asking for approval. Nothing fills unless something
+writes to `check_orders.json`: an agent, or a timer such as
+`watch -n 10 "echo '{}' > …/check_orders.json"`. A stop-loss cannot be
+expressed: a sell's floor keeps it from filling below a price, never above
+one.
 
 ## Closing an empty token account
 

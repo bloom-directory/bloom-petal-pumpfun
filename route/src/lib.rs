@@ -52,11 +52,14 @@ const JITO: &str = "https://mainnet.block-engine.jito.wtf/api/v1/transactions";
 const SOL: &str = "So11111111111111111111111111111111111111112";
 #[cfg(not(test))]
 const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e1111111111111111111111111";
-const CLASSES: [&str; 4] = [
+const CLASSES: [&str; 7] = [
     "pumpfun.buy",
     "pumpfun.sell",
     "pumpfun.close_token_account",
     "pumpfun.launch",
+    "pumpfun.limit_order",
+    "pumpfun.order_slot",
+    "pumpfun.cancel_order",
 ];
 /// Every program a supported transaction may call. Fee collection, fee
 /// sharing and tokenized agents are not supported, and their programs are not
@@ -108,6 +111,7 @@ fn sdk_message(e: &petal::SdkError) -> String {
 mod fake_host;
 pub mod insight;
 mod launch;
+pub mod orders;
 mod txedit;
 pub mod view;
 
@@ -394,7 +398,74 @@ fn fetch_within(
         Ok(v)
     }
 }
+/// Send a signed transaction through the public RPCs. The primary
+/// preflights at the commitment the blockhash was read and simulated at (the
+/// finalized default lags and reports a young blockhash as not found). A
+/// transaction it refuses in preflight stops there: it would only fail on
+/// chain and still cost its fee. Otherwise the same signed bytes also go to
+/// the verifying RPC, without a preflight its pool of nodes can fail on a
+/// blockhash one of them has not seen, and to Jito's block engine. On mainnet
+/// the primary accepted transactions and never forwarded them; one signature
+/// lands at most once, however many routes carry it.
+fn send_public(tx: &str) -> Result<Value, DispatchResponse> {
+    let send =
+        |url: &str, options: Value| post_raw(url, &rpc("sendTransaction", json!([tx, options])));
+    let primary = send(
+        RPC,
+        json!({"encoding":"base64","skipPreflight":false,"preflightCommitment":COMMITMENT}),
+    );
+    // A blockhash one of the primary's nodes has not seen is that node's
+    // lag, not a failure of the transaction, and the other routes may carry
+    // it; anything else it refuses in preflight would fail on chain.
+    if let Ok(v) = &primary
+        && v.pointer("/error/code").and_then(Value::as_i64) == Some(-32002)
+        && v.pointer("/error/data/err").and_then(Value::as_str) != Some("BlockhashNotFound")
+    {
+        return Err(fail(format!(
+            "the RPC refused the transaction in preflight: {}",
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("simulation failed")
+        )));
+    }
+    let verify = send(
+        RPC_VERIFY,
+        json!({"encoding":"base64","skipPreflight":true}),
+    );
+    let jito = send(JITO, json!({"encoding":"base64"}));
+    [primary, verify, jito]
+        .into_iter()
+        .flatten()
+        .find(|v| v.get("result").is_some())
+        .ok_or_else(|| fail("no RPC accepted the transaction"))
+}
+/// A JSON POST whose JSON-RPC error, if any, is returned rather than raised.
+fn post_raw(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
+    let r = host::http(
+        &HttpRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: serde_json::to_vec(v).map_err(|e| fail(e.to_string()))?,
+        },
+        MAX,
+    )
+    .map_err(|e| fail(sdk_message(&e)))?;
+    serde_json::from_slice(&r.body).map_err(|e| fail(format!("invalid remote JSON: {e}")))
+}
+
+/// A POST to `url`. A read from the primary RPC falls back to the verifying
+/// one when the primary fails outright: the primary is a free public
+/// endpoint that has gone down whole, and one outage should not stop every
+/// trade. Checks that compare the two RPCs use `post_exact`, so each side
+/// really is asked.
 fn post(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
+    match post_exact(url, v) {
+        Err(_) if url == RPC => post_exact(RPC_VERIFY, v),
+        result => result,
+    }
+}
+fn post_exact(url: &str, v: &Value) -> Result<Value, DispatchResponse> {
     fetch(
         "POST",
         url.into(),
@@ -432,6 +503,9 @@ pub enum Action {
     Sell,
     CloseTokenAccount,
     Launch,
+    LimitOrder,
+    OrderSlot,
+    CancelOrder,
 }
 impl Action {
     fn class(self) -> &'static str {
@@ -440,12 +514,15 @@ impl Action {
             Self::Sell => CLASSES[1],
             Self::CloseTokenAccount => CLASSES[2],
             Self::Launch => CLASSES[3],
+            Self::LimitOrder => CLASSES[4],
+            Self::OrderSlot => CLASSES[5],
+            Self::CancelOrder => CLASSES[6],
         }
     }
     fn path(self) -> &'static str {
         match self {
-            Self::Buy | Self::Sell => "/agents/swap",
-            Self::CloseTokenAccount => "",
+            Self::Buy | Self::Sell | Self::LimitOrder => "/agents/swap",
+            Self::CloseTokenAccount | Self::OrderSlot | Self::CancelOrder => "",
             Self::Launch => "/agents/create-coin",
         }
     }
@@ -455,6 +532,16 @@ impl Action {
             Self::Sell => "Sell",
             Self::CloseTokenAccount => "Close token account",
             Self::Launch => "Launch",
+            Self::LimitOrder => "Limit order",
+            Self::OrderSlot => "Order slot",
+            Self::CancelOrder => "Cancel order",
+        }
+    }
+    /// What the transaction does on chain: a limit order is a buy or a sell.
+    fn semantic(self, request: &Map<String, Value>) -> Self {
+        match self {
+            Self::LimitOrder => orders::side(request),
+            other => other,
         }
     }
 }
@@ -486,6 +573,15 @@ struct Pending {
     /// the same URI.
     #[serde(default)]
     metadata_uri: Option<String>,
+    /// For a limit order: its limit, slot and nonce, and once approved the
+    /// signed transaction the Petal sends when the price gets there.
+    #[serde(default)]
+    order: Option<orders::Order>,
+    /// The transaction signing simulates to bound what it can spend, when
+    /// that is not the one signed: a limit order is simulated at today's
+    /// price, because at its limit it would not succeed yet.
+    #[serde(default)]
+    simulate_tx: Option<String>,
     status: String,
     signature: Option<String>,
     approval: Option<String>,
@@ -521,15 +617,26 @@ fn build_pending(
     request: &Map<String, Value>,
     digest: String,
     metadata_uri: Option<String>,
+    operation: &str,
+) -> Result<Pending, DispatchResponse> {
+    match a {
+        Action::CloseTokenAccount => build_close_token_account_pending(trader, request, digest),
+        Action::Launch => launch::build(trader, request, digest, metadata_uri),
+        Action::LimitOrder => orders::build(trader, request, digest, operation),
+        Action::OrderSlot => orders::build_slot(trader, request, digest),
+        Action::CancelOrder => orders::build_cancel(trader, request, digest),
+        Action::Buy | Action::Sell => build_swap(a, trader, request, digest),
+    }
+}
+
+/// A buy or sell from Pump's builder, validated, priced and reviewed.
+fn build_swap(
+    a: Action,
+    trader: &Trader<'_>,
+    request: &Map<String, Value>,
+    digest: String,
 ) -> Result<Pending, DispatchResponse> {
     let user = trader.address;
-    match a {
-        Action::CloseTokenAccount => {
-            return build_close_token_account_pending(trader, request, digest);
-        }
-        Action::Launch => return launch::build(trader, request, digest, metadata_uri),
-        Action::Buy | Action::Sell => {}
-    }
     let sell_all = match request
         .get("amount")
         .and_then(Value::as_str)
@@ -633,6 +740,8 @@ fn build_pending(
         created: Some(created),
         sell_all,
         metadata_uri: None,
+        order: None,
+        simulate_tx: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -799,7 +908,10 @@ fn swap_instruction_amounts(message: &Msg, action: Action) -> Result<(u64, u64),
     let discriminator = match action {
         Action::Buy | Action::Launch => IX_BUY,
         Action::Sell => IX_SELL,
-        Action::CloseTokenAccount => return Err("close has no swap instruction".into()),
+        Action::CloseTokenAccount
+        | Action::LimitOrder
+        | Action::OrderSlot
+        | Action::CancelOrder => return Err("this action has no swap instruction to read".into()),
     };
     let swap = message
         .instructions
@@ -949,7 +1061,7 @@ fn token_account_fact(
     rpc_url: &str,
     token_account: &str,
 ) -> Result<TokenAccountFact, DispatchResponse> {
-    let value = post(
+    let value = post_exact(
         rpc_url,
         &rpc(
             "getAccountInfo",
@@ -1136,6 +1248,8 @@ fn build_close_token_account_pending(
         created: Some(Created::default()),
         sell_all: None,
         metadata_uri: None,
+        order: None,
+        simulate_tx: None,
         status: "built".into(),
         signature: None,
         approval: None,
@@ -1205,7 +1319,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             {
                 let approval = v.approval.take();
                 let metadata_uri = v.metadata_uri.take();
-                v = match build_pending(a, &trader, &r, digest.clone(), metadata_uri) {
+                v = match build_pending(a, &trader, &r, digest.clone(), metadata_uri, &op) {
                     Ok(value) => value,
                     Err(e) => return e,
                 };
@@ -1220,7 +1334,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             v
         }
         Ok(None) => {
-            let p = match build_pending(a, &trader, &r, digest, None) {
+            let p = match build_pending(a, &trader, &r, digest, None, &op) {
                 Ok(value) => value,
                 Err(e) => return e,
             };
@@ -1236,7 +1350,15 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     };
     if matches!(
         p.status.as_str(),
-        "submitted" | "broadcast_attempted" | "confirmed" | "finalized" | "chain_failed"
+        "submitted"
+            | "broadcast_attempted"
+            | "confirmed"
+            | "finalized"
+            | "chain_failed"
+            | "open"
+            | "filled"
+            | "cancelled"
+            | "dead"
     ) {
         return DispatchResponse::Write;
     }
@@ -1271,11 +1393,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     if let Some(all) = &p.sell_all {
         r.insert("amount".into(), json!(all.amount));
     }
-    let debits = match effects(a, &r, &parsed_message, p.created) {
+    let semantic = a.semantic(&r);
+    let debits = match effects(semantic, &r, &parsed_message, p.created) {
         Ok(value) => value,
         Err(e) => return fail(e),
     };
-    let declared_destinations = destinations(a, &parsed_message);
+    let declared_destinations = destinations(semantic, &parsed_message);
     // Bloom refuses a claim naming a destination outside wallet policy, but
     // only after the owner has approved. Say so before asking.
     if !p.may_be_signed
@@ -1298,7 +1421,8 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         Ok(total) => total,
         Err(e) => return fail(e),
     };
-    if let Err(e) = simulate_within(&p.tx, &user, declared_native) {
+    let simulated = p.simulate_tx.clone().unwrap_or_else(|| p.tx.clone());
+    if let Err(e) = simulate_within(&simulated, &user, declared_native) {
         // The approval is kept: it is not bound to these bytes, and the
         // retry rebuilds them.
         p.status = "preflight_failed".into();
@@ -1441,6 +1565,23 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     signed[env.sig_offset..env.sig_offset + 64].copy_from_slice(&sig);
     let tx = B64.encode(signed);
     let signature = bs58::encode(sig).into_string();
+    // A limit order is kept, not sent: a check sends it when the price
+    // reaches its limit.
+    if let Some(order) = p.order.as_mut() {
+        order.signed = Some(tx);
+        order.state = "open".into();
+        order.note = Some("waiting for a check".into());
+        p.status = "open".into();
+        p.signature = Some(signature);
+        p.approval = None;
+        if let Err(e) = put(&key, &p, true) {
+            return e;
+        }
+        if let Err(e) = publish(&owner, &op, a, &p) {
+            return e;
+        }
+        return DispatchResponse::Write;
+    }
     p.status = "broadcast_attempted".into();
     p.signature = Some(signature.clone());
     p.approval = None;
@@ -1456,20 +1597,16 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
         )
     } else {
-        // Preflight at the commitment the blockhash was read and simulated at.
-        // The finalized default lags and reports young blockhashes as
-        // BlockhashNotFound after the transaction is already signed.
-        let request = rpc(
-            "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
-        );
-        match post(RPC, &request) {
-            Err(_) => post(RPC_VERIFY, &request),
-            result => result,
-        }
+        send_public(&tx)
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
+            if matches!(a, Action::CancelOrder)
+                && let Some(order) = r.get("order").and_then(Value::as_str)
+                && let Err(e) = orders::cancelled(&owner, order)
+            {
+                return e;
+            }
             p.status = "submitted".into();
             if let Err(e) = put(&key, &p, true) {
                 return e;
@@ -1533,6 +1670,21 @@ fn verify_ed25519(address: &str, message: &[u8], signature: &[u8]) -> Result<(),
 }
 
 fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), DispatchResponse> {
+    if matches!(a, Action::LimitOrder) {
+        let allowed = [
+            "mint",
+            "amount",
+            "side",
+            "marketCapSol",
+            "slot",
+            "frontRunningProtection",
+            "tipAmount",
+        ];
+        if let Some(field) = r.keys().find(|field| !allowed.contains(&field.as_str())) {
+            return Err(bad(format!("unsupported field {field}")));
+        }
+        return orders::normalize(user, r);
+    }
     let allowed = match a {
         Action::Buy | Action::Sell => &[
             "mint",
@@ -1544,6 +1696,9 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             "priorityFee",
         ][..],
         Action::CloseTokenAccount => &["mint", "tokenAccount", "maxLamports"][..],
+        Action::OrderSlot => &["slot", "frontRunningProtection", "tipAmount"][..],
+        Action::CancelOrder => &["order", "frontRunningProtection", "tipAmount"][..],
+        Action::LimitOrder => &[][..],
         Action::Launch => &[
             "name",
             "symbol",
@@ -1562,8 +1717,13 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
     // Swaps are sent through Jito with its "don't front" account unless the
     // request opts out: the block engine then rejects any bundle that puts a
     // transaction ahead of this one, which is how most sandwiches are built.
-    let swap = matches!(a, Action::Buy | Action::Sell);
-    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(swap);
+    // Swaps, and the order slot and cancel transactions the Petal builds
+    // itself, go through Jito unless the request opts out.
+    let jito = matches!(
+        a,
+        Action::Buy | Action::Sell | Action::OrderSlot | Action::CancelOrder
+    );
+    let front = optional_bool(r, "frontRunningProtection")?.unwrap_or(jito);
     let tip_lamports = match (front, r.contains_key("tipAmount")) {
         (true, false) => DEFAULT_TIP_LAMPORTS,
         _ => tip_lamports(r)?,
@@ -1642,6 +1802,9 @@ fn normalize(a: Action, user: &str, r: &mut Map<String, Value>) -> Result<(), Di
             r.remove("mint");
         }
         Action::Launch => launch::normalize(r)?,
+        Action::OrderSlot => orders::normalize_slot(r)?,
+        Action::CancelOrder => orders::normalize_cancel(r)?,
+        Action::LimitOrder => {}
         Action::CloseTokenAccount => {
             let mint = text(r, "mint", 32, 64)?;
             let token_account = text(r, "tokenAccount", 32, 64)?;
@@ -1765,11 +1928,21 @@ fn effects(
             "asset":{"chain":"solana","asset":"native"},
             "amount":r.get("maxLamports").and_then(Value::as_str).ok_or("close maxLamports missing")?
         })],
+        // An order slot's rent stays in an account the trading account owns,
+        // but it leaves the trading account, so it is declared.
+        Action::OrderSlot => vec![json!({"asset":{"chain":"solana","asset":"native"},
+            "amount":account_rent.checked_add(tip).ok_or("native debit exceeds u64")?.to_string()})],
+        // A cancel moves nothing but the fee and the tip.
+        Action::CancelOrder if tip > 0 => {
+            vec![json!({"asset":{"chain":"solana","asset":"native"},"amount":tip.to_string()})]
+        }
+        Action::CancelOrder => Vec::new(),
+        Action::LimitOrder => return Err("a limit order declares the debits of its side".into()),
     };
     let auxiliary_native = tip
         .checked_add(account_rent)
         .ok_or("native debit exceeds u64")?;
-    if auxiliary_native > 0 && !matches!(a, Action::Buy | Action::Launch) {
+    if auxiliary_native > 0 && matches!(a, Action::Sell | Action::CloseTokenAccount) {
         effects.push(json!({
             "asset":{"chain":"solana","asset":"native"},
             "amount":auxiliary_native.to_string()
@@ -1802,6 +1975,14 @@ fn destinations(action: Action, message: &Msg) -> Vec<Value> {
         if Some(program) == system.as_ref()
             && let Ok(destination) = account(message, ix, 1)
             && tips.contains(destination)
+        {
+            values.insert(bs58::encode(destination).into_string());
+        }
+        // Creating an order slot moves its rent into the new account.
+        if matches!(action, Action::OrderSlot)
+            && Some(program) == system.as_ref()
+            && ix.data.starts_with(&[3, 0, 0, 0])
+            && let Ok(destination) = account(message, ix, 1)
         {
             values.insert(bs58::encode(destination).into_string());
         }
@@ -3521,7 +3702,7 @@ fn hydrate_lookups(message: &mut Msg, _response: &Value) -> Result<(), DispatchR
 
 #[cfg(not(test))]
 fn fetch_lookup_table(url: &str, table: &str) -> Result<Vec<Value>, DispatchResponse> {
-    let value = post(
+    let value = post_exact(
         url,
         &rpc(
             "getAccountInfo",
@@ -3819,7 +4000,7 @@ fn validate_auxiliary_instructions(
             let mint_allowed = match action {
                 Action::Buy | Action::Sell => account_mint == mint || account_mint == &wrapped_mint,
                 Action::Launch => account_mint == mint,
-                Action::CloseTokenAccount => false,
+                _ => false,
             };
             if !mint_allowed {
                 return Err("associated-token mint is unrelated to the request".into());
@@ -4810,7 +4991,7 @@ mod tests {
                 host.rpc_methods()
             );
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 1, "exactly one broadcast attempt");
+            assert_eq!(host.broadcasts(), 1, "exactly one broadcast");
             let send = sends[0];
             assert_eq!(send.url, RPC, "an unprotected buy uses the public RPC");
             assert_eq!(send.method, "POST");
@@ -4880,7 +5061,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unprotected_buy_retries_a_rejected_send_once_on_the_verify_rpc() {
+    fn an_unprotected_buy_is_carried_by_every_route_when_the_primary_fails() {
         let mut host = host_serving_a_buy();
         host.reply_only(
             &format!("{RPC} sendTransaction"),
@@ -4905,12 +5086,21 @@ mod tests {
 
         fake_host::with(|host| {
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 2, "one rejected send, one retry");
+            assert_eq!(sends.len(), 3, "the primary, the verifying RPC and Jito");
             assert_eq!(sends[0].url, RPC);
             assert_eq!(sends[1].url, RPC_VERIFY);
+            assert_eq!(sends[2].url, JITO);
+            let params = |i: usize| sends[i].rpc_params().unwrap().clone();
             assert_eq!(
-                sends[0].body, sends[1].body,
-                "the retry is the identical request"
+                params(0)[0],
+                params(1)[0],
+                "the retry sends the same transaction"
+            );
+            assert_eq!(params(0)[1]["skipPreflight"], json!(false));
+            assert_eq!(
+                params(1)[1]["skipPreflight"],
+                json!(true),
+                "the fallback skips a preflight a lagging node of the pool could fail"
             );
         });
         assert_eq!(
@@ -5115,7 +5305,7 @@ mod tests {
                 "the retry signs a rebuilt transaction"
             );
             assert_eq!(host.calls_for("getLatestBlockhash").len(), 2);
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5201,7 +5391,7 @@ mod tests {
         fake_host::with(|host| {
             assert_eq!(builder_calls(host), 2, "the retry rebuilt the transaction");
             assert_eq!(host.sign_requests.len(), 1);
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5248,7 +5438,7 @@ mod tests {
                 envelope(&raw).unwrap().message,
                 "only the stored message is signed"
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5278,7 +5468,7 @@ mod tests {
         );
         fake_host::with(|host| {
             assert_eq!(
-                host.calls_for("sendTransaction").len(),
+                host.broadcasts(),
                 1,
                 "a changed request under a used id must not produce a second payment"
             );
@@ -5297,11 +5487,7 @@ mod tests {
         assert_eq!(run_buy("buy-once", false), DispatchResponse::Write);
 
         fake_host::with(|host| {
-            assert_eq!(
-                host.calls_for("sendTransaction").len(),
-                1,
-                "one economic intent, one broadcast"
-            );
+            assert_eq!(host.broadcasts(), 1, "one economic intent, one broadcast");
             assert_eq!(
                 host.sign_requests.len(),
                 1,
@@ -5535,7 +5721,7 @@ mod tests {
                 1,
                 "the builder must not be asked to quote a second transaction"
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
 
         let settled = fake_host::with(|host| {
@@ -5624,7 +5810,7 @@ mod tests {
                 host.sign_requests[0].preimage,
                 host.sign_requests[1].preimage
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5667,7 +5853,7 @@ mod tests {
                 host.sign_requests[1].preimage,
                 host.sign_requests[2].preimage
             );
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5728,7 +5914,7 @@ mod tests {
             assert_eq!(builder_calls(host), 3, "each retry rebuilt");
             assert_eq!(host.sign_requests.len(), 2);
             assert!(host.sign_requests.iter().all(|r| r.approval_hint.is_none()));
-            assert_eq!(host.calls_for("sendTransaction").len(), 1);
+            assert_eq!(host.broadcasts(), 1);
         });
     }
 
@@ -5789,11 +5975,7 @@ mod tests {
         assert_eq!(public_operation("buy-poll")["status"], json!("finalized"));
 
         fake_host::with(|host| {
-            assert_eq!(
-                host.calls_for("sendTransaction").len(),
-                1,
-                "polling never re-broadcasts"
-            );
+            assert_eq!(host.broadcasts(), 1, "polling never re-broadcasts");
         });
     }
 
@@ -6055,7 +6237,7 @@ mod tests {
                 "account 1 never adopted it"
             );
             assert_eq!(
-                host.calls_for("sendTransaction").len(),
+                host.broadcasts(),
                 1,
                 "one broadcast, from the account that owns the operation"
             );
@@ -7408,6 +7590,362 @@ mod tests {
         );
     }
 
+    /// When the primary RPC fails outright, a read goes to the verifying
+    /// RPC instead; a check that compares the two still asks the primary.
+    #[test]
+    fn a_failed_primary_rpc_read_falls_back_but_cross_checks_do_not() {
+        let mut host = FakeHost::new(NOW_MS);
+        let down =
+            json!({"jsonrpc":"2.0","error":{"code":-32603,"message":"Upstream returned non-JSON"}});
+        host.reply(&format!("{RPC} getMultipleAccounts"), down.clone());
+        host.reply(&format!("{RPC} getAccountInfo"), down);
+        host.reply(
+            &format!("{RPC_VERIFY} getAccountInfo"),
+            empty_token_account(),
+        );
+        fake_host::install(host);
+        assert_eq!(markets(&[pk(BOND_MINT).unwrap()]).unwrap(), vec![None]);
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("getMultipleAccounts")
+                    .iter()
+                    .any(|c| c.url == RPC_VERIFY)
+            );
+        });
+        assert!(
+            token_account_fact(RPC, TOKEN_ACCOUNT).is_err(),
+            "no fallback inside a cross-check"
+        );
+    }
+
+    /// A transaction the primary refuses in preflight would only fail on
+    /// chain, so it is not handed to any other route.
+    #[test]
+    fn a_preflight_refusal_is_not_forwarded() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} sendTransaction"),
+            json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed"},"id":1}),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-refused", false);
+        assert!(dispatch_message(&response).contains("refused the transaction in preflight"));
+        fake_host::with(|host| assert_eq!(host.broadcasts(), 1));
+    }
+
+    /// A primary node that has not seen the blockhash yet does not stop the
+    /// transaction: the other routes carry it without a preflight.
+    #[test]
+    fn a_lagging_primary_node_does_not_stop_the_send() {
+        let mut host = host_serving_a_buy();
+        host.reply_only(
+            &format!("{RPC} sendTransaction"),
+            json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found","data":{"err":"BlockhashNotFound"}},"id":1}),
+        );
+        host.reply(
+            &format!("{RPC_VERIFY} sendTransaction"),
+            json!({"result": "$signature"}),
+        );
+        fake_host::install(host);
+        let response = run_buy("buy-lagging", false);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|host| assert_eq!(host.calls_for("sendTransaction").len(), 3));
+    }
+
+    const NONCE_VALUE: [u8; 32] = [8; 32];
+
+    fn nonce_account(authority: &str) -> Value {
+        let mut data = 1u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&pk(authority).unwrap());
+        data.extend_from_slice(&NONCE_VALUE);
+        data.extend_from_slice(&5_000u64.to_le_bytes());
+        json!({"owner": PROGRAMS[1], "lamports": 1_447_680, "data": [B64.encode(data), "base64"]})
+    }
+
+    fn slot0() -> String {
+        bs58::encode(orders::slot_address(&pk(USER).unwrap(), 0).unwrap()).into_string()
+    }
+
+    fn host_with_order_slot() -> FakeHost {
+        let mut host = host_serving_a_buy();
+        host.chain.accounts.insert(slot0(), nonce_account(USER));
+        host.chain.accounts.insert(
+            BOND_MINT.to_owned(),
+            json!({"owner": PROGRAMS[4], "lamports": 1,
+                "data": {"parsed": {"info": {"supply": "1000000000000000", "decimals": 6}}}}),
+        );
+        host
+    }
+
+    fn place_order(operation: &str, cap: f64) -> DispatchResponse {
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_LIMIT")]),
+            Action::LimitOrder,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": operation, "mint": BOND_MINT,
+                "amount": "1000000", "side": "buy", "marketCapSol": cap,
+                "frontRunningProtection": false}))
+            .unwrap(),
+        )
+    }
+
+    fn stored_order(operation: &str) -> orders::Order {
+        let pending: Value =
+            fake_host::with(|host| host.secret_json(&secret_key(&owner(), operation)).unwrap());
+        serde_json::from_value(pending["order"].clone()).unwrap()
+    }
+
+    fn check_orders() {
+        assert_eq!(
+            orders::check(&ctx(&[("wallet", WALLET)]), WALLET.to_owned()),
+            DispatchResponse::Write
+        );
+    }
+
+    /// A limit buy is approved and signed now and kept, not sent: its
+    /// blockhash is the slot's nonce, its first instruction advances that
+    /// nonce, and its amounts buy only at the limit. A check sends it once a
+    /// simulation says it would fill, and a later check confirms it.
+    #[test]
+    fn a_limit_buy_is_signed_now_and_sent_when_the_price_gets_there() {
+        fake_host::install(host_with_order_slot());
+        let response = place_order("order-1", 20.0);
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let order = stored_order("order-1");
+        assert_eq!((order.state.as_str(), order.slot), ("open", 0));
+        fake_host::with(|host| {
+            assert!(
+                host.calls_for("sendTransaction").is_empty(),
+                "an order is not sent when placed"
+            );
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            assert_eq!(claim["operation_class"], json!("pumpfun.limit_order"));
+        });
+        let signed = B64.decode(order.signed.as_deref().unwrap()).unwrap();
+        assert_eq!(signed[0], 1, "one signature, filled in");
+        assert!(signed[1..65].iter().any(|b| *b != 0));
+        let mut parsed = message(&signed[65..]).unwrap();
+        append_lookup_addresses(&mut parsed, &test_lookup_tables()).unwrap();
+        assert_eq!(parsed.blockhash, NONCE_VALUE);
+        let advance = &parsed.instructions[0];
+        assert_eq!(parsed.keys[advance.program], pk(PROGRAMS[1]).unwrap());
+        assert_eq!(
+            parsed.keys[usize::from(advance.accounts[0])],
+            pk(&slot0()).unwrap()
+        );
+        let buy = parsed
+            .instructions
+            .iter()
+            .find(|ix| has_discriminator(ix, IX_BUY))
+            .unwrap();
+        let expected = (1_000_000.0_f64 / 1.015 / (20.0 * 1e9 / 1e15)).floor() as u64;
+        assert_eq!(
+            instruction_u64(buy, 8).unwrap(),
+            expected,
+            "tokens at the limit"
+        );
+        assert_eq!(
+            instruction_u64(buy, 16).unwrap(),
+            1_000_000,
+            "spends at most the amount"
+        );
+        let review = public_operation("order-1")["review"].to_string();
+        assert!(
+            review.contains("Limit buy") && review.contains("at or below 20.00 SOL"),
+            "{review}"
+        );
+
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":{"InstructionError":[3,{"Custom":6002}]}}}}),
+            );
+        });
+        check_orders();
+        let order = stored_order("order-1");
+        assert_eq!(order.state, "open");
+        assert!(order.note.unwrap().contains("not reached"));
+
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":null}}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("order-1").state, "submitted");
+        let signed = stored_order_signed("order-1");
+        fake_host::with(|host| {
+            let sent = host.calls_for("sendTransaction");
+            assert_eq!(host.broadcasts(), 1);
+            assert_eq!(sent[0].rpc_params().unwrap()[0], json!(signed));
+            host.reply(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"result":{"value":[{"err":null,"confirmationStatus":"confirmed"}]}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("order-1").state, "filled");
+    }
+
+    fn stored_order_signed(operation: &str) -> String {
+        stored_order(operation).signed.unwrap()
+    }
+
+    /// One slot holds one open order; a second waits for another slot.
+    #[test]
+    fn a_slot_holds_one_open_order() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("order-a", 20.0), DispatchResponse::Write);
+        let second = place_order("order-b", 20.0);
+        assert!(
+            dispatch_message(&second).contains("no free order slot"),
+            "{}",
+            dispatch_message(&second)
+        );
+    }
+
+    /// A graduated coin's curve order can never fill and says so.
+    #[test]
+    fn an_order_for_a_graduated_curve_is_retired() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("order-g", 20.0), DispatchResponse::Write);
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":{"InstructionError":[3,{"Custom":6005}]}}}}),
+            );
+        });
+        check_orders();
+        let order = stored_order("order-g");
+        assert_eq!(order.state, "dead");
+        assert!(order.note.unwrap().contains("graduated"));
+    }
+
+    /// Cancelling advances the slot's nonce with a transaction the Petal
+    /// builds itself, and marks the order cancelled once it is sent.
+    #[test]
+    fn cancelling_advances_the_nonce_and_frees_the_slot() {
+        let mut host = host_with_order_slot();
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        fake_host::install(host);
+        assert_eq!(place_order("order-c", 20.0), DispatchResponse::Write);
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_CANCEL")]),
+            Action::CancelOrder,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "cancel-c", "order": "order-c"})).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        assert_eq!(stored_order("order-c").state, "cancelled");
+        fake_host::with(|host| {
+            let sent = host.calls_for("sendTransaction");
+            let raw = B64
+                .decode(
+                    sent.last().unwrap().rpc_params().unwrap()[0]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            let parsed = message(&raw[65..]).unwrap();
+            assert_eq!(
+                parsed.instructions.len(),
+                4,
+                "priority fee, the advance, the tip"
+            );
+            assert_eq!(parsed.instructions[0].data[0], 2);
+            assert_eq!(parsed.instructions[1].data[0], 3);
+            assert_eq!(parsed.instructions[2].data, [4, 0, 0, 0]);
+            assert_eq!(
+                parsed.keys[usize::from(parsed.instructions[3].accounts[1])],
+                pk(JITO_TIPS[0]).unwrap()
+            );
+            assert_eq!(parsed.keys[1], pk(&slot0()).unwrap());
+        });
+        assert_eq!(
+            place_order("order-d", 20.0),
+            DispatchResponse::Write,
+            "the slot is free again"
+        );
+    }
+
+    /// Creating a slot declares its rent and names the new account as the
+    /// destination the rent goes to.
+    #[test]
+    fn creating_an_order_slot_declares_its_rent_and_account() {
+        let mut host = host_with_order_slot();
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
+        host.reply(
+            &format!("{RPC} getMinimumBalanceForRentExemption"),
+            json!({"result": 1_447_680}),
+        );
+        fake_host::install(host);
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+            Action::OrderSlot,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "slot-1", "slot": 1})).unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        let slot1 =
+            bs58::encode(orders::slot_address(&pk(USER).unwrap(), 1).unwrap()).into_string();
+        fake_host::with(|host| {
+            let claim: Value =
+                serde_json::from_slice(&host.sign_requests[0].petal_use_claim_jcs).unwrap();
+            let mut expected = vec![
+                json!({"chain":"solana","destination":slot1}),
+                json!({"chain":"solana","destination":JITO_TIPS[0]}),
+            ];
+            expected.sort_by_key(|d| d["destination"].as_str().unwrap().to_owned());
+            assert_eq!(claim["declared_destinations"], json!(expected));
+            assert_eq!(
+                claim["declared_debits"][0]["amount"],
+                json!((1_447_680 + 10_000).to_string())
+            );
+            let sent = host.calls_for("sendTransaction");
+            assert_eq!(
+                sent.last().unwrap().url,
+                JITO,
+                "the Petal's own transactions go through Jito"
+            );
+        });
+        let existing = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+            Action::OrderSlot,
+            owner(),
+            &serde_json::to_vec(&json!({"operationId": "slot-0", "slot": 0})).unwrap(),
+        );
+        assert!(dispatch_message(&existing).contains("already exists"));
+    }
+
     const CREATE_URL: &str = "https://fun-block.pump.fun/agents/create-coin";
     const IPFS_URL: &str = "https://pump.fun/api/ipfs";
     /// The metadata URI the create fixture names.
@@ -7488,8 +8026,11 @@ mod tests {
             assert!(built.get("image").is_none(), "the image goes to IPFS only");
 
             let sends = host.calls_for("sendTransaction");
-            assert_eq!(sends.len(), 1);
-            assert_eq!(sends[0].url, RPC, "a launch is not sent through Jito");
+            assert_eq!(host.broadcasts(), 1);
+            assert_eq!(
+                sends[0].url, RPC,
+                "a launch is sent through the public RPC first"
+            );
             let sent = B64
                 .decode(sends[0].rpc_params().unwrap()[0].as_str().unwrap())
                 .unwrap();
