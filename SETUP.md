@@ -2,10 +2,10 @@
 
 ## Scope
 
-Buy or sell an existing coin from the Bloom account already selected, and
-optionally close an empty token account afterwards. Each of those is one owner
-approval. Coin creation, fee collection and fee-sharing configuration are not in
-this release and their routes have been removed.
+Buy or sell an existing coin from the Bloom account already selected, launch a
+new coin from it, and optionally close an empty token account afterwards. Each
+of those is one owner approval. Fee collection and fee-sharing configuration
+are not in this release and their routes have been removed.
 
 ## Compatibility
 
@@ -53,7 +53,7 @@ Bloom compares every destination a claim declares against
 | --- | --- | --- |
 | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump bonding curve | a buy or sell before the coin migrates |
 | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
-| the selected Jito tip account | a protected write | only with `frontRunningProtection` |
+| all eight Jito tip accounts | a protected write | every buy and sell, unless `"frontRunningProtection":false` |
 | the trading account's own Solana address | `close_token_account` | returning the rent — see below |
 
 Which Pump program a given mint routes through depends on whether it has
@@ -68,9 +68,11 @@ the write is refused after the owner has already approved it, with
 `CLAIM_INVALID: claim names destination <account> for chain "solana" outside
 wallet policy`. Add it before the first close.
 
-The eight Jito tip accounts the Petal accepts are listed in
-`route/src/lib.rs`. A write declares only the one it selects, and only when
-`frontRunningProtection` is set.
+Swaps are protected by default, and Pump's builder picks one of Jito's eight
+tip accounts at random each time it builds, so the rebuild after approval can
+name a different one: allow all eight (listed in `JITO_TIPS` in
+`route/src/lib.rs`). Without them a protected write stops before asking for
+approval and names the accounts to add; nothing is signed.
 
 Read the current policy before assuming any of this is missing:
 
