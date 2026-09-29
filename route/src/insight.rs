@@ -428,8 +428,8 @@ fn below_high(coin: &Value) -> Option<f64> {
 }
 
 const SWAP_API: &str = "https://swap-api.pump.fun/v2/coins";
-/// Candles per chart: two hours of minutes, ten hours of five minutes, or
-/// five days of hours.
+/// Candles per chart: two minutes of seconds, two hours of minutes, ten
+/// hours of five minutes, or five days of hours.
 const CANDLES: usize = 120;
 /// Trades listed, newest first.
 const TRADES: usize = 50;
@@ -454,9 +454,10 @@ pub(crate) struct Chart {
 
 /// The candle interval that fits a coin's age into one chart.
 fn interval_for(age_ms: u64) -> (&'static str, u64) {
-    match age_ms / 3_600_000 {
-        0..2 => ("1m", 60_000),
-        2..10 => ("5m", 300_000),
+    match age_ms / 60_000 {
+        0..2 => ("1s", 1_000),
+        2..120 => ("1m", 60_000),
+        120..600 => ("5m", 300_000),
         _ => ("1h", 3_600_000),
     }
 }
@@ -656,7 +657,7 @@ mod tests {
     /// fits one chart; malformed candles are dropped.
     #[test]
     fn candles_fit_the_coin_age_and_drop_malformed_rows() {
-        for (minutes, interval) in [(30, "1m"), (5 * 60, "5m"), (3 * 24 * 60, "1h")] {
+        for (minutes, interval) in [(1, "1s"), (30, "1m"), (5 * 60, "5m"), (3 * 24 * 60, "1h")] {
             let mut host = FakeHost::new(NOW_MS);
             let created = coin_aged(&mut host, minutes);
             host.reply(

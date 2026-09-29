@@ -2310,12 +2310,39 @@ pub(crate) fn coin_value(m: &str) -> Result<(Value, Value), DispatchResponse> {
     if v.get("is_banned").and_then(Value::as_bool) == Some(true) {
         warnings.push("Pump.fun has banned this coin".to_owned());
     }
+    // A coin priced in another token has no SOL market on chain; Pump's own
+    // figures stand in for it, labelled as Pump's.
+    let quote = market.is_none().then(|| curve_quote(&mint)).flatten();
+    let quote_symbol = quote.as_deref().map(quote_symbol);
+    let pump_cap = |field: &str| {
+        v.get(field)
+            .and_then(Value::as_f64)
+            .filter(|cap| cap.is_finite() && *cap > 0.0)
+    };
+    let (price_sol, market_cap_sol, price_source) = match (&quote, price_sol) {
+        (_, Some(price)) => (Some(price), market_cap_sol, "chain"),
+        (Some(_), None) => {
+            let cap = pump_cap("market_cap");
+            let price = cap
+                .zip(risk.supply)
+                .map(|(cap, supply)| cap / (supply as f64 / scale));
+            (price, cap, "pump")
+        }
+        (None, None) => (None, None, "none"),
+    };
+    let progress = market.and_then(|m| m.progress_pct()).or_else(|| {
+        quote.as_ref()?;
+        let real = v
+            .get("real_token_reserves")
+            .and_then(|r| r.as_f64().or_else(|| r.as_str()?.parse().ok()))?;
+        Some(((1.0 - real / INITIAL_REAL_TOKENS as f64) * 100.0).clamp(0.0, 100.0))
+    });
     if market.is_none() {
-        warnings.push(match curve_quote(&mint) {
-            Some(quote) => format!(
-                "This coin is priced in the token {quote}, not SOL; it cannot be traded here, and its price is not shown"
+        warnings.push(match (&quote, &quote_symbol) {
+            (Some(_), Some(symbol)) => format!(
+                "Priced in {symbol}, not SOL: this Petal cannot trade it, and its market cap is Pump's figure"
             ),
-            None => "No active Pump curve or pool was found on chain; it cannot be traded here"
+            _ => "No active Pump curve or pool was found on chain; it cannot be traded here"
                 .to_owned(),
         });
     }
@@ -2340,7 +2367,14 @@ pub(crate) fn coin_value(m: &str) -> Result<(Value, Value), DispatchResponse> {
         "graduated": matches!(market, Some(Market::Pool { .. })),
         "priceSol": price_sol,
         "marketCapSol": market_cap_sol,
-        "curveProgressPct": market.and_then(|m| m.progress_pct()),
+        "marketCapUsd": pump_cap("usd_market_cap"),
+        "priceSource": price_source,
+        "quote": quote.as_ref().map(|mint| json!({
+            "mint": mint,
+            "symbol": quote_symbol,
+            "marketCap": pump_cap("market_cap_quote"),
+        })),
+        "curveProgressPct": progress,
         "createdMs": v.get("created_timestamp").and_then(Value::as_u64),
         "ageMinutes": age_minutes,
         "creator": creator,
@@ -2549,6 +2583,21 @@ fn curve_quote(mint: &[u8; 32]) -> Option<String> {
     )?;
     let quote = key_at(&data, CURVE_QUOTE_OFFSET)?;
     (!quoted_in_sol(&data)).then(|| bs58::encode(quote).into_string())
+}
+
+/// A quote token's symbol: well-known stablecoins by mint, then Pump's own
+/// record of the token, then a shortened address.
+fn quote_symbol(mint: &str) -> String {
+    match mint {
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => return "USDC".into(),
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => return "USDT".into(),
+        _ => {}
+    }
+    fetch("GET", format!("{COINS}/{mint}"), vec![])
+        .ok()
+        .map(|record| clean_text(&record, "symbol", 12))
+        .filter(|symbol| !symbol.is_empty())
+        .unwrap_or_else(|| format!("{}…{}", &mint[..4], &mint[mint.len() - 4..]))
 }
 
 /// The pool Pump creates when a coin graduates: index 0, owned by the Pump
@@ -7221,10 +7270,12 @@ mod tests {
         assert!(
             v["warnings"]
                 .to_string()
-                .contains(&format!("priced in the token {quote}")),
+                .contains("Priced in DJTu…xvoF, not SOL"),
             "{}",
             v["warnings"]
         );
+        assert_eq!(v["quote"]["mint"], json!(quote));
+        assert_eq!(v["priceSource"], json!("pump"));
         assert_eq!(markets(&[pk(BOND_MINT).unwrap()]).unwrap(), vec![None]);
     }
 

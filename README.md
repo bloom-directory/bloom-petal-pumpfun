@@ -98,13 +98,13 @@ at most six of them; `launchBlockPartial` says the block held more. Pump's own
 sniper and bundler flags and third-party risk scores are not used: on a coin
 rugged within 20 seconds of launch, both called it clean.
 
-`market/<mint>/candles.json` has up to 120 price candles in SOL per token, one
-minute each for a coin under two hours old, five minutes under ten hours, and an
-hour after that. `trades.json` lists the latest 50 trades, with the wallet,
-side, SOL, tokens, venue and transaction, and tallies buying against selling.
-Both come from Pump's trade index at `swap-api.pump.fun`; a coin's `.md` and
-`.html` pages draw the candles as its market cap, on a log scale once the range
-passes twentyfold.
+`market/<mint>/candles.json` has up to 120 price candles in SOL per token: one
+second each for a coin under two minutes old, one minute each for a coin under
+two hours old, five minutes under ten hours, and an hour after that.
+`trades.json` lists the latest 50 trades, with the wallet, side, SOL, tokens,
+venue and transaction, and tallies buying against selling. Both come from Pump's
+trade index at `swap-api.pump.fun`; a coin's `.md` and `.html` pages draw the
+candles as its market cap, on a log scale once the range passes twentyfold.
 
 `coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
 creator is streaming, up to 25 each, without banned or NSFW coins. Names and

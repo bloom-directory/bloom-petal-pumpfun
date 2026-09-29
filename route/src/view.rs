@@ -243,7 +243,7 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
     if let Some(pct) = risk["top10HoldPct"].as_f64()
         && !warned("10 largest")
     {
-        passes.push(format!("The 10 largest holders own {pct:.1}%"));
+        passes.push(format!("The 10 largest holders own {}", share(pct)));
     }
     if risk["launchBlockBuyers"].as_u64().is_some() && !warned("bundled") {
         passes.push(match risk["launchBlockBuyers"].as_u64() {
@@ -304,23 +304,17 @@ fn coin_markdown(
     };
     let mut out = format!("# {title}\n\n`{m}`\n\n");
     out.push_str(&format!(
-        "{} · launched {} ago · {} holders · {}\n\n",
+        "{} · launched {} ago · holders: {} · {}\n\n",
         status_text(summary),
         age_since(summary["createdMs"].as_u64(), now),
-        summary["risk"]["holders"]
-            .as_u64()
-            .map(|h| h.to_string())
-            .unwrap_or_else(|| "?".into()),
+        holders_text(summary),
         stamp(now)
     ));
     out.push_str(&table(
         &["Market cap", "Price", "Curve", "Below high"],
         &[true, true, false, true],
         &[vec![
-            summary["marketCapSol"]
-                .as_f64()
-                .map(sol)
-                .unwrap_or_else(|| "—".into()),
+            cap_text(summary),
             summary["priceSol"]
                 .as_f64()
                 .map(price)
@@ -332,13 +326,14 @@ fn coin_markdown(
                 .unwrap_or_else(|| "—".into()),
         ]],
     ));
-    if let Some(chart) = chart.filter(|c| !c.candles.is_empty()) {
-        out.push_str(&format!(
+    match chart.filter(|c| c.candles.len() >= 2) {
+        Some(chart) => out.push_str(&format!(
             "\n## Market cap in SOL · {} candles · {}\n\n```text\n{}```\n",
             chart.interval,
             change_text(chart),
             text_chart(chart, now)
-        ));
+        )),
+        None => out.push_str("\n## Market cap\n\nNot enough trading to chart yet.\n"),
     }
     out.push_str("\n## Checks\n\n");
     for (level, text) in checklist(summary) {
@@ -358,6 +353,9 @@ fn coin_markdown(
             trades["sells"],
             sol(trades["soldSol"].as_f64().unwrap_or(0.0)),
         ));
+        if list.is_empty() {
+            out.push_str("No trades yet.\n");
+        }
         let rows = list
             .iter()
             .take(PAGE_TRADES)
@@ -378,11 +376,13 @@ fn coin_markdown(
                 ]
             })
             .collect::<Vec<_>>();
-        out.push_str(&table(
-            &["When", "Side", "SOL", "Tokens", "Wallet"],
-            &[true, false, true, true, false],
-            &rows,
-        ));
+        if !rows.is_empty() {
+            out.push_str(&table(
+                &["When", "Side", "SOL", "Tokens", "Wallet"],
+                &[true, false, true, true, false],
+                &rows,
+            ));
+        }
     }
     out.push_str(&format!(
         "\n## Trade\n\nBuy 0.01 SOL of it (the amount is in lamports) from the mounted folder:\n\n    echo '{{\"operationId\":\"buy-1\",\"mint\":\"{m}\",\"amount\":\"10000000\"}}' > trade/<wallet>/buy.json\n\nSell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`. Every trade waits for your approval in Bloom.\n\nNames and links are the creator's own; prices, authorities and the creator's holding are read from the chain; holders and the creator's other coins are Pump's figures.\n"
@@ -418,10 +418,14 @@ fn coin_html(
     out.push_str("<section class=stats>");
     out.push_str(&stat(
         "Market cap",
-        summary["marketCapSol"]
-            .as_f64()
-            .map(sol)
-            .unwrap_or_else(|| "—".into()),
+        format!(
+            "{}<div class=sub>{}</div>",
+            html(&cap_text(summary)),
+            summary["marketCapUsd"]
+                .as_f64()
+                .map(usd)
+                .unwrap_or_default()
+        ),
     ));
     out.push_str(&stat(
         "Price",
@@ -437,13 +441,7 @@ fn coin_html(
             None => html(&curve_text(summary)),
         },
     ));
-    out.push_str(&stat(
-        "Holders",
-        summary["risk"]["holders"]
-            .as_u64()
-            .map(|h| h.to_string())
-            .unwrap_or_else(|| "—".into()),
-    ));
+    out.push_str(&stat("Holders", html(&holders_text(summary))));
     out.push_str(&stat(
         "Below high",
         summary["risk"]["belowAllTimeHighPct"]
@@ -452,15 +450,20 @@ fn coin_html(
             .unwrap_or_else(|| "—".into()),
     ));
     out.push_str("</section>");
-    if let Some(chart) = chart.filter(|c| !c.candles.is_empty()) {
-        let change = change_pct(chart);
-        out.push_str(&format!(
-            "<section class=card><div class=charthead><span>Market cap in SOL · {} candles</span><span class={}>{}</span></div>{}</section>",
-            chart.interval,
-            if change >= 0.0 { "buy" } else { "sell" },
-            html(&change_text(chart)),
-            svg_chart(chart, now)
-        ));
+    match chart.filter(|c| c.candles.len() >= 2) {
+        Some(chart) => {
+            let change = change_pct(chart);
+            out.push_str(&format!(
+                "<section class=card><div class=charthead><span>Market cap in SOL · {} candles</span><span class={}>{}</span></div>{}</section>",
+                chart.interval,
+                if change >= 0.0 { "buy" } else { "sell" },
+                html(&change_text(chart)),
+                svg_chart(chart, now)
+            ));
+        }
+        None => out.push_str(
+            "<section class=\"card empty\">Not enough trading to chart yet. Reload once the coin has traded more.</section>",
+        ),
     }
     out.push_str("<div class=cols><section><h2>Checks</h2><ul class=checks>");
     for (level, text) in checklist(summary) {
@@ -505,14 +508,41 @@ fn coin_html(
                 short = short(wallet),
             ));
         }
-        out.push_str("</tbody></table></section>");
+        out.push_str("</tbody></table>");
+        if list.is_empty() {
+            out.push_str("<p class=\"card empty\">No trades yet.</p>");
+        }
+        out.push_str("</section>");
     }
     out.push_str("</div><p class=muted>Names and images are the creator's own. Prices, authorities and the creator's holding are read from the chain; holders and the creator's other coins are Pump's figures.</p>");
     out
 }
 
+/// The market cap: in SOL when it can be priced in SOL, otherwise in the
+/// token the coin is priced in.
+fn cap_text(summary: &Value) -> String {
+    if let Some(cap) = summary["marketCapSol"].as_f64() {
+        return sol(cap);
+    }
+    let quote = &summary["quote"];
+    match (quote["marketCap"].as_f64(), quote["symbol"].as_str()) {
+        (Some(cap), Some(symbol)) => format!("{} {}", sol_short(cap), symbol),
+        _ => "—".into(),
+    }
+}
+
+/// Pump's holder count, which is zero until its index catches up.
+fn holders_text(summary: &Value) -> String {
+    match summary["risk"]["holders"].as_u64() {
+        Some(0) | None => "not counted yet".into(),
+        Some(count) => count.to_string(),
+    }
+}
+
 fn status_text(summary: &Value) -> String {
-    if summary["priceSol"].is_null() {
+    if let Some(symbol) = summary["quote"]["symbol"].as_str() {
+        format!("priced in {symbol} · not tradable here")
+    } else if summary["priceSol"].is_null() {
         "not tradable here".into()
     } else if summary["graduated"] == json!(true) {
         "graduated to PumpSwap".into()
@@ -592,9 +622,12 @@ impl Scale {
             };
         }
         let log = high / low > 20.0;
-        if high - low < high * 1e-6 {
-            low *= 0.98;
-            high *= 1.02;
+        // A range under a tenth of the price is drawn as a tenth, so a coin
+        // that barely moved looks flat instead of stretched to full height.
+        let mid = (high + low) / 2.0;
+        if high - low < mid * 0.1 {
+            low = low.min(mid * 0.95);
+            high = high.max(mid * 1.05);
         }
         Self { low, high, log }
     }
@@ -721,9 +754,15 @@ fn svg_chart(chart: &Chart, now: u64) -> String {
     svg.push_str(&format!(
         "<path d=\"{area}\" fill=\"url(#fill)\"/><path d=\"{line}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"2\" vector-effect=\"non-scaling-stroke\"/>"
     ));
+    let mut last_label = String::new();
     for step in 0..4 {
         let t = first + (span * f64::from(step) / 3.0) as u64;
         let t = t.min(candles[candles.len() - 1].time_ms);
+        let label = age_since(Some(t), now);
+        if label == last_label {
+            continue;
+        }
+        last_label.clone_from(&label);
         svg.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" class=\"axis\" text-anchor=\"{}\">{} ago</text>",
             x(t),
@@ -733,7 +772,7 @@ fn svg_chart(chart: &Chart, now: u64) -> String {
                 3 => "end",
                 _ => "middle",
             },
-            age_since(Some(t), now)
+            label
         ));
     }
     svg.push_str("<line id=\"cross\" class=\"cross\" y1=\"0\" y2=\"0\" x1=\"0\" x2=\"0\"/></svg><div class=\"tip\" id=\"tip\"></div></div>");
@@ -978,7 +1017,7 @@ a.card:hover{border-color:var(--accent);transform:translateY(-1px)}a.card{transi
 .bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:10px}.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--up))}
 .pill{display:inline-block;font-size:12px;padding:2px 10px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin:6px 6px 0 0}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
-.stat .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}.stat .v{font-size:21px;margin-top:2px}
+.stat .sub{font-size:13px;color:var(--muted);font-weight:400}.empty{color:var(--muted);text-align:center;padding:28px}.stat .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}.stat .v{font-size:21px;margin-top:2px}
 .charthead{display:flex;justify-content:space-between;color:var(--muted);font-size:13px;margin-bottom:6px}
 .chart{position:relative;overflow-x:auto}.chart svg{width:100%;min-width:640px;height:auto;display:block}
 .gl{stroke:var(--line)}.axis{fill:var(--muted);font-size:12px}.vup{fill:var(--up);opacity:.35}.vdown{fill:var(--down);opacity:.35}.cross{stroke:var(--muted);stroke-dasharray:3 3}
@@ -1500,6 +1539,8 @@ mod tests {
         assert_eq!(lines.len(), TEXT_CHART_HEIGHT + 2);
         assert!(lines[0].trim_start().starts_with("20.00 ┤"), "{text}");
         assert!(lines[TEXT_CHART_HEIGHT - 1].contains("10.00 ┤"), "{text}");
+        let flat = Scale::over([100.0, 100.2].into_iter());
+        assert!(flat.high - flat.low >= 9.9, "a 0.2% move is not stretched");
         assert!(
             lines[0].ends_with('█'),
             "the last close is the highest: {text}"
