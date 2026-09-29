@@ -781,26 +781,17 @@ fn confirm(_p: &Pending, order: &Order) -> Outcome {
 
 /// `trade/<wallet>/orders.json`: every order and every slot.
 pub fn list(c: &Ctx, w: String) -> DispatchResponse {
-    let owner = match TradeOwner::scope(c, &w) {
-        Ok(owner) => owner,
-        Err(e) => return e,
-    };
-    let address = match owner.address() {
-        Ok(address) => address,
-        Err(e) => return e,
-    };
-    let user = match pk(&address) {
-        Ok(user) => user,
-        Err(e) => return fail(e),
-    };
-    let list = match orders(&owner) {
-        Ok(list) => list,
-        Err(e) => return e,
-    };
-    let slots = match slots(&user) {
-        Ok(slots) => slots,
-        Err(e) => return e,
-    };
+    match list_value(c, &w) {
+        Ok(v) => petal::read_json_value(&v),
+        Err(e) => e,
+    }
+}
+
+pub(crate) fn list_value(c: &Ctx, w: &str) -> Result<Value, DispatchResponse> {
+    let owner = TradeOwner::scope(c, w)?;
+    let user = pk(&owner.address()?).map_err(fail)?;
+    let list = orders(&owner)?;
+    let slots = slots(&user)?;
     let orders = list
         .iter()
         .filter_map(|(id, p)| {
@@ -835,7 +826,7 @@ pub fn list(c: &Ctx, w: String) -> DispatchResponse {
             })
         })
         .collect::<Vec<_>>();
-    petal::read_json_value(&json!({
+    Ok(json!({
         "orders": orders,
         "slots": slots,
         "note": "An order fills only when a check finds the price at its limit: write {} to check_orders.json, from an agent or a timer. Cancel with cancel_order.json.",

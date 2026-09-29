@@ -818,6 +818,11 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
         Err(e) => return unavailable(&e, format, "../../coins/"),
     };
     let now = host::now_ms();
+    // Orders are shown when they can be read; holdings do not depend on them.
+    let open_orders = orders::list_value(c, &w)
+        .ok()
+        .and_then(|v| v.get("orders").cloned())
+        .unwrap_or_default();
     let tokens = data["tokens"].as_array().cloned().unwrap_or_default();
     let held = tokens
         .iter()
@@ -898,6 +903,18 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                 ));
             }
             out.push_str("\n\"Worth now\" is what selling everything returns at the current price, before Pump's fee (about 1%) and slippage. Sell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`.\n");
+            let orders = order_rows(&open_orders);
+            if !orders.is_empty() {
+                out.push_str("\n## Limit orders\n\n");
+                out.push_str(&table(
+                    &["Order", "Side", "At market cap", "State", "Mint"],
+                    &[false, false, true, false, false],
+                    &orders,
+                ));
+                out.push_str(
+                    "\nOrders fill only when something writes `{}` to `check_orders.json`.\n",
+                );
+            }
             markdown(out)
         }
         Format::Html => {
@@ -936,6 +953,28 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                     )
                 },
             );
+            let orders = order_rows(&open_orders);
+            let body = if orders.is_empty() {
+                body
+            } else {
+                let rows = orders
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "<tr><td>{}</td><td class={}>{}</td><td class=num>{}</td><td>{}</td><td><code>{}</code></td></tr>",
+                            html(&r[0]),
+                            if r[1] == "buy" { "buy" } else { "sell" },
+                            html(&r[1]),
+                            html(&r[2]),
+                            html(&r[3]),
+                            html(&short(&r[4]))
+                        )
+                    })
+                    .collect::<String>();
+                format!(
+                    "{body}<h2>Limit orders</h2><table><thead><tr><th>Order</th><th>Side</th><th class=num>At market cap</th><th>State</th><th>Mint</th></tr></thead><tbody>{rows}</tbody></table><p class=muted>Orders fill only when something writes <code>{{}}</code> to <code>check_orders.json</code>.</p>"
+                )
+            };
             page(
                 "Holdings · Pump.fun",
                 &nav_from("../../coins/", "holdings"),
@@ -944,6 +983,25 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
             )
         }
     }
+}
+
+/// Limit orders that are not finished, as table rows.
+fn order_rows(orders: &Value) -> Vec<Vec<String>> {
+    orders
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| !matches!(o["state"].as_str(), Some("filled" | "cancelled" | "dead")))
+        .map(|o| {
+            vec![
+                cell(o["order"].as_str().unwrap_or("")),
+                o["side"].as_str().unwrap_or("").to_owned(),
+                o["marketCapSol"].as_f64().map(sol).unwrap_or_default(),
+                cell(o["state"].as_str().unwrap_or("")),
+                o["mint"].as_str().unwrap_or("").to_owned(),
+            ]
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------ page chrome
