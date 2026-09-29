@@ -109,6 +109,7 @@ mod fake_host;
 pub mod insight;
 mod launch;
 mod txedit;
+pub mod view;
 
 /// This crate's only boundary to the Bloom host.
 ///
@@ -2157,6 +2158,12 @@ pub enum Listing {
 /// they are stripped of control, zero-width and direction-changing characters
 /// and shortened; a trade names the mint, never the name.
 pub fn coins(listing: Listing) -> DispatchResponse {
+    match listing_value(listing) {
+        Ok(v) => petal::read_json_value(&v),
+        Err(e) => e,
+    }
+}
+pub(crate) fn listing_value(listing: Listing) -> Result<Value, DispatchResponse> {
     let (url, description) = match listing {
         Listing::Latest => (
             format!(
@@ -2171,14 +2178,12 @@ pub fn coins(listing: Listing) -> DispatchResponse {
             "Pump.fun coins whose creator is streaming now",
         ),
     };
-    match fetch("GET", url, vec![]) {
-        Ok(v) => petal::read_json_value(&json!({
-            "description": description,
-            "note": "Names and symbols are chosen by the coin's creator and are not unique. Trade by mint, and read coins/<mint>.json first.",
-            "coins": project_listing(&v),
-        })),
-        Err(e) => e,
-    }
+    let v = fetch("GET", url, vec![])?;
+    Ok(json!({
+        "description": description,
+        "note": "Names and symbols are chosen by the coin's creator and are not unique. Trade by mint, and read coins/<mint>.json first.",
+        "coins": project_listing(&v),
+    }))
 }
 
 /// A creator-chosen string, cleaned for an agent to read: control,
@@ -2226,12 +2231,31 @@ fn project_listing(v: &Value) -> Vec<Value> {
                     .or_else(|| coin.get("market_cap_usd"))
                     .and_then(Value::as_f64),
                 "graduated": coin.get("complete").and_then(Value::as_bool).unwrap_or(false),
+                "curveProgressPct": coin
+                    .get("real_token_reserves")
+                    .and_then(|r| r.as_f64().or_else(|| r.as_str()?.parse().ok()))
+                    .filter(|_| coin.get("complete").and_then(Value::as_bool) != Some(true))
+                    .map(|real| ((1.0 - real / INITIAL_REAL_TOKENS as f64) * 100.0).clamp(0.0, 100.0)),
+                // Pump writes an unset quote mint as the all-zero key.
+                "quotedInSol": coin
+                    .get("quote_mint")
+                    .and_then(Value::as_str)
+                    .is_none_or(|quote| quote == SOL || quote == PROGRAMS[1] || quote.is_empty()),
+                "quoteMint": coin.get("quote_mint").and_then(Value::as_str).filter(|q| pk(q).is_ok()),
+                "image": image_link(mint, 86),
                 "replies": coin.get("reply_count").and_then(Value::as_u64),
                 "creator": coin.get("creator").and_then(Value::as_str).filter(|c| pk(c).is_ok()),
             }))
         })
         .take(LISTING_LIMIT)
         .collect()
+}
+
+/// A coin's image from Pump's own image service, named by mint. The
+/// creator's own image link is never used: it could point anywhere, and a
+/// page that loaded it would tell that host who is looking.
+fn image_link(mint: &str, size: u32) -> String {
+    format!("https://images.pump.fun/coin-image/{mint}?variant={size}x{size}")
 }
 
 /// The creator's share of supply at which a coin summary warns.
@@ -2244,17 +2268,16 @@ const YOUNG_COIN_MINUTES: u64 = 60;
 /// how much of the supply the creator still holds and could sell. Warnings
 /// name the plain risks. The creator's free text is not passed through.
 pub fn coin(m: &str) -> DispatchResponse {
-    let Ok(mint) = pk(m) else {
-        return bad("invalid mint");
-    };
-    let v = match fetch("GET", format!("{COINS}/{m}"), vec![]) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let market = match markets(&[mint]) {
-        Ok(mut found) => found.pop().flatten(),
-        Err(e) => return e,
-    };
+    match coin_value(m) {
+        Ok((summary, _)) => petal::read_json_value(&summary),
+        Err(e) => e,
+    }
+}
+/// The summary, and Pump's own record it was built from.
+pub(crate) fn coin_value(m: &str) -> Result<(Value, Value), DispatchResponse> {
+    let mint = pk(m).map_err(|_| bad("invalid mint"))?;
+    let v = fetch("GET", format!("{COINS}/{m}"), vec![])?;
+    let market = markets(&[mint])?.pop().flatten();
     let creator = v
         .get("creator")
         .and_then(Value::as_str)
@@ -2310,7 +2333,7 @@ pub fn coin(m: &str) -> DispatchResponse {
     if links.is_empty() {
         warnings.push("No website or social links".to_owned());
     }
-    petal::read_json_value(&json!({
+    let summary = json!({
         "mint": m,
         "name": clean_text(&v, "name", 48),
         "symbol": clean_text(&v, "symbol", 16),
@@ -2325,8 +2348,10 @@ pub fn coin(m: &str) -> DispatchResponse {
         "replies": v.get("reply_count").and_then(Value::as_u64),
         "links": links,
         "warnings": warnings,
+        "image": image_link(m, 256),
         "note": "Price, progress, authorities and the creator's holding are read from the chain now; holders and the creator's other coins are Pump's figures; names and links are the creator's own. Any check listed in risk.unchecked could not be made.",
-    }))
+    });
+    Ok((summary, v))
 }
 
 fn stored_children(prefix: &str, suffix: Option<&str>) -> Result<Vec<String>, DispatchResponse> {
@@ -2803,29 +2828,28 @@ fn append_close(
 
 /// Every token account the trading account holds, under both token programs.
 pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
-    let owner = match TradeOwner::scope(c, &w) {
-        Ok(owner) => owner,
-        Err(e) => return e,
-    };
-    let address = match owner.address() {
-        Ok(address) => address,
-        Err(e) => return e,
-    };
+    match holdings_value(c, w) {
+        Ok(v) => petal::read_json_value(&v),
+        Err(e) => e,
+    }
+}
+pub(crate) fn holdings_value(c: &Ctx, w: String) -> Result<Value, DispatchResponse> {
+    let owner = TradeOwner::scope(c, &w)?;
+    let address = owner.address()?;
     let mut tokens = Vec::new();
     for program in [PROGRAMS[3], PROGRAMS[4]] {
         // The primary RPC refuses getTokenAccountsByOwner; the verifying one serves it.
-        let v = match post(
+        let v = post(
             RPC_VERIFY,
             &rpc(
                 "getTokenAccountsByOwner",
                 json!([address, {"programId": program}, {"encoding":"jsonParsed","commitment":COMMITMENT}]),
             ),
-        ) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+        )?;
         let Some(entries) = v.pointer("/result/value").and_then(Value::as_array) else {
-            return fail("Solana RPC omitted the trading account's token accounts");
+            return Err(fail(
+                "Solana RPC omitted the trading account's token accounts",
+            ));
         };
         for entry in entries {
             let info = entry.pointer("/account/data/parsed/info");
@@ -2861,10 +2885,7 @@ pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
         .collect::<Vec<_>>();
     if !held.is_empty() {
         let mints = held.iter().map(|(mint, _)| *mint).collect::<Vec<_>>();
-        let found = match markets(&mints) {
-            Ok(found) => found,
-            Err(e) => return e,
-        };
+        let found = markets(&mints)?;
         for ((mint, _), market) in held.iter().zip(found) {
             let key = bs58::encode(mint).into_string();
             for token in tokens.iter_mut().filter(|t| t["mint"] == json!(key)) {
@@ -2879,7 +2900,7 @@ pub fn holdings(c: &Ctx, w: String) -> DispatchResponse {
             }
         }
     }
-    petal::read_json_value(&json!({
+    Ok(json!({
         "account": {"wallet": w, "account": owner.account, "address": address},
         "tokens": tokens,
         "note": "sellValueLamports is what selling the whole position returns at the current curve or pool price, before Pump's fee (about 1%) and slippage. Sell a share with sell.json {\"amount\":\"50%\"}, or everything with \"all\", which also closes the emptied token account. An empty account can be closed with close_token_account.json.",

@@ -49,20 +49,31 @@ bonding curve's or the pool's reserves on chain and refuses a floor below that
 price less 2% for Pump's fees (measured at 1.25% on the curve and 0.85% on
 PumpSwap) and the requested slippage.
 
-## Route tree
+## Reading it
+
+Every data file has a JSON form for agents, and the files people read have two
+more:
+
+- **In a terminal**, `.md` files are laid out to read raw: padded tables, a
+  block chart of the market cap, a checklist of risks, the latest trades, and
+  the command that trades the coin. `bloom vfs cat /petals/pumpfun/coins/live.md`.
+- **In a browser**, `.html` pages open from the mounted folder and link to one
+  another: `index.html` (the newest coins) → a coin's page → back. They follow
+  the system's light or dark theme, work at phone width, and are
+  self-contained: each carries a Content-Security-Policy that allows no network
+  access except coin thumbnails from Pump's image service, requested by mint.
+  The creator's own image link is never loaded.
 
 ```text
-status.json
-coins/latest.json
-coins/live.json
-coins/<mint>.json
-market/<mint>/candles.json
-market/<mint>/chart.svg
-market/<mint>/trades.json
-trade/<wallet>/preflight.json
-trade/<wallet>/holdings.json
+index.html                                  newest coins, for a browser
+coins/{latest,live}.{md,html,json}          25 coins each
+coins/<mint>.{md,html,json}                 price, chart, risks, trades
+market/<mint>/{candles,trades}.json         the chart and trades as data
+trade/<wallet>/holdings.{md,html,json}      what the account holds, and its worth
 trade/<wallet>/{buy,sell,launch,close_token_account}.json
+trade/<wallet>/preflight.json
 trade/<wallet>/operations/<operationId>.json
+status.json
 ```
 
 `coins/<mint>.json` is a safety summary rather than Pump's raw record: the
@@ -89,10 +100,11 @@ rugged within 20 seconds of launch, both called it clean.
 
 `market/<mint>/candles.json` has up to 120 price candles in SOL per token, one
 minute each for a coin under two hours old, five minutes under ten hours, and an
-hour after that. `chart.svg` draws them as market cap on a log scale.
-`trades.json` lists the latest 50 trades, with the wallet, side, SOL, tokens,
-venue and transaction, and tallies buying against selling. All three come from
-Pump's trade index at `swap-api.pump.fun`.
+hour after that. `trades.json` lists the latest 50 trades, with the wallet,
+side, SOL, tokens, venue and transaction, and tallies buying against selling.
+Both come from Pump's trade index at `swap-api.pump.fun`; a coin's `.md` and
+`.html` pages draw the candles as its market cap, on a log scale once the range
+passes twentyfold.
 
 `coins/latest.json` lists the newest launches and `coins/live.json` the coins whose
 creator is streaming, up to 25 each, without banned or NSFW coins. Names and

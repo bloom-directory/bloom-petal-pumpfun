@@ -128,7 +128,11 @@ pub(crate) fn risk(
         .map(|a| bs58::encode(a).into_string())
         .collect::<Vec<_>>();
     let scale = 10f64.powi(i32::from(decimals.unwrap_or(6)));
-    let holders = supply.and_then(|s| top_holders(m, &excluded, s as f64 / scale));
+    // Pump's index can lag or leave holders out; the creator's holding read
+    // from the chain is a floor under the ten largest.
+    let holders = supply
+        .and_then(|s| top_holders(m, &excluded, s as f64 / scale))
+        .map(|(top_ten, count)| (top_ten.max(creator_pct.unwrap_or(0.0)), count));
     if holders.is_none() {
         unchecked.push("holders");
     }
@@ -431,22 +435,21 @@ const CANDLES: usize = 120;
 const TRADES: usize = 50;
 
 /// Price candles: SOL per whole token, with SOL volume.
-struct Candle {
-    time_ms: u64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
+pub(crate) struct Candle {
+    pub time_ms: u64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
 }
 
-struct Chart {
-    symbol: String,
-    interval: &'static str,
-    interval_ms: u64,
+pub(crate) struct Chart {
+    pub interval: &'static str,
+    pub interval_ms: u64,
     /// Whole tokens in supply, to turn a price into a market cap.
-    supply: f64,
-    candles: Vec<Candle>,
+    pub supply: f64,
+    pub candles: Vec<Candle>,
 }
 
 /// The candle interval that fits a coin's age into one chart.
@@ -460,7 +463,10 @@ fn interval_for(age_ms: u64) -> (&'static str, u64) {
 
 fn chart(m: &str) -> Result<Chart, DispatchResponse> {
     pk(m).map_err(|_| bad("invalid mint"))?;
-    let coin = fetch("GET", format!("{COINS}/{m}"), vec![])?;
+    chart_from(m, &fetch("GET", format!("{COINS}/{m}"), vec![])?)
+}
+/// Candles for a coin whose Pump record is already in hand.
+pub(crate) fn chart_from(m: &str, coin: &Value) -> Result<Chart, DispatchResponse> {
     let created = coin
         .get("created_timestamp")
         .and_then(Value::as_u64)
@@ -509,7 +515,6 @@ fn chart(m: &str) -> Result<Chart, DispatchResponse> {
     candles.sort_by_key(|c| c.time_ms);
     candles.dedup_by_key(|c| c.time_ms);
     Ok(Chart {
-        symbol: clean_text(&coin, "symbol", 16),
         interval,
         interval_ms,
         supply,
@@ -541,150 +546,21 @@ pub fn candles(m: &str) -> DispatchResponse {
     }))
 }
 
-/// `market/<mint>/chart.svg`: the same candles drawn as market cap in SOL on
-/// a log scale, which keeps a coin that moved a hundredfold readable.
-pub fn chart_svg(m: &str) -> DispatchResponse {
-    match chart(m) {
-        Ok(chart) => DispatchResponse::Read(render(&chart, host::now_ms()).into_bytes()),
-        Err(e) => e,
-    }
-}
-
-fn render(chart: &Chart, now_ms: u64) -> String {
-    const W: f64 = 800.0;
-    const H: f64 = 400.0;
-    const LEFT: f64 = 84.0;
-    const RIGHT: f64 = 16.0;
-    const TOP: f64 = 44.0;
-    const BOTTOM: f64 = 32.0;
-    let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{W}\" height=\"{H}\" viewBox=\"0 0 {W} {H}\" font-family=\"monospace\" font-size=\"12\">\
-<rect width=\"100%\" height=\"100%\" fill=\"#0e1116\"/>"
-    );
-    let caps = |price: f64| price * chart.supply;
-    let (Some(first), Some(last)) = (chart.candles.first(), chart.candles.last()) else {
-        svg.push_str(&format!(
-            "<text x=\"{}\" y=\"{}\" fill=\"#c9d1d9\" text-anchor=\"middle\">{} has no trades to chart yet</text></svg>",
-            W / 2.0,
-            H / 2.0,
-            xml(&chart.symbol)
-        ));
-        return svg;
-    };
-    let change = (last.close / first.open - 1.0) * 100.0;
-    svg.push_str(&format!(
-        "<text x=\"{LEFT}\" y=\"26\" fill=\"#c9d1d9\" font-size=\"15\">{} · market cap {} · {} candles · {:+.1}%</text>",
-        xml(&chart.symbol),
-        sol(caps(last.close)),
-        chart.interval,
-        change
-    ));
-    let low = chart
-        .candles
-        .iter()
-        .map(|c| caps(c.low).log10())
-        .fold(f64::INFINITY, f64::min);
-    let mut high = chart
-        .candles
-        .iter()
-        .map(|c| caps(c.high).log10())
-        .fold(f64::NEG_INFINITY, f64::max);
-    if high - low < 1e-9 {
-        high = low + 0.01;
-    }
-    let plot_h = H - TOP - BOTTOM;
-    let y = |price: f64| TOP + (high - caps(price).log10()) / (high - low) * plot_h;
-    for step in 0..=4 {
-        let level = high - (high - low) * f64::from(step) / 4.0;
-        let at = TOP + plot_h * f64::from(step) / 4.0;
-        svg.push_str(&format!(
-            "<line x1=\"{LEFT}\" x2=\"{}\" y1=\"{at:.1}\" y2=\"{at:.1}\" stroke=\"#21262d\"/>\
-<text x=\"{}\" y=\"{:.1}\" fill=\"#8b949e\" text-anchor=\"end\">{}</text>",
-            W - RIGHT,
-            LEFT - 6.0,
-            at + 4.0,
-            sol(10f64.powf(level))
-        ));
-    }
-    // Candles sit at their time, so minutes without trades show as gaps.
-    let slots = ((last.time_ms - first.time_ms) / chart.interval_ms.max(1) + 1) as f64;
-    let step = (W - LEFT - RIGHT) / slots;
-    let body = (step * 0.7).clamp(1.0, 12.0);
-    for c in &chart.candles {
-        let slot = ((c.time_ms - first.time_ms) / chart.interval_ms.max(1)) as f64;
-        let x = LEFT + step * (slot + 0.5);
-        let color = if c.close >= c.open {
-            "#3fb950"
-        } else {
-            "#f85149"
-        };
-        let (top, bottom) = (y(c.open.max(c.close)), y(c.open.min(c.close)));
-        svg.push_str(&format!(
-            "<line x1=\"{x:.1}\" x2=\"{x:.1}\" y1=\"{:.1}\" y2=\"{:.1}\" stroke=\"{color}\"/>\
-<rect x=\"{:.1}\" y=\"{top:.1}\" width=\"{body:.1}\" height=\"{:.1}\" fill=\"{color}\"/>",
-            y(c.high),
-            y(c.low),
-            x - body / 2.0,
-            (bottom - top).max(1.0)
-        ));
-    }
-    svg.push_str(&format!(
-        "<text x=\"{LEFT}\" y=\"{}\" fill=\"#8b949e\">{} ago</text>\
-<text x=\"{}\" y=\"{}\" fill=\"#8b949e\" text-anchor=\"end\">{} ago</text></svg>",
-        H - 10.0,
-        age(now_ms.saturating_sub(first.time_ms)),
-        W - RIGHT,
-        H - 10.0,
-        age(now_ms.saturating_sub(last.time_ms))
-    ));
-    svg
-}
-
-/// A SOL amount in a few significant figures.
-fn sol(amount: f64) -> String {
-    match amount {
-        a if a >= 1e6 => format!("{:.2}M SOL", a / 1e6),
-        a if a >= 1e3 => format!("{:.1}K SOL", a / 1e3),
-        a if a >= 10.0 => format!("{a:.0} SOL"),
-        a => format!("{a:.2} SOL"),
-    }
-}
-
-fn age(ms: u64) -> String {
-    match ms / 60_000 {
-        m if m < 60 => format!("{m}m"),
-        m if m < 48 * 60 => format!("{}h", m / 60),
-        m => format!("{}d", m / 1440),
-    }
-}
-
-fn xml(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '&' => "&amp;".to_owned(),
-            '<' => "&lt;".to_owned(),
-            '>' => "&gt;".to_owned(),
-            '"' => "&quot;".to_owned(),
-            '\'' => "&apos;".to_owned(),
-            c => c.to_string(),
-        })
-        .collect()
-}
-
 /// `market/<mint>/trades.json`: the latest trades, newest first, with who
 /// traded and a tally of buying against selling.
 pub fn trades(m: &str) -> DispatchResponse {
-    if pk(m).is_err() {
-        return bad("invalid mint");
+    match trades_value(m) {
+        Ok(v) => petal::read_json_value(&v),
+        Err(e) => e,
     }
-    let v = match fetch(
+}
+pub(crate) fn trades_value(m: &str) -> Result<Value, DispatchResponse> {
+    pk(m).map_err(|_| bad("invalid mint"))?;
+    let v = fetch(
         "GET",
         format!("{SWAP_API}/{m}/trades?limit={TRADES}"),
         vec![],
-    ) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    )?;
     let number = |t: &Value, field: &str| {
         t.get(field)
             .and_then(Value::as_str)
@@ -732,7 +608,7 @@ pub fn trades(m: &str) -> DispatchResponse {
             .sum::<f64>()
     };
     let count = |side: &str| trades.iter().filter(|t| t["side"] == side).count();
-    petal::read_json_value(&json!({
+    Ok(json!({
         "mint": m,
         "buys": count("buy"),
         "sells": count("sell"),
@@ -801,45 +677,6 @@ mod tests {
         }
     }
 
-    /// The chart is an SVG of market caps; the creator's symbol is escaped so
-    /// it cannot inject markup.
-    #[test]
-    fn the_chart_is_escaped_svg_of_market_caps() {
-        let mut host = FakeHost::new(NOW_MS);
-        let created = coin_aged(&mut host, 30);
-        host.reply(
-            &format!(
-                "{SWAP_API}/{MINT}/candles?interval=1m&limit=120&currency=SOL&createdTs={created}"
-            ),
-            json!([
-                candle(NOW_MS - 120_000, "0.00000002", "0.00000003"),
-                candle(NOW_MS - 60_000, "0.00000003", "0.000000025"),
-            ]),
-        );
-        fake_host::install(host);
-        let svg = String::from_utf8(bytes_of(chart_svg(MINT))).unwrap();
-        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
-        assert!(svg.contains("&lt;MOG&gt;") && !svg.contains("<MOG>"));
-        assert!(svg.contains("market cap 25 SOL"), "{svg}");
-        assert!(svg.contains("#3fb950") && svg.contains("#f85149"));
-        assert!(svg.contains("2m ago"));
-    }
-
-    #[test]
-    fn a_coin_without_trades_charts_a_message() {
-        let mut host = FakeHost::new(NOW_MS);
-        let created = coin_aged(&mut host, 1);
-        host.reply(
-            &format!(
-                "{SWAP_API}/{MINT}/candles?interval=1m&limit=120&currency=SOL&createdTs={created}"
-            ),
-            json!([]),
-        );
-        fake_host::install(host);
-        let svg = String::from_utf8(bytes_of(chart_svg(MINT))).unwrap();
-        assert!(svg.contains("no trades to chart yet"));
-    }
-
     /// Trades keep only well-formed buys and sells, and tally them.
     #[test]
     fn trades_are_projected_and_tallied() {
@@ -873,7 +710,7 @@ mod tests {
     #[test]
     fn an_invalid_mint_is_refused_before_any_request() {
         fake_host::install(FakeHost::new(NOW_MS));
-        for response in [candles("x/../y"), chart_svg("x"), trades("x?y")] {
+        for response in [candles("x/../y"), trades("x?y")] {
             assert!(
                 matches!(response, DispatchResponse::Error { .. }),
                 "{response:?}"
