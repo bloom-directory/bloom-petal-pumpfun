@@ -686,13 +686,7 @@ fn try_fill(p: &Pending, order: &Order) -> Outcome {
         let sent = if p.front {
             post(JITO, &request)
         } else {
-            post(
-                RPC,
-                &rpc(
-                    "sendTransaction",
-                    json!([signed,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
-                ),
-            )
+            send_public(signed)
         };
         return Ok(match sent {
             Ok(_) => (

@@ -398,6 +398,31 @@ fn fetch_within(
         Ok(v)
     }
 }
+/// Send a signed transaction through the public RPCs. The primary
+/// preflights at the commitment the blockhash was read and simulated at (the
+/// finalized default lags and reports a young blockhash as not found). The
+/// verifying RPC is a pool of nodes, and one may not have seen the block its
+/// sibling gave the blockhash from, so the fallback skips a preflight that
+/// the Petal's own simulation, moments before signing, already did.
+fn send_public(tx: &str) -> Result<Value, DispatchResponse> {
+    post_exact(
+        RPC,
+        &rpc(
+            "sendTransaction",
+            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
+        ),
+    )
+    .or_else(|_| {
+        post_exact(
+            RPC_VERIFY,
+            &rpc(
+                "sendTransaction",
+                json!([tx,{"encoding":"base64","skipPreflight":true}]),
+            ),
+        )
+    })
+}
+
 /// A POST to `url`. A read from the primary RPC falls back to the verifying
 /// one when the primary fails outright: the primary is a free public
 /// endpoint that has gone down whole, and one outage should not stop every
@@ -1541,17 +1566,7 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             &rpc("sendTransaction", json!([tx, {"encoding":"base64"}])),
         )
     } else {
-        // Preflight at the commitment the blockhash was read and simulated at.
-        // The finalized default lags and reports young blockhashes as
-        // BlockhashNotFound after the transaction is already signed.
-        let request = rpc(
-            "sendTransaction",
-            json!([tx,{"encoding":"base64","skipPreflight":false,"maxRetries":0,"preflightCommitment":COMMITMENT}]),
-        );
-        match post(RPC, &request) {
-            Err(_) => post(RPC_VERIFY, &request),
-            result => result,
-        }
+        send_public(&tx)
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
@@ -5036,9 +5051,17 @@ mod tests {
             assert_eq!(sends.len(), 2, "one rejected send, one retry");
             assert_eq!(sends[0].url, RPC);
             assert_eq!(sends[1].url, RPC_VERIFY);
+            let params = |i: usize| sends[i].rpc_params().unwrap().clone();
             assert_eq!(
-                sends[0].body, sends[1].body,
-                "the retry is the identical request"
+                params(0)[0],
+                params(1)[0],
+                "the retry sends the same transaction"
+            );
+            assert_eq!(params(0)[1]["skipPreflight"], json!(false));
+            assert_eq!(
+                params(1)[1]["skipPreflight"],
+                json!(true),
+                "the fallback skips a preflight a lagging node of the pool could fail"
             );
         });
         assert_eq!(
