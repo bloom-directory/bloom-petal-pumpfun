@@ -54,10 +54,10 @@ status.json
 coins/latest.json
 coins/live.json
 coins/<mint>.json
-trade/<wallet>/preflight.json
-trade/<wallet>/holdings.json
-trade/<wallet>/{buy,sell,close_token_account}.json
-trade/<wallet>/operations/<operationId>.json
+trade/<wallet>/<index>/preflight.json
+trade/<wallet>/<index>/holdings.json
+trade/<wallet>/<index>/{buy,sell,close_token_account}.json
+trade/<wallet>/<index>/operations/<operationId>.json
 ```
 
 `coins/<mint>.json` is a safety summary rather than Pump's raw record: the
@@ -73,10 +73,13 @@ creator is streaming, up to 25 each, without banned or NSFW coins. Names and
 symbols are the creator's own text, not unique, and cleaned of control and
 direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
 
-Bloom mounts Petals only at `petals/`, so `<wallet>` is the wallet id in the
-path and the account is the one Bloom injects — account 0 on current Bloom.
-Operation records are scoped by both, so one operation id used on two accounts
-is two unrelated operations.
+`<wallet>/<index>` names the Bloom account that trades, exactly as under
+`/wallets/<wallet>/<index>/`. Bloom lists the wallets and accounts under
+`trade/`, checks the pair against the live wallet projection before the Petal
+runs, and hands the Petal that same pair as trusted context; a route without it
+is refused, and there is no default account. Each account, including 0, has its
+own private store, and operation records are scoped by both halves, so one
+operation id used on two accounts is two unrelated operations.
 
 ## How a transaction is checked
 
@@ -133,7 +136,7 @@ guarantee.
 
 ## Holdings and selling everything
 
-`trade/<wallet>/holdings.json` lists every token account the trading account
+`trade/<wallet>/<index>/holdings.json` lists every token account the trading account
 holds under both token programs: mint, raw and display amount, rent, whether
 it is empty, and for a Pump coin what selling the whole position returns at
 the current curve or pool price, before Pump's fee and slippage.
@@ -217,6 +220,13 @@ validators. The fake host signs with a real Ed25519 key whose public key is the
 payer in `route/tests/pump-builder-fixtures.json`, so a test drives a signature
 that genuinely belongs to the trading account.
 
+`scripts/check-bloom-contract.sh` installs the built package into Bloom's own
+Petal router, at the Bloom revision the script pins, with a two-account wallet,
+and checks that `trade/` lists Bloom's wallets and accounts, that the old
+unscoped paths are gone, and that preflight, a buy and the operation listings
+each use only the account the path names. Point `BLOOM_ROOT` at a Bloom checkout
+of that revision.
+
 Install a reviewed package archive into a running Bloom instance:
 
 ```sh
@@ -228,8 +238,18 @@ the selected account bound to the exact reviewed release before trading.
 
 ## Compatibility
 
-This package needs Bloom with `[sign].fee_asset` (bloom#276) and, for the
+This package needs Bloom with explicit `[wallet]/[index]` Petal routes and
+per-account stores (bloom#328) and `[sign].fee_asset` (bloom#276) and, for the
 ceremony to display the review above rather than an opaque digest, the review
 transport described in `SETUP.md`. It does **not** need bounded session keys
 (bloom#302) or session-key Exact signing (bloom#304); those cover a delegation
 model this Petal no longer uses.
+
+### Upgrading from `trade/<wallet>/`
+
+Earlier builds served trades at `trade/<wallet>/` and kept their records in the
+Petal-wide store. This build cannot read those records. Before upgrading, read
+every `trade/<wallet>/operations/<id>.json` with the installed build until each
+operation is `confirmed`, `finalized`, `chain_failed` or abandoned, and keep
+that package installed until it is. The transactions themselves are on chain;
+only the Petal's record of them stays behind.

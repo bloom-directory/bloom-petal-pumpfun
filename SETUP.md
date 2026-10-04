@@ -27,7 +27,7 @@ session model this Petal no longer uses.
 
 There is no session to create, no key to derive and no address to fund.
 
-1. `GET trade/<wallet>/preflight.json` — verifies the trading account has a
+1. `GET trade/<wallet>/<index>/preflight.json` — verifies the trading account has a
    readable Solana address, that the RPC is serving mainnet-beta, and that
    Pump's builder is reachable.
 
@@ -40,7 +40,7 @@ There is no session to create, no key to derive and no address to fund.
 2. Make sure wallet policy allows the protocol programs the trade will route
    through. See the table below.
 
-3. `POST trade/<wallet>/buy.json {operationId, mint, amount, minOutputAmount}`.
+3. `POST trade/<wallet>/<index>/buy.json {operationId, mint, amount, minOutputAmount}`.
    The first call returns `approval required` with an `action_id`; complete the
    ceremony, then repeat the identical write to continue.
 

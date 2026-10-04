@@ -9,9 +9,6 @@ repository = "bloom-directory/bloom-petal-pumpfun"
 command = "scripts/build.sh"
 outputs = ["petal/pumpfun"]
 
-[account]
-aware = true
-
 [consent]
 summary = "List the latest and live Pump.fun coins, see what the selected Bloom account holds, and buy or sell an existing coin from the Bloom account you selected. Every trade is one operation you approve in Bloom, capped at the SOL ceiling the approval shows, and rebuilt with a fresh blockhash after you approve; no session key, no separate wallet and no standing budget. An empty token account can be closed, returning its rent to the same account. Coin creation, fee collection and fee sharing are not supported."
 
