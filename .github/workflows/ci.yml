@@ -39,14 +39,13 @@ jobs:
         run: |
           scripts/build.sh
           petal check --root .
-      # This package declares [sign].fee_asset, which the Bloom CLI only
-      # accepts since bloom#276 (`pumpfun-fee-classes`). Build the CLI from
-      # that branch until it lands, then flip this ref back to master.
+      # The manifest needs both fee-asset and account-awareness support.
+      # Pin the published Pump.fun integration CLI used by the local smoke test.
       - name: Checkout Bloom CLI
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: pumpfun-fee-classes
+          ref: 26f40c8d26abf298aa3403fbb1fa4b74fde988a4
           path: bloom
           persist-credentials: false
       - name: Build key-free debug Bloom CLI for install smoke tests
