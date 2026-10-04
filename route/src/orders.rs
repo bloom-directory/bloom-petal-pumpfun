@@ -1058,7 +1058,7 @@ fn send_order(signed: &str, front: bool) -> Result<(), DispatchResponse> {
 fn reconcile(p: &Pending, order: &Order) -> Result<(String, String), DispatchResponse> {
     let Some(signed) = order.signed.as_deref() else {
         return Ok((
-            order.state.clone(),
+            p.status.clone(),
             "awaiting approval; no signed order".into(),
         ));
     };

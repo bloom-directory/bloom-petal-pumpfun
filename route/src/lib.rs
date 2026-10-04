@@ -2699,6 +2699,50 @@ fn transaction_fee(
         .ok_or_else(|| fail("Solana RPC did not quote the transaction fee"))?;
     Ok(quoted.max(local_floor))
 }
+/// Bind the quote to the exact curve or canonical pool used by the swap.
+fn priced_swap<'a>(
+    message: &'a Msg,
+    request: &Map<String, Value>,
+    action: Action,
+) -> Result<(&'a Ix, Market), DispatchResponse> {
+    let (mint_field, discriminator, side) = match action {
+        Action::Buy => ("outputMint", IX_BUY, "buy"),
+        Action::Sell => ("inputMint", IX_SELL, "sell"),
+        _ => return Err(fail("price check requires a buy or sell")),
+    };
+    let pump = pk(PROGRAMS[5]).map_err(fail)?;
+    let amm = pk(PROGRAMS[6]).map_err(fail)?;
+    let mint = pk(request_text(request, mint_field).map_err(fail)?).map_err(fail)?;
+    let ix = message
+        .instructions
+        .iter()
+        .find(|ix| {
+            has_discriminator(ix, discriminator)
+                && matches!(message.keys.get(ix.program), Some(p) if *p == pump || *p == amm)
+        })
+        .ok_or_else(|| fail(format!("{side} instruction missing")))?;
+    let market = markets(&[mint])?
+        .pop()
+        .flatten()
+        .ok_or_else(|| fail("the chain has no Pump curve or pool for this coin"))?;
+    match (message.keys.get(ix.program) == Some(&pump), market) {
+        (true, Market::Curve { .. }) => {
+            let curve = program_address(&[b"bonding-curve", &mint], &pump).map_err(fail)?;
+            require_account(message, ix, 3, &curve, "swap bonding curve").map_err(fail)?;
+        }
+        (false, Market::Pool { vaults, .. }) => {
+            require_account(message, ix, 7, &vaults[0], "pool token vault").map_err(fail)?;
+            require_account(message, ix, 8, &vaults[1], "pool SOL vault").map_err(fail)?;
+        }
+        _ => {
+            return Err(fail(format!(
+                "the {side} does not trade where the coin trades now"
+            )));
+        }
+    }
+    Ok((ix, market))
+}
+
 /// Refuse a sell whose floor the chain does not support. The builder sets
 /// the least SOL a sell may return, and the program enforces only that
 /// figure, so a builder that set it low would hand the difference to anyone
@@ -2707,34 +2751,9 @@ fn transaction_fee(
 /// less Pump's fees and the requested slippage. The sell must trade against
 /// exactly the curve or pool vaults that were priced.
 fn verify_sell_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), DispatchResponse> {
-    let pump = pk(PROGRAMS[5]).map_err(fail)?;
-    let amm = pk(PROGRAMS[6]).map_err(fail)?;
-    let mint = pk(request_text(request, "inputMint").map_err(fail)?).map_err(fail)?;
-    let ix = message
-        .instructions
-        .iter()
-        .find(|ix| {
-            has_discriminator(ix, IX_SELL)
-                && matches!(message.keys.get(ix.program), Some(p) if *p == pump || *p == amm)
-        })
-        .ok_or_else(|| fail("sell instruction missing"))?;
+    let (ix, market) = priced_swap(message, request, Action::Sell)?;
     let sold = u128::from(instruction_u64(ix, 8).map_err(fail)?);
     let floor = u128::from(instruction_u64(ix, 16).map_err(fail)?);
-    let market = markets(&[mint])?
-        .pop()
-        .flatten()
-        .ok_or_else(|| fail("the chain has no Pump curve or pool for this coin"))?;
-    match (message.keys.get(ix.program) == Some(&pump), market) {
-        (true, Market::Curve { .. }) => {
-            let curve = program_address(&[b"bonding-curve", &mint], &pump).map_err(fail)?;
-            require_account(message, ix, 3, &curve, "sell bonding curve").map_err(fail)?;
-        }
-        (false, Market::Pool { vaults, .. }) => {
-            require_account(message, ix, 7, &vaults[0], "pool token vault").map_err(fail)?;
-            require_account(message, ix, 8, &vaults[1], "pool SOL vault").map_err(fail)?;
-        }
-        _ => return Err(fail("the sell does not trade where the coin trades now")),
-    }
     let fair = market.sell_value(sold);
     let slippage = request
         .get("slippagePct")
@@ -2759,32 +2778,7 @@ fn verify_sell_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), 
 /// conservative fees and slippage, then enforce both that floor and the
 /// caller's explicit minOutputAmount through the existing byte validator.
 fn verify_buy_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), DispatchResponse> {
-    let pump = pk(PROGRAMS[5]).map_err(fail)?;
-    let amm = pk(PROGRAMS[6]).map_err(fail)?;
-    let mint = pk(request_text(request, "outputMint").map_err(fail)?).map_err(fail)?;
-    let ix = message
-        .instructions
-        .iter()
-        .find(|ix| {
-            has_discriminator(ix, IX_BUY)
-                && matches!(message.keys.get(ix.program), Some(p) if *p == pump || *p == amm)
-        })
-        .ok_or_else(|| fail("buy instruction missing"))?;
-    let market = markets(&[mint])?
-        .pop()
-        .flatten()
-        .ok_or_else(|| fail("the chain has no SOL Pump curve or pool for this coin"))?;
-    match (message.keys.get(ix.program) == Some(&pump), market) {
-        (true, Market::Curve { .. }) => {
-            let curve = program_address(&[b"bonding-curve", &mint], &pump).map_err(fail)?;
-            require_account(message, ix, 3, &curve, "buy bonding curve").map_err(fail)?;
-        }
-        (false, Market::Pool { vaults, .. }) => {
-            require_account(message, ix, 7, &vaults[0], "pool token vault").map_err(fail)?;
-            require_account(message, ix, 8, &vaults[1], "pool SOL vault").map_err(fail)?;
-        }
-        _ => return Err(fail("the buy does not trade where the coin trades now")),
-    }
+    let (ix, market) = priced_swap(message, request, Action::Buy)?;
     let budget = u128::from(request_u64(request, "amount").map_err(fail)?);
     let net = budget * 10_000 / (10_000 + SELL_FEE_ALLOWANCE_BPS);
     let (tokens, sol) = market.reserves();
@@ -8391,10 +8385,40 @@ mod tests {
         });
     }
 
+    fn install_order(id: &str) {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order(id, 20.0), DispatchResponse::Write);
+    }
+
+    #[test]
+    fn checking_an_unsigned_order_preserves_approval_and_rebuild_on_retry() {
+        let mut host = host_with_order_slot();
+        host.sign_outcome(Ok(SignOutcome::ApprovalPending {
+            action_id: "order-approval".into(),
+            expires_ms: NOW_MS + 60_000,
+        }));
+        fake_host::install(host);
+        assert!(
+            dispatch_message(&place_order("unsigned-order", 20.0)).contains("approval required")
+        );
+        let before: Pending = get_secret(&secret_key(&owner(), "unsigned-order"))
+            .unwrap()
+            .unwrap();
+        check_orders();
+        let after: Pending = get_secret(&secret_key(&owner(), "unsigned-order"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.approval, before.approval);
+        assert!(after.order.unwrap().signed.is_none());
+        assert_eq!(place_order("unsigned-order", 20.0), DispatchResponse::Write);
+        assert_eq!(stored_order("unsigned-order").state, "open");
+        fake_host::with(|h| assert_eq!(h.calls.iter().filter(|c| c.url == SWAP_URL).count(), 2));
+    }
+
     #[test]
     fn checking_an_order_never_exposes_a_usable_signature_to_simulation() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("unsigned-check", 20.0), DispatchResponse::Write);
+        install_order("unsigned-check");
         let tx = stored_order_signed("unsigned-check");
         let signed = B64.decode(&tx).unwrap();
         check_orders();
@@ -8424,8 +8448,7 @@ mod tests {
 
     #[test]
     fn dropped_order_sends_retry_identical_bytes_without_signing_again() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("dropped", 20.0), DispatchResponse::Write);
+        install_order("dropped");
         let tx = stored_order_signed("dropped");
         check_orders();
         check_orders();
@@ -8445,8 +8468,7 @@ mod tests {
 
     #[test]
     fn uncertain_order_submission_is_reconciled_even_without_an_acknowledgement() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("uncertain-send", 20.0), DispatchResponse::Write);
+        install_order("uncertain-send");
         fake_host::with(|host| {
             for url in [RPC, RPC_VERIFY, JITO] {
                 host.reply_only(
@@ -8474,8 +8496,7 @@ mod tests {
 
     #[test]
     fn processed_and_confirmed_orders_reserve_the_slot_until_finalized() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("finality", 20.0), DispatchResponse::Write);
+        install_order("finality");
         let tx = stored_order_signed("finality");
         for (commitment, state) in [("processed", "submitted"), ("confirmed", "confirmed")] {
             order_status(&tx, commitment, Value::Null);
@@ -8499,8 +8520,7 @@ mod tests {
     /// order keeps its slot and is signed once, and is filled only when final.
     #[test]
     fn processed_then_missing_then_finalized_is_one_fill_reserved_until_final() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("sequence", 20.0), DispatchResponse::Write);
+        install_order("sequence");
         let tx = stored_order_signed("sequence");
         order_status(&tx, "processed", Value::Null);
         check_orders();
@@ -8521,8 +8541,7 @@ mod tests {
     /// still read its nonce unchanged does not retire it or free its slot.
     #[test]
     fn blockhash_not_found_with_an_unmoved_nonce_keeps_the_order() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("lagging", 20.0), DispatchResponse::Write);
+        install_order("lagging");
         fake_host::with(|h| {
             h.reply_only(
                 &format!("{RPC} simulateTransaction"),
@@ -8539,8 +8558,7 @@ mod tests {
 
     #[test]
     fn malformed_status_never_reports_a_fill_or_sends_an_order() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("bad-status", 20.0), DispatchResponse::Write);
+        install_order("bad-status");
         for value in [
             json!({"confirmationStatus":"finalized"}),
             json!({"err":null}),
@@ -8566,8 +8584,7 @@ mod tests {
 
     #[test]
     fn a_final_status_requires_independent_rpc_agreement() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("rpc-finality", 20.0), DispatchResponse::Write);
+        install_order("rpc-finality");
         order_status(
             &stored_order_signed("rpc-finality"),
             "finalized",
@@ -8586,8 +8603,7 @@ mod tests {
 
     #[test]
     fn finalized_nonce_invalidation_frees_a_slot_without_inventing_a_fill() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("invalidated", 20.0), DispatchResponse::Write);
+        install_order("invalidated");
         change_nonce([9; 32]);
         check_orders();
         assert_eq!(stored_order("invalidated").state, "invalidated");
@@ -8612,11 +8628,7 @@ mod tests {
 
     #[test]
     fn nonce_disagreement_preserves_reservation_and_records_the_failure() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(
-            place_order("nonce-disagreement", 20.0),
-            DispatchResponse::Write
-        );
+        install_order("nonce-disagreement");
         fake_host::with(|host| {
             host.reply_only(
                 &format!("{RPC_VERIFY} getMultipleAccounts"),
@@ -8637,8 +8649,7 @@ mod tests {
 
     #[test]
     fn a_nonce_change_on_an_unfinalized_fork_does_not_free_the_slot() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("nonce-fork", 20.0), DispatchResponse::Write);
+        install_order("nonce-fork");
         let old = nonce_account(USER);
         change_nonce([9; 32]);
         let changed = fake_host::with(|h| h.chain.accounts[&slot0()].clone());
@@ -8661,8 +8672,7 @@ mod tests {
 
     #[test]
     fn cancel_acknowledgement_keeps_the_order_live_and_the_slot_reserved() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("cancel-ack", 20.0), DispatchResponse::Write);
+        install_order("cancel-ack");
         assert_eq!(
             cancel_limit("cancel-ack", "cancel-ack-op"),
             DispatchResponse::Write
@@ -8679,8 +8689,7 @@ mod tests {
 
     #[test]
     fn a_fill_winning_the_cancel_race_is_reported_as_a_fill() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("fill-wins", 20.0), DispatchResponse::Write);
+        install_order("fill-wins");
         assert_eq!(
             cancel_limit("fill-wins", "cancel-loses"),
             DispatchResponse::Write
@@ -8707,8 +8716,7 @@ mod tests {
 
     #[test]
     fn cancellation_can_resume_after_a_crash_without_another_signature() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("restart-cancel", 20.0), DispatchResponse::Write);
+        install_order("restart-cancel");
         assert_eq!(
             cancel_limit("restart-cancel", "restart-cancel-op"),
             DispatchResponse::Write
@@ -8738,11 +8746,7 @@ mod tests {
 
     #[test]
     fn a_graduated_curve_order_still_reserves_its_nonce_and_can_be_cancelled() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(
-            place_order("graduated-cancel", 20.0),
-            DispatchResponse::Write
-        );
+        install_order("graduated-cancel");
         fake_host::with(|host| {
             host.reply_only(
                 &format!("{RPC} simulateTransaction"),
@@ -8769,8 +8773,7 @@ mod tests {
 
     #[test]
     fn legacy_cancelled_records_are_reserved_and_reconciled_before_reuse() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("legacy-cancel", 20.0), DispatchResponse::Write);
+        install_order("legacy-cancel");
         update_order("legacy-cancel", |p| {
             p.order.as_mut().unwrap().state = "cancelled".into();
             p.status = "cancelled".into();
@@ -8789,8 +8792,7 @@ mod tests {
 
     #[test]
     fn finalized_on_chain_failure_is_distinct_from_fill_and_cancellation() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("failed-order", 20.0), DispatchResponse::Write);
+        install_order("failed-order");
         order_status(
             &stored_order_signed("failed-order"),
             "finalized",
@@ -8809,11 +8811,7 @@ mod tests {
 
     #[test]
     fn cancellation_rechecks_the_bound_nonce_before_signing() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(
-            place_order("nonce-before-cancel", 20.0),
-            DispatchResponse::Write
-        );
+        install_order("nonce-before-cancel");
         change_nonce([9; 32]);
         let result = cancel_limit("nonce-before-cancel", "changed-cancel");
         assert!(dispatch_message(&result).contains("changed nonce"));
@@ -8822,8 +8820,7 @@ mod tests {
 
     #[test]
     fn order_and_cancel_bytes_stay_out_of_public_operations_and_orders() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("secret-order", 20.0), DispatchResponse::Write);
+        install_order("secret-order");
         assert_eq!(
             cancel_limit("secret-order", "secret-cancel"),
             DispatchResponse::Write
@@ -8956,8 +8953,7 @@ mod tests {
 
     #[test]
     fn limit_review_matches_the_final_instruction_amounts() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("review-limit", 20.0), DispatchResponse::Write);
+        install_order("review-limit");
         let tx = B64.decode(stored_order_signed("review-limit")).unwrap();
         let parsed = message(&tx[65..]).unwrap();
         let ix = parsed
@@ -8977,11 +8973,7 @@ mod tests {
 
     #[test]
     fn cancelling_during_approval_suspends_checks_without_claiming_success() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(
-            place_order("approval-cancel", 20.0),
-            DispatchResponse::Write
-        );
+        install_order("approval-cancel");
         fake_host::with(|h| {
             h.sign_outcome(Ok(SignOutcome::ApprovalPending {
                 action_id: "cancel-approval".into(),
@@ -9010,11 +9002,7 @@ mod tests {
 
     #[test]
     fn cancellation_refuses_a_second_operation_id_until_the_first_is_reconciled() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(
-            place_order("duplicate-cancel", 20.0),
-            DispatchResponse::Write
-        );
+        install_order("duplicate-cancel");
         assert_eq!(
             cancel_limit("duplicate-cancel", "cancel-once"),
             DispatchResponse::Write
@@ -9028,8 +9016,7 @@ mod tests {
 
     #[test]
     fn a_late_cancellation_write_cannot_overwrite_a_settled_fill() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("settled-race", 20.0), DispatchResponse::Write);
+        install_order("settled-race");
         assert_eq!(
             cancel_limit("settled-race", "settled-cancel"),
             DispatchResponse::Write
@@ -9052,8 +9039,7 @@ mod tests {
 
     #[test]
     fn a_confirmed_fill_that_disappears_can_resume_the_same_order() {
-        fake_host::install(host_with_order_slot());
-        assert_eq!(place_order("rollback", 20.0), DispatchResponse::Write);
+        install_order("rollback");
         let tx = stored_order_signed("rollback");
         order_status(&tx, "confirmed", Value::Null);
         check_orders();
