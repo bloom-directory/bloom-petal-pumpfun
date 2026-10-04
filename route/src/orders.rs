@@ -34,9 +34,6 @@ const OWN_COMPUTE_UNITS: u32 = 20_000;
 const OWN_COMPUTE_UNIT_PRICE: u64 = 2_000_000;
 /// Order slots a trading account may have.
 pub(crate) const SLOTS: u64 = 4;
-/// Pump's fee is 1.25% on the curve and 0.85% on PumpSwap. An order's
-/// amounts leave this much room, so it fills at the limit or better.
-const FEE_ALLOWANCE_BPS: f64 = 150.0;
 /// Pump's own errors for a price that has not reached the limit: too much
 /// SOL required, too little SOL received (curve), and exceeded slippage
 /// (PumpSwap).
@@ -56,13 +53,38 @@ pub(crate) struct Order {
     /// The signed transaction, once the owner has approved it.
     #[serde(default)]
     pub signed: Option<String>,
-    /// `open`, `submitted`, `filled`, `cancelled` or `dead`.
+    /// Nonterminal states reserve the slot until the nonce is settled.
     #[serde(default)]
     pub state: String,
     #[serde(default)]
     pub checked_ms: Option<u64>,
+    /// Cancellation bytes stay secret and use the same nonce as the order.
+    #[serde(default)]
+    pub cancellation: Option<Cancellation>,
+    /// True only after a finalized outcome or finalized nonce invalidation.
+    /// Older records did not establish finality and must be reconciled.
+    #[serde(default)]
+    pub settled: bool,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Cancellation {
+    pub operation: String,
+    pub signed: Option<String>,
+    pub front: bool,
+}
+
+fn terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "filled" | "cancelled" | "invalidated" | "chain_failed"
+    )
+}
+
+fn reserves_slot(order: &Order) -> bool {
+    !order.settled
 }
 
 /// The seed an order slot's address is derived from.
@@ -86,6 +108,7 @@ pub(crate) fn slot_address(user: &[u8; 32], slot: u64) -> Result<[u8; 32], Strin
 fn nonce_value(account: &Value, user: &[u8; 32]) -> Option<[u8; 32]> {
     let data = owned_data(account, &pk(PROGRAMS[1]).ok()?)?;
     if data.len() != NONCE_SPACE as usize
+        || data.get(..4) != Some(&1u32.to_le_bytes()[..])
         || data.get(4..8) != Some(&1u32.to_le_bytes()[..])
         || key_at(&data, 8).as_ref() != Some(user)
     {
@@ -96,6 +119,53 @@ fn nonce_value(account: &Value, user: &[u8; 32]) -> Option<[u8; 32]> {
 
 /// An order slot's address and, when it exists, its nonce value.
 type Slot = ([u8; 32], Option<[u8; 32]>);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SlotReservation {
+    operation: String,
+    digest: String,
+}
+
+fn reservation_key(owner: &TradeOwner, slot: u64, nonce: &[u8; 32]) -> String {
+    format!(
+        "state/{}order-slots/{slot}/{}.json",
+        trades_prefix(owner),
+        bs58::encode(nonce).into_string()
+    )
+}
+
+/// Atomic creation prevents concurrent route writes from approving two orders
+/// on one nonce. The same operation may resume; a new nonce has a new key.
+fn reserve(
+    owner: &TradeOwner,
+    slot: u64,
+    nonce: &[u8; 32],
+    operation: &str,
+    digest: &str,
+) -> Result<(), DispatchResponse> {
+    let key = reservation_key(owner, slot, nonce);
+    let expected = SlotReservation {
+        operation: operation.into(),
+        digest: digest.into(),
+    };
+    if put_new(&key, &expected, false).is_err() {
+        match get::<SlotReservation>(&key)? {
+            Some(existing) if existing == expected => return Ok(()),
+            Some(existing) => {
+                return Err(deny(format!(
+                    "slot {slot} is reserved by operation {}; retry that operationId",
+                    existing.operation
+                )));
+            }
+            None => {
+                return Err(fail(
+                    "could not persist the order slot reservation; nothing signed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Every slot's address and, when it exists, its nonce value.
 fn slots(user: &[u8; 32]) -> Result<Vec<Slot>, DispatchResponse> {
@@ -206,16 +276,21 @@ pub(crate) fn build(
         .and_then(Value::as_f64)
         .ok_or_else(|| fail("normalized marketCapSol missing"))?;
     let slots = slots(&user)?;
-    let busy = orders(&owner_of(trader))?
+    let owner = owner_of(trader);
+    let mut busy = orders(&owner)?
         .into_iter()
-        .filter(|(id, p)| {
-            id != operation
-                && p.order
-                    .as_ref()
-                    .is_some_and(|o| matches!(o.state.as_str(), "" | "open" | "submitted"))
-        })
+        .filter(|(id, p)| id != operation && p.order.as_ref().is_some_and(reserves_slot))
         .filter_map(|(_, p)| p.order.map(|o| o.slot))
         .collect::<Vec<_>>();
+    for (slot, (_, nonce)) in slots.iter().enumerate() {
+        if let Some(nonce) = nonce
+            && let Some(reservation) =
+                get::<SlotReservation>(&reservation_key(&owner, slot as u64, nonce))?
+            && reservation.operation != operation
+        {
+            busy.push(slot as u64);
+        }
+    }
     let slot = match request.get("slot").and_then(Value::as_u64) {
         Some(slot) => slot,
         None => (0..SLOTS)
@@ -288,6 +363,22 @@ pub(crate) fn build(
     } else {
         "sell"
     };
+    let mut final_message =
+        super::message(envelope(&order_raw).map_err(fail)?.message).map_err(fail)?;
+    hydrate_lookups(&mut final_message, &json!({}))?;
+    swap.review = swap_review(
+        trader,
+        side,
+        request,
+        &final_message,
+        Costs {
+            network_fee_lamports: swap.network_fee_lamports,
+            network_fee_cap_lamports: swap.network_fee_cap_lamports,
+            created: swap.created.unwrap_or_default(),
+        },
+        verified_mint_decimals(&mint),
+    )
+    .map_err(fail)?;
     let mut review = vec![
         format!("Limit {verb} on Pump.fun"),
         limit_line,
@@ -308,8 +399,11 @@ pub(crate) fn build(
         signed: None,
         state: String::new(),
         checked_ms: None,
+        cancellation: None,
+        settled: false,
         note: None,
     });
+    reserve(&owner, slot, &value, operation, &swap.digest)?;
     Ok(swap)
 }
 
@@ -361,30 +455,29 @@ fn tighten(
                 && has_discriminator(ix, discriminator)
         })
         .ok_or_else(|| fail("validated swap instruction missing"))?;
-    let fee = FEE_ALLOWANCE_BPS / 10_000.0;
     let line = if matches!(side, Action::Buy) {
         let budget = request_u64(request, "amount").map_err(fail)?;
-        let tokens = (budget as f64 / (1.0 + fee) / lamports_per_unit).floor();
+        let tokens = (budget as f64 / lamports_per_unit).ceil();
         if !(1.0..u64::MAX as f64).contains(&tokens) {
             return Err(bad("that limit buys no tokens with this amount"));
         }
         swap.data[8..16].copy_from_slice(&(tokens as u64).to_le_bytes());
         swap.data[16..24].copy_from_slice(&budget.to_le_bytes());
         format!(
-            "Fills only while the market cap is at or below {} SOL: spends at most {} for {} raw token units",
+            "Buy limit from target market cap {} SOL and the supply at placement: spends at most {} for {} raw token units, including protocol fees",
             cap_display(cap),
             lamports_display(budget),
             tokens as u64
         )
     } else {
         let sold = instruction_u64(swap, 8).map_err(fail)?;
-        let floor = (sold as f64 * lamports_per_unit * (1.0 - fee)).floor();
+        let floor = (sold as f64 * lamports_per_unit).ceil();
         if !(1.0..u64::MAX as f64).contains(&floor) {
             return Err(bad("that limit prices this sale at nothing"));
         }
         swap.data[16..24].copy_from_slice(&(floor as u64).to_le_bytes());
         format!(
-            "Fills only once the market cap is at or above {} SOL: sells {} raw token units for at least {}",
+            "Sell limit from target market cap {} SOL and the supply at placement: sells {} raw token units for at least {} after protocol fees",
             cap_display(cap),
             sold,
             lamports_display(floor as u64)
@@ -505,15 +598,33 @@ pub(crate) fn build_cancel(
     trader: &Trader<'_>,
     request: &Map<String, Value>,
     digest: String,
+    operation: &str,
 ) -> Result<Pending, DispatchResponse> {
     let user = pk(trader.address).map_err(fail)?;
     let id = request_text(request, "order").map_err(fail)?;
     let order = get_secret::<Pending>(&secret_key(&owner_of(trader), id))?
         .and_then(|p| p.order)
         .ok_or_else(|| bad(format!("no order {id}")))?;
-    if !matches!(order.state.as_str(), "open" | "submitted") {
+    if order.settled {
         return Err(bad(format!(
-            "order {id} is {}, not open",
+            "order {id} is already settled; check orders.json"
+        )));
+    }
+    if order.signed.is_none() {
+        return Err(bad(format!("order {id} is awaiting approval, not signed")));
+    }
+    if order
+        .cancellation
+        .as_ref()
+        .is_some_and(|c| c.operation != operation)
+    {
+        return Err(deny(
+            "cancellation already requested: retry its original operationId",
+        ));
+    }
+    if current_nonce(&order, "confirmed")? != Some(pk(&order.nonce_value).map_err(fail)?) {
+        return Err(bad(format!(
+            "order {id} has a changed nonce ({}) : check_orders.json must reconcile it before cancellation",
             if order.state.is_empty() {
                 "awaiting approval"
             } else {
@@ -521,17 +632,9 @@ pub(crate) fn build_cancel(
             }
         )));
     }
-    let keys = [
-        user,
-        pk(&order.nonce_account).map_err(fail)?,
-        pk(PROGRAMS[1]).map_err(fail)?,
-        pk(RECENT_BLOCKHASHES).map_err(fail)?,
-    ];
-    let instructions = [Ix {
-        program: 2,
-        accounts: vec![1, 3, 0],
-        data: vec![4, 0, 0, 0],
-    }];
+    // Do not use a recent blockhash: a delayed cancel could advance a slot
+    // reused after the order filled. Order and cancel must race on one nonce.
+    let keys = [user, pk(PROGRAMS[1]).map_err(fail)?];
     let review_head = vec![
         "Cancel a Pump.fun limit order".to_owned(),
         trader.line(),
@@ -542,20 +645,37 @@ pub(crate) fn build_cancel(
             cap_display(order.market_cap_sol),
             order.slot
         ),
-        "Advances the slot's nonce, so the stored order can never land; nothing else moves"
+        "Cancels only after its nonce advance finalizes; the order may fill first. The fee and Jito tip are charged"
             .to_owned(),
     ];
-    own_transaction(
+    let mut pending = own_transaction(
         trader,
-        [1, 0, 2],
+        [1, 0, 1],
         &keys,
-        &instructions,
+        &[],
         tip_lamports(request)?,
         digest,
         Created::default(),
         review_head,
-        json!({"order": id, "slot": order.slot}),
+        json!({"order": id, "slot": order.slot, "nonceValue": order.nonce_value}),
+    )?;
+    let raw = B64
+        .decode(&pending.tx)
+        .map_err(|_| fail("invalid cancel transaction"))?;
+    let env = envelope(&raw).map_err(fail)?;
+    let parsed = message(env.message).map_err(fail)?;
+    let durable = txedit::with_durable_nonce(
+        env.message,
+        &parsed.instructions,
+        &pk(&order.nonce_account).map_err(fail)?,
+        &pk(&order.nonce_value).map_err(fail)?,
+        &pk(PROGRAMS[1]).map_err(fail)?,
+        &pk(RECENT_BLOCKHASHES).map_err(fail)?,
     )
+    .map_err(fail)?;
+    pending.message_sha256 = hex::encode(Sha256::digest(&durable));
+    pending.tx = B64.encode(txedit::unsigned_transaction(&durable).map_err(fail)?);
+    Ok(pending)
 }
 
 /// A transaction this Petal builds itself, with a fresh blockhash.
@@ -625,7 +745,8 @@ fn own_transaction(
         .collect::<Vec<_>>();
     let price = recent_compute_unit_price(&writable)
         .unwrap_or(0)
-        .max(OWN_COMPUTE_UNIT_PRICE);
+        .max(OWN_COMPUTE_UNIT_PRICE)
+        .min(MAX_PRIORITY_FEE_LAMPORTS * 1_000_000 / u64::from(OWN_COMPUTE_UNITS));
     let mut keys = keys.to_vec();
     keys.push(pk(PROGRAMS[0]).map_err(fail)?);
     let budget = keys.len() - 1;
@@ -644,8 +765,9 @@ fn own_transaction(
     all.extend_from_slice(instructions);
     let header = [header[0], header[1], header[2] + 1];
     let message = txedit::plain_message(header, &keys, &blockhash, &all).map_err(fail)?;
-    super::message(&message).map_err(fail)?;
-    let network_fee_lamports = quote_message_fee(&message)?;
+    let parsed = super::message(&message).map_err(fail)?;
+    let network_fee_lamports =
+        quote_message_fee(&message)?.max(local_fee_floor(&parsed, &Map::new()).map_err(fail)?);
     review.push(format!(
         "Estimated network fee: {} (a cap, charged as used)",
         lamports_display(network_fee_lamports)
@@ -680,52 +802,82 @@ fn own_transaction(
     })
 }
 
-/// Record that a cancel landed: the order can no longer fill.
-pub(crate) fn cancelled(owner: &TradeOwner, id: &str) -> Result<(), DispatchResponse> {
+/// Record cancellation intent before signing and executable bytes before
+/// sending. A restart can reconcile or resend the same cancel without signing.
+pub(crate) fn request_cancel(
+    owner: &TradeOwner,
+    id: &str,
+    operation: &str,
+    p: &Pending,
+    signed: Option<String>,
+) -> Result<(), DispatchResponse> {
     let key = secret_key(owner, id);
-    if let Some(mut p) = get_secret::<Pending>(&key)?
-        && let Some(order) = p.order.as_mut()
-    {
-        order.state = "cancelled".into();
-        order.note = Some("cancelled: the slot's nonce was advanced".into());
-        p.status = "cancelled".into();
-        put(&key, &p, true)?;
-        publish(owner, id, Action::LimitOrder, &p)?;
+    let mut original = get_secret::<Pending>(&key)?.ok_or_else(|| bad("order not found"))?;
+    let order = original
+        .order
+        .as_mut()
+        .ok_or_else(|| bad("operation is not an order"))?;
+    if order.settled {
+        return Err(deny("order already settled; refresh orders.json"));
     }
-    Ok(())
+    if p.api.get("nonceValue").and_then(Value::as_str) != Some(&order.nonce_value) {
+        return Err(deny("cancellation does not bind the order's nonce"));
+    }
+    if order
+        .cancellation
+        .as_ref()
+        .is_some_and(|c| c.operation != operation)
+    {
+        return Err(deny("retry the existing cancellation operationId"));
+    }
+    // Preserve any signed bytes if the caller is reconciling signing.
+    let signed = signed.or_else(|| order.cancellation.as_ref().and_then(|c| c.signed.clone()));
+    order.cancellation = Some(Cancellation {
+        operation: operation.into(),
+        signed,
+        front: p.front,
+    });
+    order.state = "cancel_pending".into();
+    order.note = Some(
+        "cancellation requested; the order can still fill until the nonce advance finalizes".into(),
+    );
+    original.status = order.state.clone();
+    put(&key, &original, true)?;
+    publish(owner, id, Action::LimitOrder, &original)
 }
 
-/// Check every open order: send those that would fill now, confirm those
-/// sent, and retire those that can never fill. Nothing is signed here; each
-/// order was signed when the owner approved it.
+/// Check and reconcile all unsettled orders. Every simulation is unsigned;
+/// executable bytes leave only through the selected broadcast route.
 pub fn check(c: &Ctx, w: String) -> DispatchResponse {
     let owner = match TradeOwner::scope(c, &w) {
-        Ok(owner) => owner,
+        Ok(v) => v,
         Err(e) => return e,
     };
     let list = match orders(&owner) {
-        Ok(list) => list,
+        Ok(v) => v,
         Err(e) => return e,
     };
     for (id, mut p) in list {
         let Some(order) = p.order.clone() else {
             continue;
         };
-        let outcome = match order.state.as_str() {
-            "open" => try_fill(&p, &order),
-            "submitted" => confirm(&p, &order),
-            _ => continue,
-        };
-        let Ok((state, note, signature)) = outcome else {
+        // Older packages marked cancelled at RPC acceptance, so recheck those
+        // records too. Filled/failed/invalidated records require no new send.
+        if order.settled && order.state != "invalidated" {
             continue;
+        }
+        let (state, note) = match reconcile(&p, &order) {
+            Ok(outcome) => outcome,
+            Err(e) => (
+                order.state.clone(),
+                format!("check failed: {}", dispatch_message(&e)),
+            ),
         };
         let order = p.order.as_mut().expect("checked above");
+        order.settled = terminal(&state);
         order.state = state.clone();
         order.note = Some(note);
         order.checked_ms = Some(host::now_ms());
-        if signature.is_some() {
-            p.signature = signature;
-        }
         p.status = state;
         let key = secret_key(&owner, &id);
         if let Err(e) =
@@ -737,117 +889,302 @@ pub fn check(c: &Ctx, w: String) -> DispatchResponse {
     DispatchResponse::Write
 }
 
-type Outcome = Result<(String, String, Option<String>), DispatchResponse>;
-
 fn signed_signature(signed: &str) -> Option<String> {
     let raw = B64.decode(signed).ok()?;
+    signed_message(&raw).ok()?;
     Some(bs58::encode(raw.get(1..65)?).into_string())
 }
 
-/// Simulate the signed order; send it when it would succeed.
-fn try_fill(p: &Pending, order: &Order) -> Outcome {
-    let Some(signed) = order.signed.as_deref() else {
-        return Ok(("open".into(), "not signed yet".into(), None));
+fn signed_message(raw: &[u8]) -> Result<&[u8], DispatchResponse> {
+    if raw.len() > MAX_TX || raw.first() != Some(&1) {
+        return Err(fail("invalid stored signer count or packet size"));
+    }
+    let bytes = raw
+        .get(65..)
+        .ok_or_else(|| fail("truncated stored signature"))?;
+    let parsed = message(bytes).map_err(fail)?;
+    if parsed.required != 1 {
+        return Err(fail("stored signer/header mismatch"));
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, PartialEq)]
+enum ChainStatus {
+    Absent,
+    Pending,
+    Confirmed,
+    Finalized,
+    Failed(String, bool),
+}
+
+fn status_at(url: &str, signed: &str) -> Result<ChainStatus, DispatchResponse> {
+    let signature = signed_signature(signed).ok_or_else(|| fail("invalid stored transaction"))?;
+    let reply = post_exact(
+        url,
+        &rpc(
+            "getSignatureStatuses",
+            json!([[signature], {"searchTransactionHistory":true}]),
+        ),
+    )?;
+    let value = reply
+        .pointer("/result/value/0")
+        .ok_or_else(|| fail("RPC omitted signature status"))?;
+    if value.is_null() {
+        return Ok(ChainStatus::Absent);
+    }
+    let err = value
+        .get("err")
+        .ok_or_else(|| fail("RPC omitted transaction error status"))?;
+    let commitment = value
+        .get("confirmationStatus")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("RPC omitted transaction commitment"))?;
+    if !matches!(commitment, "processed" | "confirmed" | "finalized") {
+        return Err(fail("RPC returned an unknown transaction commitment"));
+    }
+    if !err.is_null() {
+        return Ok(ChainStatus::Failed(
+            err.to_string().chars().take(200).collect(),
+            commitment == "finalized",
+        ));
+    }
+    Ok(match commitment {
+        "finalized" => ChainStatus::Finalized,
+        "confirmed" => ChainStatus::Confirmed,
+        _ => ChainStatus::Pending,
+    })
+}
+
+/// A final outcome needs both independently queried RPCs to agree. A lagging
+/// or unavailable second RPC keeps the slot reserved; it never licenses reuse.
+fn chain_status(signed: &str) -> Result<ChainStatus, DispatchResponse> {
+    let primary = status_at(RPC, signed)?;
+    if matches!(
+        primary,
+        ChainStatus::Finalized | ChainStatus::Failed(_, true)
+    ) {
+        let verify = status_at(RPC_VERIFY, signed)?;
+        if primary != verify {
+            return Ok(ChainStatus::Pending);
+        }
+    }
+    Ok(primary)
+}
+
+fn payer(order: &Order) -> Result<[u8; 32], DispatchResponse> {
+    let raw = B64
+        .decode(
+            order
+                .signed
+                .as_deref()
+                .ok_or_else(|| fail("order not signed"))?,
+        )
+        .map_err(|_| fail("invalid stored order"))?;
+    let parsed = message(signed_message(&raw)?).map_err(fail)?;
+    parsed
+        .keys
+        .first()
+        .copied()
+        .ok_or_else(|| fail("order payer missing"))
+}
+
+fn current_nonce(order: &Order, commitment: &str) -> Result<Option<[u8; 32]>, DispatchResponse> {
+    let user = payer(order)?;
+    let read = |url| -> Result<Option<[u8; 32]>, DispatchResponse> {
+        let value = post_exact(
+            url,
+            &rpc(
+                "getMultipleAccounts",
+                json!([[order.nonce_account],
+            {"encoding":"base64", "commitment":commitment}]),
+            ),
+        )?;
+        let account = value
+            .pointer("/result/value/0")
+            .ok_or_else(|| fail("RPC omitted order nonce"))?;
+        if account.is_null() {
+            return Ok(None);
+        }
+        nonce_value(account, &user)
+            .map(Some)
+            .ok_or_else(|| fail("invalid order nonce account or authority"))
     };
-    let v = post(
+    let primary = read(RPC)?;
+    let verify = read(RPC_VERIFY)?;
+    if primary != verify {
+        return Err(fail(
+            "RPCs disagree on the order nonce; slot remains reserved",
+        ));
+    }
+    Ok(primary)
+}
+
+fn simulate_order(signed: &str) -> Result<Value, DispatchResponse> {
+    let raw = B64
+        .decode(signed)
+        .map_err(|_| fail("invalid stored transaction"))?;
+    let unsigned = B64.encode(txedit::unsigned_transaction(signed_message(&raw)?).map_err(fail)?);
+    let value = post(
         RPC,
         &rpc(
             "simulateTransaction",
-            json!([signed, {"encoding":"base64","sigVerify":true,"replaceRecentBlockhash":false,"commitment":COMMITMENT}]),
+            json!([unsigned,
+        {"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":false,"commitment":COMMITMENT}]),
         ),
     )?;
-    let err = v
+    value
         .pointer("/result/value/err")
-        .ok_or_else(|| fail("Solana RPC omitted the simulation result"))?;
-    if err.is_null() {
-        let signature = signed_signature(signed);
-        let request = rpc("sendTransaction", json!([signed, {"encoding":"base64"}]));
-        let sent = if p.front {
-            post(JITO, &request)
-        } else {
-            send_public(signed)
-        };
-        return Ok(match sent {
-            Ok(_) => (
-                "submitted".into(),
-                "the price reached the limit; sent".into(),
-                signature,
-            ),
-            Err(e) => (
-                "open".into(),
-                format!("would fill, but sending failed: {}", dispatch_message(&e)),
-                None,
-            ),
-        });
+        .cloned()
+        .ok_or_else(|| fail("RPC omitted simulation result"))
+}
+
+fn send_order(signed: &str, front: bool) -> Result<(), DispatchResponse> {
+    let expected = signed_signature(signed).ok_or_else(|| fail("invalid stored signature"))?;
+    let sent = if front {
+        post(
+            JITO,
+            &rpc("sendTransaction", json!([signed, {"encoding":"base64"}])),
+        )?
+    } else {
+        send_public(signed)?
+    };
+    if sent.get("result").and_then(Value::as_str) != Some(&expected) {
+        return Err(fail("RPC signature mismatch; submission outcome unknown"));
     }
-    let custom = err
+    Ok(())
+}
+
+fn reconcile(p: &Pending, order: &Order) -> Result<(String, String), DispatchResponse> {
+    let Some(signed) = order.signed.as_deref() else {
+        return Ok((
+            order.state.clone(),
+            "awaiting approval; no signed order".into(),
+        ));
+    };
+    let status = chain_status(signed)?;
+    match status {
+        ChainStatus::Finalized => return Ok(("filled".into(), "fill finalized on chain".into())),
+        ChainStatus::Failed(ref err, true) => {
+            return Ok((
+                "chain_failed".into(),
+                format!("order failed on chain and spent its nonce: {err}"),
+            ));
+        }
+        _ => {}
+    }
+    let expected = pk(&order.nonce_value).map_err(fail)?;
+    if let Some(cancel) = &order.cancellation
+        && let Some(cancel_tx) = cancel.signed.as_deref()
+        && chain_status(cancel_tx)? == ChainStatus::Finalized
+    {
+        // The original transaction may be confirmed on the winning fork even
+        // if another RPC reports the cancellation finalized. Do not guess.
+        if matches!(status, ChainStatus::Confirmed) {
+            return Ok((
+                "cancel_pending".into(),
+                "conflicting fill/cancel observations; waiting for finality".into(),
+            ));
+        }
+        return Ok((
+            "cancelled".into(),
+            "cancellation finalized; the signed order is invalid".into(),
+        ));
+    }
+    if current_nonce(order, "confirmed")? != Some(expected) {
+        if current_nonce(order, "finalized")? != Some(expected) {
+            return Ok(("invalidated".into(), "nonce change finalized; this order cannot execute. Its fill/cancellation outcome is not established; inspect the recorded signatures".into()));
+        }
+        return Ok((
+            if order.cancellation.is_some() {
+                "cancel_pending"
+            } else {
+                "submitted"
+            }
+            .into(),
+            "nonce changed but is not finalized; slot remains reserved".into(),
+        ));
+    }
+    if let Some(cancel) = &order.cancellation {
+        if let Some(tx) = cancel.signed.as_deref() {
+            let err = simulate_order(tx)?;
+            if err.is_null() {
+                let result = send_order(tx, cancel.front);
+                return Ok(("cancel_pending".into(), match result {
+                    Ok(()) => "cancellation sent; order remains executable until the nonce advance finalizes".into(),
+                    Err(e) => format!("cancellation submission uncertain: {}; retry the same cancellation operationId", dispatch_message(&e)),
+                }));
+            }
+            return Ok((
+                "cancel_pending".into(),
+                format!(
+                    "cancellation would fail: {}; retry its original operationId",
+                    err
+                ),
+            ));
+        }
+        return Ok((
+            "cancel_pending".into(),
+            "cancellation awaiting approval/signing; retry its original operationId".into(),
+        ));
+    }
+    if matches!(order.state.as_str(), "cancelled" | "cancel_pending") {
+        return Ok((
+            "cancel_pending".into(),
+            "legacy cancellation is unverified and nonce remains live; request cancellation again"
+                .into(),
+        ));
+    }
+    match status {
+        ChainStatus::Confirmed => {
+            return Ok((
+                "confirmed".into(),
+                "fill confirmed; waiting for finality".into(),
+            ));
+        }
+        ChainStatus::Pending | ChainStatus::Failed(_, false) => {
+            return Ok((
+                "submitted".into(),
+                "transaction observed; waiting for finality".into(),
+            ));
+        }
+        _ => {}
+    }
+    let err = simulate_order(signed)?;
+    if err.is_null() {
+        // On lost acknowledgements or dropped sends, resend only identical
+        // bytes. A durable nonce permits at most one execution.
+        let result = send_order(signed, p.front);
+        return Ok((
+            "submitted".into(),
+            match result {
+                Ok(()) => "sent the signed order; waiting for confirmation".into(),
+                Err(e) => format!(
+                    "submission outcome unknown: {}; the same bytes will be reconciled on the next check",
+                    dispatch_message(&e)
+                ),
+            },
+        ));
+    }
+    let code = err
         .pointer("/InstructionError/1/Custom")
         .and_then(Value::as_u64);
-    Ok(match custom {
-        Some(code) if NOT_YET.contains(&code) => {
-            ("open".into(), "waiting: the price has not reached the limit".into(), None)
-        }
+    Ok(match code {
+        Some(code) if NOT_YET.contains(&code) => (
+            "open".into(),
+            "waiting: the price has not reached the limit".into(),
+        ),
         Some(CURVE_COMPLETE) => (
             "dead".into(),
-            "the coin graduated to PumpSwap; this order was built for its curve and can never fill. Cancel it to free the slot".into(),
-            None,
+            "coin graduated; cancel this curve order to invalidate its nonce and free the slot"
+                .into(),
         ),
-        _ if err.as_str() == Some("BlockhashNotFound") => {
-            // The nonce moved. If this order moved it, it filled.
-            return confirm(p, order).map(|(state, note, sig)| {
-                if state == "submitted" {
-                    (
-                        "dead".into(),
-                        "the slot's nonce moved without this order landing: it was cancelled or the slot was reused".into(),
-                        sig,
-                    )
-                } else {
-                    (state, note, sig)
-                }
-            });
-        }
         _ => (
             "open".into(),
             format!(
                 "would not fill now: {}",
                 err.to_string().chars().take(200).collect::<String>()
             ),
-            None,
-        ),
-    })
-}
-
-/// Whether a sent order landed.
-fn confirm(_p: &Pending, order: &Order) -> Outcome {
-    let Some(signature) = order.signed.as_deref().and_then(signed_signature) else {
-        return Ok(("open".into(), "not signed yet".into(), None));
-    };
-    let v = post(
-        RPC,
-        &rpc(
-            "getSignatureStatuses",
-            json!([[signature], {"searchTransactionHistory": true}]),
-        ),
-    )?;
-    let status = v.pointer("/result/value/0");
-    Ok(match status {
-        Some(s) if !s.is_null() => match s.get("err") {
-            Some(Value::Null) | None => {
-                ("filled".into(), "filled on chain".into(), Some(signature))
-            }
-            Some(err) => (
-                "dead".into(),
-                format!(
-                    "landed but failed on chain, which spent the nonce: {}",
-                    err.to_string().chars().take(200).collect::<String>()
-                ),
-                Some(signature),
-            ),
-        },
-        _ => (
-            "submitted".into(),
-            "sent; not seen on chain yet".into(),
-            Some(signature),
         ),
     })
 }
@@ -879,26 +1216,24 @@ pub(crate) fn list_value(c: &Ctx, w: &str) -> Result<Value, DispatchResponse> {
                 "note": o.note,
                 "checkedMs": o.checked_ms,
                 "signature": p.signature,
+                "cancelOperation": o.cancellation.as_ref().map(|c| c.operation.as_str()),
+                "cancelSignature": o.cancellation.as_ref().and_then(|c| c.signed.as_deref()).and_then(signed_signature),
             }))
         })
         .collect::<Vec<_>>();
-    let slots = slots
-        .iter()
-        .enumerate()
-        .map(|(slot, (address, value))| {
-            let holder = list.iter().find(|(_, p)| {
-                p.order.as_ref().is_some_and(|o| {
-                    o.slot == slot as u64 && matches!(o.state.as_str(), "" | "open" | "submitted")
-                })
-            });
-            json!({
-                "slot": slot,
-                "address": bs58::encode(address).into_string(),
-                "exists": value.is_some(),
-                "order": holder.map(|(id, _)| id),
-            })
-        })
-        .collect::<Vec<_>>();
+    let slots = slots.iter().enumerate().map(|(slot, (address, value))| {
+        let holder = list.iter().find(|(_, p)| p.order.as_ref().is_some_and(|o| o.slot == slot as u64 && reserves_slot(o)));
+        let reservation = match value {
+            Some(nonce) => get::<SlotReservation>(&reservation_key(&owner, slot as u64, nonce))?,
+            None => None,
+        };
+        Ok(json!({
+            "slot": slot,
+            "address": bs58::encode(address).into_string(),
+            "exists": value.is_some(),
+            "order": holder.map(|(id, _)| id.clone()).or_else(|| reservation.map(|r| r.operation)),
+        }))
+    }).collect::<Result<Vec<_>, DispatchResponse>>()?;
     Ok(json!({
         "orders": orders,
         "slots": slots,

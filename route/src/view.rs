@@ -226,6 +226,7 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
         .collect::<Vec<_>>();
     let warned = |needle: &str| items.iter().any(|(_, w)| w.contains(needle));
     let mut passes = Vec::new();
+    let mut unknown = Vec::new();
     if !risk["tokenExtensions"].is_null()
         && risk["mintAuthority"].is_null()
         && risk["freezeAuthority"].is_null()
@@ -238,16 +239,27 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
         && !warned("creator still holds")
         && !warned("now holds")
     {
-        passes.push(format!("The creator holds {} of the supply", share(pct)));
+        passes.push(format!("The creator's associated token accounts hold {}; other accounts and related wallets are not checked", share(pct)));
     }
     if let Some(pct) = risk["top10HoldPct"].as_f64()
         && !warned("10 largest")
     {
-        passes.push(format!("The 10 largest holders own {}", share(pct)));
+        passes.push(format!(
+            "Pump's index reports the 10 largest holders own {}; the index may lag",
+            share(pct)
+        ));
     }
-    if risk["launchBlockBuyers"].as_u64().is_some() && !warned("bundled") {
+    if risk["launchBlockPartial"].as_bool() == Some(true) {
+        unknown.push((Level::Unknown, format!(
+            "Partial launch sample: {} other fee payer(s) bought {} in the transactions inspected; the rest were not checked",
+            risk["launchBlockBuyers"].as_u64().unwrap_or(0),
+            share(risk["launchBlockBoughtPct"].as_f64().unwrap_or(0.0))
+        )));
+    } else if risk["launchBlockBuyers"].as_u64().is_some() && !warned("bundled") {
         passes.push(match risk["launchBlockBuyers"].as_u64() {
-            Some(0) => "No other wallet bought in the block the coin was created".to_owned(),
+            Some(0) => {
+                "No other fee payer bought in the inspected creation-block transactions".to_owned()
+            }
             Some(n) => format!(
                 "{n} other wallet(s) bought {} in the creation block",
                 share(risk["launchBlockBoughtPct"].as_f64().unwrap_or(0.0))
@@ -261,7 +273,7 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
     ) && !warned("none graduated")
     {
         passes.push(match others {
-            0 => "This is the creator's first coin".to_owned(),
+            0 => "Pump's index lists no other coin for this creator".to_owned(),
             _ if others >= 49 => {
                 format!("The creator has launched 49+ other coins; {graduated} graduated")
             }
@@ -269,6 +281,7 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
         });
     }
     items.extend(passes.into_iter().map(|p| (Level::Pass, p)));
+    items.extend(unknown);
     for check in risk["unchecked"]
         .as_array()
         .into_iter()
@@ -280,7 +293,7 @@ fn checklist(summary: &Value) -> Vec<(Level, String)> {
             "creatorHolds" => "the creator's holding",
             "holders" => "the largest holders",
             "creatorHistory" => "the creator's other coins",
-            "launch" => "who bought in the launch block (too much history)",
+            "launch" => "who bought in the launch block (unavailable or outside the history limit)",
             other => other,
         };
         items.push((Level::Unknown, format!("Could not check {what}")));
@@ -891,7 +904,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                 out.push_str("No coins held.\n");
             } else {
                 out.push_str(&table(
-                    &["Coin", "Amount", "Worth now", "Mint"],
+                    &["Coin", "Amount", "Sale estimate", "Mint"],
                     &[false, true, true, false],
                     &rows,
                 ));
@@ -902,7 +915,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                     sol(rent as f64 / 1e9)
                 ));
             }
-            out.push_str("\n\"Worth now\" is what selling everything returns at the current price, before Pump's fee (about 1%) and slippage. Sell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`.\n");
+            out.push_str("\n\"Sale estimate\" is what selling everything returns at the current price, including price impact, before protocol fees, network fee, tip and any later price move. Sell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`.\n");
             let orders = order_rows(&open_orders);
             if !orders.is_empty() {
                 out.push_str("\n## Limit orders\n\n");
@@ -939,7 +952,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                 })
                 .collect::<String>();
             let body = format!(
-                "<header class=head><h1>Holdings</h1><p class=muted>{wallet} · account {account} · <code>{address}</code> · {stamp}</p></header><section class=stats><div class=\"card stat\"><div class=k>Worth if sold now</div><div class=v>{total}</div></div><div class=\"card stat\"><div class=k>Coins</div><div class=v>{count}</div></div><div class=\"card stat\"><div class=k>Rent in empty accounts</div><div class=v>{rent}</div></div></section>{table}<p class=muted>“Worth” is what selling everything returns at the current price, before Pump's fee (about 1%) and slippage. Sell with <code>sell.json</code> and <code>\"amount\":\"all\"</code> or <code>\"50%\"</code>; close empty accounts with <code>close_token_account.json</code> to get their rent back.</p>",
+                "<header class=head><h1>Holdings</h1><p class=muted>{wallet} · account {account} · <code>{address}</code> · {stamp}</p></header><section class=stats><div class=\"card stat\"><div class=k>Sale estimate before fees</div><div class=v>{total}</div></div><div class=\"card stat\"><div class=k>Coins</div><div class=v>{count}</div></div><div class=\"card stat\"><div class=k>Rent in empty accounts</div><div class=v>{rent}</div></div></section>{table}<p class=muted>“Sale estimate” is what selling everything returns at the current price, including price impact, before protocol fees, network fee, tip and any later price move. Sell with <code>sell.json</code> and <code>\"amount\":\"all\"</code> or <code>\"50%\"</code>; close empty accounts with <code>close_token_account.json</code> to get their rent back.</p>",
                 wallet = html(&w),
                 stamp = stamp(now),
                 total = sol(total as f64 / 1e9),
@@ -949,7 +962,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                     "<p class=card>No coins held.</p>".to_owned()
                 } else {
                     format!(
-                        "<table><thead><tr><th>Coin</th><th class=num>Amount</th><th class=num>Worth now</th><th>Mint</th></tr></thead><tbody>{rows}</tbody></table>"
+                        "<table><thead><tr><th>Coin</th><th class=num>Amount</th><th class=num>Sale estimate</th><th>Mint</th></tr></thead><tbody>{rows}</tbody></table>"
                     )
                 },
             );
@@ -991,7 +1004,12 @@ fn order_rows(orders: &Value) -> Vec<Vec<String>> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|o| !matches!(o["state"].as_str(), Some("filled" | "cancelled" | "dead")))
+        .filter(|o| {
+            !matches!(
+                o["state"].as_str(),
+                Some("filled" | "cancelled" | "invalidated" | "chain_failed")
+            )
+        })
         .map(|o| {
             vec![
                 cell(o["order"].as_str().unwrap_or("")),
@@ -1054,8 +1072,9 @@ fn page(title: &str, nav: &str, body: &str, script: &str) -> DispatchResponse {
     };
     DispatchResponse::Read(
         format!(
-            "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=Content-Security-Policy content=\"default-src 'none'; img-src https://images.pump.fun https://imagedelivery.net; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><meta name=referrer content=no-referrer><title>{}</title><style>{STYLE}</style></head><body><div class=wrap>{nav}{body}<footer class=muted>Read live through Bloom · reload to refresh</footer></div>{script}</body></html>",
-            html(title)
+            "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=Content-Security-Policy content=\"default-src 'none'; img-src https://images.pump.fun https://imagedelivery.net; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><meta name=referrer content=no-referrer><title>{}</title><style>{STYLE}</style></head><body><div class=wrap>{nav}{body}<footer class=muted>Snapshot through Bloom at {} · reload to refresh</footer></div>{script}</body></html>",
+            html(title),
+            html(&stamp(host::now_ms()))
         )
         .into_bytes(),
     )
@@ -1611,5 +1630,59 @@ mod tests {
             "the last close is the highest: {text}"
         );
         assert!(lines.last().unwrap().contains("11m ago"), "{text}");
+    }
+
+    #[test]
+    fn partial_launch_samples_are_unknown_in_both_rendered_views() {
+        let summary = json!({"mint":MINT,"symbol":"TEST","name":"Test",
+            "warnings":[],"risk":{"launchBlockBuyers":0,"launchBlockBoughtPct":0.0,"launchBlockPartial":true,"unchecked":[]}});
+        let checks = checklist(&summary);
+        assert!(checks.iter().any(
+            |(level, text)| *level == Level::Unknown && text.contains("Partial launch sample")
+        ));
+        assert!(
+            !checks
+                .iter()
+                .any(|(level, text)| *level == Level::Pass && text.contains("No other"))
+        );
+        let md = coin_markdown(MINT, &summary, None, None, NOW);
+        let html = coin_html(MINT, &summary, None, None, NOW);
+        for view in [md, html] {
+            assert!(view.contains("Partial launch sample"));
+            assert!(!view.contains("No other fee payer"));
+        }
+    }
+
+    #[test]
+    fn creator_and_holder_observations_keep_their_attribution_limits() {
+        let summary = json!({"warnings":[],"risk":{"creatorHoldsPct":0.0,"top10HoldPct":5.0,"creatorOtherCoins":0,"creatorGraduatedCoins":0,"unchecked":[]}});
+        let checks = checklist(&summary)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(checks.contains("associated token accounts"));
+        assert!(checks.contains("related wallets are not checked"));
+        assert!(checks.contains("index may lag"));
+        assert!(!checks.contains("first coin"));
+    }
+
+    #[test]
+    fn unsettled_dead_and_pending_cancel_orders_remain_visible() {
+        let rows = order_rows(&json!([
+            {"order":"dead","state":"dead"}, {"order":"cancel","state":"cancel_pending"},
+            {"order":"confirmed","state":"confirmed"}, {"order":"done","state":"filled"}
+        ]));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r[0] == "dead"));
+        assert!(!rows.iter().any(|r| r[0] == "done"));
+    }
+
+    #[test]
+    fn html_snapshots_show_their_generation_time() {
+        fake_host::install(FakeHost::new(NOW));
+        let text = text(page("Snapshot", "", "<p>Snapshot</p>", ""));
+        assert!(text.contains("Snapshot through Bloom at"));
+        assert!(text.contains(&stamp(NOW)));
     }
 }

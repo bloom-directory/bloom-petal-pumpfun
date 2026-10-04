@@ -78,6 +78,7 @@ pub struct Chain {
     pub created: BTreeMap<String, u64>,
     /// What `getMultipleAccounts` returns for an address, when set.
     pub accounts: BTreeMap<String, Value>,
+    pub statuses: BTreeMap<String, Value>,
 }
 
 impl FakeHost {
@@ -262,6 +263,10 @@ impl FakeHost {
                 .iter()
                 .map(|address| self.account_view(address.as_str().unwrap_or_default()))
                 .collect::<Vec<_>>()}})),
+            "getSignatureStatuses" => Some(
+                serde_json::json!({"result":{"value": params[0].as_array()?.iter()
+                .map(|sig| self.chain.statuses.get(sig.as_str().unwrap_or_default()).cloned().unwrap_or(Value::Null)).collect::<Vec<_>>()}}),
+            ),
             "getBalance" => Some(serde_json::json!({"result": {"value": self.chain.balance}})),
             _ => None,
         }

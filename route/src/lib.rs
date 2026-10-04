@@ -35,9 +35,10 @@ const MIN_JITO_TIP_LAMPORTS: u64 = 1_000;
 /// 0.001 SOL of priority, which doubles the cost of a small trade; recent
 /// fees on a trade's own accounts are usually far lower.
 const MIN_COMPUTE_UNIT_PRICE: u64 = 100_000;
-/// What a sell's floor may leave for Pump's own fees, in basis points, on
-/// top of the requested slippage. Measured on 26 September 2026: 125 on the
-/// bonding curve and 85 on PumpSwap; the rest is rounding headroom.
+/// Conservative protocol-fee allowance in basis points, plus the request's
+/// slippage. Canonical PumpSwap fees vary by market cap; 0.85% is one tier,
+/// not a fixed rate. Refuse quotes outside this allowance rather than silently
+/// widening it when the protocol changes.
 const SELL_FEE_ALLOWANCE_BPS: u128 = 150;
 const BUILD: &str = "https://fun-block.pump.fun";
 const COINS: &str = "https://frontend-api-v3.pump.fun/coins-v2";
@@ -593,9 +594,8 @@ struct Pending {
     may_be_signed: bool,
     /// The review the owner is shown, frozen with the bytes it describes.
     /// Every fact in it is read out of the parsed transaction that was just
-    /// validated, so it cannot drift from what signing will produce; the host
-    /// hashes it into the approval's canonical facts, so changing it cannot
-    /// reuse an approval prepared for the old text.
+    /// validated. It is advisory: the reusable approval seals the operation
+    /// class and debit/fee ceilings, not this text or the mint.
     #[serde(default)]
     review: Vec<String>,
 }
@@ -619,14 +619,16 @@ fn build_pending(
     metadata_uri: Option<String>,
     operation: &str,
 ) -> Result<Pending, DispatchResponse> {
-    match a {
+    let mut pending = match a {
         Action::CloseTokenAccount => build_close_token_account_pending(trader, request, digest),
         Action::Launch => launch::build(trader, request, digest, metadata_uri),
         Action::LimitOrder => orders::build(trader, request, digest, operation),
         Action::OrderSlot => orders::build_slot(trader, request, digest),
-        Action::CancelOrder => orders::build_cancel(trader, request, digest),
+        Action::CancelOrder => orders::build_cancel(trader, request, digest, operation),
         Action::Buy | Action::Sell => build_swap(a, trader, request, digest),
-    }
+    }?;
+    pending.review.push("Approval scope: one operation from this package, route and account within the spending and fee ceilings. Bloom does not seal the coin or this quoted output; the Petal checks them and a rebuild may change the quote. An explicit minOutputAmount stays enforced".into());
+    Ok(pending)
 }
 
 /// A buy or sell from Pump's builder, validated, priced and reviewed.
@@ -680,6 +682,8 @@ fn build_swap(
     };
     if matches!(a, Action::Sell) {
         verify_sell_floor(&parsed, request)?;
+    } else {
+        verify_buy_floor(&parsed, request)?;
     }
     let created = created_accounts(&tx, &parsed)?;
     let raw = B64
@@ -1358,6 +1362,8 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
             | "open"
             | "filled"
             | "cancelled"
+            | "cancel_pending"
+            | "invalidated"
             | "dead"
     ) {
         return DispatchResponse::Write;
@@ -1448,6 +1454,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         return fail(
             "this operation has no owner review, so it will not be signed; retry under a new operationId to rebuild it",
         );
+    }
+    if matches!(a, Action::CancelOrder)
+        && let Some(id) = r.get("order").and_then(Value::as_str)
+        && let Err(e) = orders::request_cancel(&owner, id, &op, &p, None)
+    {
+        return e;
     }
     // Recorded before the host call, so an interruption leaves `signing`
     // behind and the next retry treats the message as possibly signed.
@@ -1582,6 +1594,12 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
         }
         return DispatchResponse::Write;
     }
+    if matches!(a, Action::CancelOrder)
+        && let Some(id) = r.get("order").and_then(Value::as_str)
+        && let Err(e) = orders::request_cancel(&owner, id, &op, &p, Some(tx.clone()))
+    {
+        return e;
+    }
     p.status = "broadcast_attempted".into();
     p.signature = Some(signature.clone());
     p.approval = None;
@@ -1601,12 +1619,6 @@ pub fn execute(c: &Ctx, a: Action, owner: TradeOwner, b: &[u8]) -> DispatchRespo
     };
     match result {
         Ok(v) if v.get("result").and_then(Value::as_str) == Some(&signature) => {
-            if matches!(a, Action::CancelOrder)
-                && let Some(order) = r.get("order").and_then(Value::as_str)
-                && let Err(e) = orders::cancelled(&owner, order)
-            {
-                return e;
-            }
             p.status = "submitted".into();
             if let Err(e) = put(&key, &p, true) {
                 return e;
@@ -2605,6 +2617,7 @@ pub(crate) fn coin_value(m: &str) -> Result<(Value, Value), DispatchResponse> {
     }
     let summary = json!({
         "mint": m,
+        "observedMs": host::now_ms(),
         "name": clean_text(&v, "name", 48),
         "symbol": clean_text(&v, "symbol", 16),
         "graduated": matches!(market, Some(Market::Pool { .. })),
@@ -2626,7 +2639,7 @@ pub(crate) fn coin_value(m: &str) -> Result<(Value, Value), DispatchResponse> {
         "links": links,
         "warnings": warnings,
         "image": image_link(m, 256),
-        "note": "Price, progress, authorities and the creator's holding are read from the chain now; holders and the creator's other coins are Pump's figures; names and links are the creator's own. Any check listed in risk.unchecked could not be made.",
+        "note": "Price, progress and authorities are read from the chain at observedMs; creator holdings cover only associated token accounts, excluding other accounts and related wallets; holders and the creator's other coins are Pump's figures; names and links are the creator's own. Any check listed in risk.unchecked could not be made.",
     });
     Ok((summary, v))
 }
@@ -2744,6 +2757,62 @@ fn verify_sell_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), 
     }
     Ok(())
 }
+/// A SOL ceiling alone does not establish that the builder names a fair
+/// amount of tokens. Independently price the requested budget with impact,
+/// conservative fees and slippage, then enforce both that floor and the
+/// caller's explicit minOutputAmount through the existing byte validator.
+fn verify_buy_floor(message: &Msg, request: &Map<String, Value>) -> Result<(), DispatchResponse> {
+    let pump = pk(PROGRAMS[5]).map_err(fail)?;
+    let amm = pk(PROGRAMS[6]).map_err(fail)?;
+    let mint = pk(request_text(request, "outputMint").map_err(fail)?).map_err(fail)?;
+    let ix = message
+        .instructions
+        .iter()
+        .find(|ix| {
+            has_discriminator(ix, IX_BUY)
+                && matches!(message.keys.get(ix.program), Some(p) if *p == pump || *p == amm)
+        })
+        .ok_or_else(|| fail("buy instruction missing"))?;
+    let market = markets(&[mint])?
+        .pop()
+        .flatten()
+        .ok_or_else(|| fail("the chain has no SOL Pump curve or pool for this coin"))?;
+    match (message.keys.get(ix.program) == Some(&pump), market) {
+        (true, Market::Curve { .. }) => {
+            let curve = program_address(&[b"bonding-curve", &mint], &pump).map_err(fail)?;
+            require_account(message, ix, 3, &curve, "buy bonding curve").map_err(fail)?;
+        }
+        (false, Market::Pool { vaults, .. }) => {
+            require_account(message, ix, 7, &vaults[0], "pool token vault").map_err(fail)?;
+            require_account(message, ix, 8, &vaults[1], "pool SOL vault").map_err(fail)?;
+        }
+        _ => return Err(fail("the buy does not trade where the coin trades now")),
+    }
+    let budget = u128::from(request_u64(request, "amount").map_err(fail)?);
+    let net = budget * 10_000 / (10_000 + SELL_FEE_ALLOWANCE_BPS);
+    let (tokens, sol) = market.reserves();
+    let fair = tokens
+        .checked_mul(net)
+        .and_then(|n| n.checked_div(sol + net))
+        .ok_or_else(|| fail("invalid or excessive market reserves"))?;
+    let fair = match market {
+        Market::Curve { real_tokens, .. } => fair.min(real_tokens),
+        _ => fair,
+    };
+    let slip = request
+        .get("slippagePct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let slip = (slip * 1_000_000.0).ceil() as u128;
+    let least = (fair * (100_000_000 - slip.min(100_000_000)) / 100_000_000).max(1);
+    if u128::from(instruction_u64(ix, 8).map_err(fail)?) < least {
+        return Err(fail(format!(
+            "unsafe builder transaction: buy names fewer than the chain-priced minimum of {least} raw token units after fees and slippage"
+        )));
+    }
+    Ok(())
+}
+
 fn request_text<'a>(request: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
     request
         .get(field)
@@ -2948,7 +3017,7 @@ fn markets(mints: &[[u8; 32]]) -> Result<Vec<Option<Market>>, DispatchResponse> 
             balances[position * 2 + offset]
                 .pointer("/data/parsed/info/tokenAmount/amount")
                 .and_then(Value::as_str)
-                .and_then(|amount| amount.parse::<u128>().ok())
+                .and_then(|amount| amount.parse::<u64>().ok().map(u128::from))
         };
         if let (Some(tokens), Some(sol)) = (balance(0), balance(1))
             && tokens > 0
@@ -3183,7 +3252,7 @@ pub(crate) fn holdings_value(c: &Ctx, w: String) -> Result<Value, DispatchRespon
             for token in tokens.iter_mut().filter(|t| t["mint"] == json!(key)) {
                 let amount = token["amount"]
                     .as_str()
-                    .and_then(|a| a.parse::<u128>().ok());
+                    .and_then(|a| a.parse::<u64>().ok().map(u128::from));
                 token["sellValueLamports"] = match (market, amount) {
                     (Some(market), Some(amount)) => json!(market.sell_value(amount).to_string()),
                     _ => Value::Null,
@@ -3195,7 +3264,8 @@ pub(crate) fn holdings_value(c: &Ctx, w: String) -> Result<Value, DispatchRespon
     Ok(json!({
         "account": {"wallet": w, "account": owner.account, "address": address},
         "tokens": tokens,
-        "note": "sellValueLamports is what selling the whole position returns at the current curve or pool price, before Pump's fee (about 1%) and slippage. Sell a share with sell.json {\"amount\":\"50%\"}, or everything with \"all\", which also closes the emptied token account. An empty account can be closed with close_token_account.json.",
+        "observedMs": host::now_ms(),
+        "note": "sellValueLamports is what selling the whole position returns at the current curve or pool price, including price impact, before protocol fees, network fee, tip and later price movement. Sell a share with sell.json {\"amount\":\"50%\"}, or everything with \"all\", which also closes the emptied token account. An empty account can be closed with close_token_account.json.",
     }))
 }
 
@@ -4862,6 +4932,11 @@ mod tests {
     fn host_serving_a_buy() -> FakeHost {
         let mut host = FakeHost::new(NOW_MS);
         host.chain.payer = USER.to_owned();
+        let mut curve = curve_account(1_072_993_493_000_000, 30_000_182_059, false);
+        let mut data = B64.decode(curve["data"][0].as_str().unwrap()).unwrap();
+        data[24..32].copy_from_slice(&800_000_000_000_000u64.to_le_bytes());
+        curve["data"][0] = json!(B64.encode(data));
+        host.chain.accounts.insert(curve_address(BOND_MINT), curve);
         host.seed_vfs(
             &format!("wallets/{WALLET}/0/address.sol"),
             &format!("{USER}\n"),
@@ -7675,6 +7750,10 @@ mod tests {
     fn host_with_order_slot() -> FakeHost {
         let mut host = host_serving_a_buy();
         host.chain.accounts.insert(slot0(), nonce_account(USER));
+        host.reply(
+            &format!("{RPC} getLatestBlockhash"),
+            json!({"result":{"value":{"blockhash":BOND_MINT,"lastValidBlockHeight":1000}}}),
+        );
         host.chain.accounts.insert(
             BOND_MINT.to_owned(),
             json!({"owner": PROGRAMS[4], "lamports": 1,
@@ -7750,7 +7829,7 @@ mod tests {
             .iter()
             .find(|ix| has_discriminator(ix, IX_BUY))
             .unwrap();
-        let expected = (1_000_000.0_f64 / 1.015 / (20.0 * 1e9 / 1e15)).floor() as u64;
+        let expected = (1_000_000.0_f64 / (20.0 * 1e9 / 1e15)).ceil() as u64;
         assert_eq!(
             instruction_u64(buy, 8).unwrap(),
             expected,
@@ -7763,7 +7842,7 @@ mod tests {
         );
         let review = public_operation("order-1")["review"].to_string();
         assert!(
-            review.contains("Limit buy") && review.contains("at or below 20.00 SOL"),
+            review.contains("Limit buy") && review.contains("target market cap 20.00 SOL"),
             "{review}"
         );
 
@@ -7791,13 +7870,36 @@ mod tests {
             let sent = host.calls_for("sendTransaction");
             assert_eq!(host.broadcasts(), 1);
             assert_eq!(sent[0].rpc_params().unwrap()[0], json!(signed));
-            host.reply(
+            host.reply_only(
                 &format!("{RPC} getSignatureStatuses"),
                 json!({"result":{"value":[{"err":null,"confirmationStatus":"confirmed"}]}}),
             );
         });
         check_orders();
+        assert_eq!(stored_order("order-1").state, "confirmed");
+        set_order_status("finalized", Value::Null);
+        check_orders();
         assert_eq!(stored_order("order-1").state, "filled");
+    }
+
+    fn set_order_status(commitment: &str, err: Value) {
+        fake_host::with(|host| {
+            for url in [RPC, RPC_VERIFY] {
+                host.reply_only(
+                    &format!("{url} getSignatureStatuses"),
+                    json!({"result":{"value":[{"err":err,"confirmationStatus":commitment}]}}),
+                );
+            }
+        });
+    }
+
+    fn change_nonce(value: [u8; 32]) {
+        fake_host::with(|host| {
+            let account = host.chain.accounts.get_mut(&slot0()).unwrap();
+            let mut raw = B64.decode(account["data"][0].as_str().unwrap()).unwrap();
+            raw[40..72].copy_from_slice(&value);
+            account["data"][0] = json!(B64.encode(raw));
+        });
     }
 
     fn stored_order_signed(operation: &str) -> String {
@@ -7834,8 +7936,8 @@ mod tests {
         assert!(order.note.unwrap().contains("graduated"));
     }
 
-    /// Cancelling advances the slot's nonce with a transaction the Petal
-    /// builds itself, and marks the order cancelled once it is sent.
+    /// Cancellation races on the exact same durable nonce. RPC acceptance
+    /// leaves it pending and keeps the slot reserved until finalization.
     #[test]
     fn cancelling_advances_the_nonce_and_frees_the_slot() {
         let mut host = host_with_order_slot();
@@ -7857,7 +7959,7 @@ mod tests {
             "{}",
             dispatch_message(&response)
         );
-        assert_eq!(stored_order("order-c").state, "cancelled");
+        assert_eq!(stored_order("order-c").state, "cancel_pending");
         fake_host::with(|host| {
             let sent = host.calls_for("sendTransaction");
             let raw = B64
@@ -7873,20 +7975,47 @@ mod tests {
                 4,
                 "priority fee, the advance, the tip"
             );
-            assert_eq!(parsed.instructions[0].data[0], 2);
-            assert_eq!(parsed.instructions[1].data[0], 3);
-            assert_eq!(parsed.instructions[2].data, [4, 0, 0, 0]);
+            assert_eq!(parsed.blockhash, NONCE_VALUE);
+            assert_eq!(parsed.instructions[0].data, [4, 0, 0, 0]);
+            assert_eq!(parsed.instructions[1].data[0], 2);
+            assert_eq!(parsed.instructions[2].data[0], 3);
             assert_eq!(
                 parsed.keys[usize::from(parsed.instructions[3].accounts[1])],
                 pk(JITO_TIPS[0]).unwrap()
             );
-            assert_eq!(parsed.keys[1], pk(&slot0()).unwrap());
+            assert_eq!(
+                parsed.keys[usize::from(parsed.instructions[0].accounts[0])],
+                pk(&slot0()).unwrap()
+            );
         });
-        assert_eq!(
-            place_order("order-d", 20.0),
-            DispatchResponse::Write,
-            "the slot is free again"
-        );
+        assert!(dispatch_message(&place_order("order-d", 20.0)).contains("no free order slot"));
+        let cancel_tx = stored_order("order-c")
+            .cancellation
+            .unwrap()
+            .signed
+            .unwrap();
+        fake_host::with(|host| {
+            // The original remains absent; the cancellation is finalized.
+            host.reply_only(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"result":{"value":[null]}}),
+            );
+            host.reply(
+                &format!("{RPC} getSignatureStatuses"),
+                json!({"result":{"value":[{"err":null,"confirmationStatus":"finalized"}]}}),
+            );
+            host.reply_only(
+                &format!("{RPC_VERIFY} getSignatureStatuses"),
+                json!({"result":{"value":[{"err":null,"confirmationStatus":"finalized"}]}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("order-c").state, "cancelled");
+        assert!(stored_order("order-c").settled);
+        assert!(stored_order("order-c").cancellation.unwrap().signed == Some(cancel_tx));
+        // Reflect the nonce change before reusing the slot.
+        change_nonce([9; 32]);
+        assert_eq!(place_order("order-d", 20.0), DispatchResponse::Write);
     }
 
     /// Creating a slot declares its rent and names the new account as the
@@ -8165,5 +8294,886 @@ mod tests {
             );
         }
         fake_host::with(|host| assert!(host.calls.is_empty(), "{:?}", host.calls.len()));
+    }
+
+    fn cancel_limit(order: &str, operation: &str) -> DispatchResponse {
+        execute(
+            &ctx(&[("bloom.route_id", "ROUTE_CANCEL")]),
+            Action::CancelOrder,
+            owner(),
+            &serde_json::to_vec(
+                &json!({"operationId":operation,"order":order,"frontRunningProtection":false}),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn order_status(tx: &str, commitment: &str, err: Value) {
+        let raw = B64.decode(tx).unwrap();
+        let signature = bs58::encode(&raw[1..65]).into_string();
+        fake_host::with(|host| {
+            host.chain.statuses.insert(
+                signature,
+                json!({"err":err,"confirmationStatus":commitment}),
+            );
+        });
+    }
+
+    fn update_order(id: &str, update: impl FnOnce(&mut Pending)) {
+        fake_host::with(|host| {
+            let key = secret_key(&owner(), id);
+            let mut p: Pending = serde_json::from_value(host.secret_json(&key).unwrap()).unwrap();
+            update(&mut p);
+            host.seed_secret(&key, &p);
+        });
+    }
+
+    #[test]
+    fn checking_an_order_never_exposes_a_usable_signature_to_simulation() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("unsigned-check", 20.0), DispatchResponse::Write);
+        let tx = stored_order_signed("unsigned-check");
+        let signed = B64.decode(&tx).unwrap();
+        check_orders();
+        fake_host::with(|host| {
+            for call in host.calls_for("simulateTransaction") {
+                let params = call.rpc_params().unwrap();
+                let raw = B64.decode(params[0].as_str().unwrap()).unwrap();
+                assert!(raw[1..65].iter().all(|b| *b == 0));
+                assert_eq!(params[1]["sigVerify"], json!(false));
+                assert_eq!(params[1]["replaceRecentBlockhash"], json!(false));
+            }
+            let checked = host.calls_for("simulateTransaction");
+            let raw = B64
+                .decode(
+                    checked.last().unwrap().rpc_params().unwrap()[0]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                raw[65..],
+                signed[65..],
+                "exact durable message simulated without a signature"
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_order_sends_retry_identical_bytes_without_signing_again() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("dropped", 20.0), DispatchResponse::Write);
+        let tx = stored_order_signed("dropped");
+        check_orders();
+        check_orders();
+        fake_host::with(|host| {
+            assert_eq!(host.sign_requests.len(), 1);
+            assert_eq!(host.broadcasts(), 1);
+            assert!(host.calls_for("sendTransaction").len() >= 4);
+            assert!(
+                host.calls_for("sendTransaction")
+                    .iter()
+                    .all(|c| c.rpc_params().unwrap()[0] == json!(tx))
+            );
+        });
+        assert_eq!(stored_order("dropped").state, "submitted");
+        assert!(dispatch_message(&place_order("other", 20.0)).contains("no free order slot"));
+    }
+
+    #[test]
+    fn uncertain_order_submission_is_reconciled_even_without_an_acknowledgement() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("uncertain-send", 20.0), DispatchResponse::Write);
+        fake_host::with(|host| {
+            for url in [RPC, RPC_VERIFY, JITO] {
+                host.reply_only(
+                    &format!("{url} sendTransaction"),
+                    json!({"error":{"code":-32000,"message":"send unavailable"}}),
+                );
+            }
+        });
+        check_orders();
+        assert_eq!(stored_order("uncertain-send").state, "submitted");
+        assert!(
+            stored_order("uncertain-send")
+                .note
+                .unwrap()
+                .contains("unknown")
+        );
+        order_status(
+            &stored_order_signed("uncertain-send"),
+            "finalized",
+            Value::Null,
+        );
+        check_orders();
+        assert_eq!(stored_order("uncertain-send").state, "filled");
+    }
+
+    #[test]
+    fn processed_and_confirmed_orders_reserve_the_slot_until_finalized() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("finality", 20.0), DispatchResponse::Write);
+        let tx = stored_order_signed("finality");
+        for (commitment, state) in [("processed", "submitted"), ("confirmed", "confirmed")] {
+            order_status(&tx, commitment, Value::Null);
+            check_orders();
+            assert_eq!(stored_order("finality").state, state);
+            assert!(!stored_order("finality").settled);
+            assert!(dispatch_message(&place_order("blocked", 20.0)).contains("no free order slot"));
+        }
+        order_status(&tx, "finalized", Value::Null);
+        check_orders();
+        assert!(stored_order("finality").settled);
+        assert_eq!(stored_order("finality").state, "filled");
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+    }
+
+    #[test]
+    fn malformed_status_never_reports_a_fill_or_sends_an_order() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("bad-status", 20.0), DispatchResponse::Write);
+        for value in [
+            json!({"confirmationStatus":"finalized"}),
+            json!({"err":null}),
+            json!({"err":null,"confirmationStatus":"unknown"}),
+        ] {
+            fake_host::with(|host| {
+                host.reply_only(
+                    &format!("{RPC} getSignatureStatuses"),
+                    json!({"result":{"value":[value]}}),
+                );
+            });
+            check_orders();
+            assert_eq!(stored_order("bad-status").state, "open");
+            assert!(
+                stored_order("bad-status")
+                    .note
+                    .unwrap()
+                    .contains("check failed")
+            );
+        }
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+    }
+
+    #[test]
+    fn a_final_status_requires_independent_rpc_agreement() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("rpc-finality", 20.0), DispatchResponse::Write);
+        order_status(
+            &stored_order_signed("rpc-finality"),
+            "finalized",
+            Value::Null,
+        );
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC_VERIFY} getSignatureStatuses"),
+                json!({"result":{"value":[null]}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("rpc-finality").state, "submitted");
+        assert!(!stored_order("rpc-finality").settled);
+    }
+
+    #[test]
+    fn finalized_nonce_invalidation_frees_a_slot_without_inventing_a_fill() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("invalidated", 20.0), DispatchResponse::Write);
+        change_nonce([9; 32]);
+        check_orders();
+        assert_eq!(stored_order("invalidated").state, "invalidated");
+        assert!(stored_order("invalidated").settled);
+        assert!(
+            stored_order("invalidated")
+                .note
+                .unwrap()
+                .contains("not established")
+        );
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+        assert_eq!(place_order("replacement", 20.0), DispatchResponse::Write);
+        // A delayed history response can still settle the old economic outcome.
+        order_status(
+            &stored_order_signed("invalidated"),
+            "finalized",
+            Value::Null,
+        );
+        check_orders();
+        assert_eq!(stored_order("invalidated").state, "filled");
+    }
+
+    #[test]
+    fn nonce_disagreement_preserves_reservation_and_records_the_failure() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(
+            place_order("nonce-disagreement", 20.0),
+            DispatchResponse::Write
+        );
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC_VERIFY} getMultipleAccounts"),
+                json!({"result":{"value":[null]}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("nonce-disagreement").state, "open");
+        assert!(
+            stored_order("nonce-disagreement")
+                .note
+                .unwrap()
+                .contains("disagree")
+        );
+        assert!(!stored_order("nonce-disagreement").settled);
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+    }
+
+    #[test]
+    fn a_nonce_change_on_an_unfinalized_fork_does_not_free_the_slot() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("nonce-fork", 20.0), DispatchResponse::Write);
+        let old = nonce_account(USER);
+        change_nonce([9; 32]);
+        let changed = fake_host::with(|h| h.chain.accounts[&slot0()].clone());
+        fake_host::with(|host| {
+            for url in [RPC, RPC_VERIFY] {
+                host.reply_only(
+                    &format!("{url} getMultipleAccounts"),
+                    json!({"result":{"value":[changed]}}),
+                );
+                host.reply(
+                    &format!("{url} getMultipleAccounts"),
+                    json!({"result":{"value":[old]}}),
+                );
+            }
+        });
+        check_orders();
+        assert_eq!(stored_order("nonce-fork").state, "submitted");
+        assert!(!stored_order("nonce-fork").settled);
+    }
+
+    #[test]
+    fn cancel_acknowledgement_keeps_the_order_live_and_the_slot_reserved() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("cancel-ack", 20.0), DispatchResponse::Write);
+        assert_eq!(
+            cancel_limit("cancel-ack", "cancel-ack-op"),
+            DispatchResponse::Write
+        );
+        assert_eq!(stored_order("cancel-ack").state, "cancel_pending");
+        check_orders();
+        assert_eq!(stored_order("cancel-ack").state, "cancel_pending");
+        assert!(!stored_order("cancel-ack").settled);
+        assert!(
+            dispatch_message(&place_order("blocked-cancel", 20.0)).contains("no free order slot")
+        );
+        fake_host::with(|h| assert_eq!(h.sign_requests.len(), 2));
+    }
+
+    #[test]
+    fn a_fill_winning_the_cancel_race_is_reported_as_a_fill() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("fill-wins", 20.0), DispatchResponse::Write);
+        assert_eq!(
+            cancel_limit("fill-wins", "cancel-loses"),
+            DispatchResponse::Write
+        );
+        let tx = stored_order_signed("fill-wins");
+        order_status(&tx, "finalized", Value::Null);
+        change_nonce([9; 32]);
+        check_orders();
+        assert_eq!(stored_order("fill-wins").state, "filled");
+        assert!(stored_order("fill-wins").settled);
+        assert_eq!(place_order("next-nonce", 20.0), DispatchResponse::Write);
+        let cancel = stored_order("fill-wins")
+            .cancellation
+            .unwrap()
+            .signed
+            .unwrap();
+        let raw = B64.decode(cancel).unwrap();
+        assert_eq!(message(&raw[65..]).unwrap().blockhash, NONCE_VALUE);
+        assert_ne!(
+            stored_order("next-nonce").nonce_value,
+            bs58::encode(NONCE_VALUE).into_string()
+        );
+    }
+
+    #[test]
+    fn cancellation_can_resume_after_a_crash_without_another_signature() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("restart-cancel", 20.0), DispatchResponse::Write);
+        assert_eq!(
+            cancel_limit("restart-cancel", "restart-cancel-op"),
+            DispatchResponse::Write
+        );
+        let cancellation = stored_order("restart-cancel").cancellation.unwrap();
+        fake_host::with(|h| {
+            h.calls.clear();
+        });
+        check_orders();
+        fake_host::with(|h| {
+            assert_eq!(h.sign_requests.len(), 2);
+            assert!(
+                h.calls_for("sendTransaction")
+                    .iter()
+                    .all(|c| c.rpc_params().unwrap()[0] == json!(cancellation.signed))
+            );
+        });
+        order_status(
+            cancellation.signed.as_deref().unwrap(),
+            "finalized",
+            Value::Null,
+        );
+        change_nonce([9; 32]);
+        check_orders();
+        assert_eq!(stored_order("restart-cancel").state, "cancelled");
+    }
+
+    #[test]
+    fn a_graduated_curve_order_still_reserves_its_nonce_and_can_be_cancelled() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(
+            place_order("graduated-cancel", 20.0),
+            DispatchResponse::Write
+        );
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":{"InstructionError":[3,{"Custom":6005}]}}}}),
+            );
+        });
+        check_orders();
+        assert_eq!(stored_order("graduated-cancel").state, "dead");
+        assert!(
+            dispatch_message(&place_order("blocked-dead", 20.0)).contains("no free order slot")
+        );
+        fake_host::with(|host| {
+            host.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":null}}}),
+            );
+        });
+        assert_eq!(
+            cancel_limit("graduated-cancel", "retire-op"),
+            DispatchResponse::Write
+        );
+        assert_eq!(stored_order("graduated-cancel").state, "cancel_pending");
+    }
+
+    #[test]
+    fn legacy_cancelled_records_are_reserved_and_reconciled_before_reuse() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("legacy-cancel", 20.0), DispatchResponse::Write);
+        update_order("legacy-cancel", |p| {
+            p.order.as_mut().unwrap().state = "cancelled".into();
+            p.status = "cancelled".into();
+        });
+        assert!(
+            dispatch_message(&place_order("blocked-legacy", 20.0)).contains("no free order slot")
+        );
+        check_orders();
+        assert_eq!(stored_order("legacy-cancel").state, "cancel_pending");
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+        assert_eq!(
+            cancel_limit("legacy-cancel", "legacy-cancel-new"),
+            DispatchResponse::Write
+        );
+    }
+
+    #[test]
+    fn finalized_on_chain_failure_is_distinct_from_fill_and_cancellation() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("failed-order", 20.0), DispatchResponse::Write);
+        order_status(
+            &stored_order_signed("failed-order"),
+            "finalized",
+            json!({"InstructionError":[3,{"Custom":6002}]}),
+        );
+        check_orders();
+        assert_eq!(stored_order("failed-order").state, "chain_failed");
+        assert!(stored_order("failed-order").settled);
+        assert!(
+            stored_order("failed-order")
+                .note
+                .unwrap()
+                .contains("spent its nonce")
+        );
+    }
+
+    #[test]
+    fn cancellation_rechecks_the_bound_nonce_before_signing() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(
+            place_order("nonce-before-cancel", 20.0),
+            DispatchResponse::Write
+        );
+        change_nonce([9; 32]);
+        let result = cancel_limit("nonce-before-cancel", "changed-cancel");
+        assert!(dispatch_message(&result).contains("changed nonce"));
+        fake_host::with(|h| assert_eq!(h.sign_requests.len(), 1));
+    }
+
+    #[test]
+    fn order_and_cancel_bytes_stay_out_of_public_operations_and_orders() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("secret-order", 20.0), DispatchResponse::Write);
+        assert_eq!(
+            cancel_limit("secret-order", "secret-cancel"),
+            DispatchResponse::Write
+        );
+        let order = stored_order("secret-order");
+        let public = public_operation("secret-order").to_string();
+        let list = orders::list_value(&ctx(&[("wallet", WALLET)]), WALLET)
+            .unwrap()
+            .to_string();
+        for tx in [
+            order.signed.unwrap(),
+            order.cancellation.unwrap().signed.unwrap(),
+        ] {
+            assert!(!public.contains(&tx));
+            assert!(!list.contains(&tx));
+        }
+        assert!(list.contains("secret-cancel"));
+    }
+
+    #[test]
+    fn buy_quotes_are_independently_checked_against_chain_reserves() {
+        let request = normalized(
+            Action::Buy,
+            json!({"mint":BOND_MINT,"amount":"1000000","slippagePct":2}),
+        );
+        fake_host::install(host_serving_a_buy());
+        let (mut parsed, _, _) = parsed_buy_fixture();
+        assert!(verify_buy_floor(&parsed, &request).is_ok());
+        let ix = parsed
+            .instructions
+            .iter_mut()
+            .find(|ix| has_discriminator(ix, IX_BUY))
+            .unwrap();
+        ix.data[8..16].copy_from_slice(&1u64.to_le_bytes());
+        assert!(
+            dispatch_message(&verify_buy_floor(&parsed, &request).unwrap_err())
+                .contains("chain-priced minimum")
+        );
+    }
+
+    #[test]
+    fn an_unsafe_buy_quote_never_reaches_signing() {
+        let mut host = host_serving_a_buy();
+        let mut response = fixture("buy_bond");
+        let mut raw = B64
+            .decode(response["transaction"].as_str().unwrap())
+            .unwrap();
+        let at = raw.windows(8).position(|w| w == IX_BUY).unwrap();
+        raw[at + 8..at + 16].copy_from_slice(&1u64.to_le_bytes());
+        response["transaction"] = json!(B64.encode(raw));
+        host.reply_only(SWAP_URL, response);
+        fake_host::install(host);
+        assert!(dispatch_message(&run_buy("unsafe-buy", false)).contains("chain-priced minimum"));
+        fake_host::with(|h| {
+            assert!(h.sign_requests.is_empty());
+            assert!(h.calls_for("sendTransaction").is_empty());
+        });
+    }
+
+    #[test]
+    fn self_built_transactions_bound_and_declare_their_priority_fee_locally() {
+        let mut host = host_with_order_slot();
+        host.reply_only(
+            &format!("{RPC_VERIFY} getRecentPrioritizationFees"),
+            recent_fees(&[u64::MAX; 150]),
+        );
+        host.reply(
+            &format!("{RPC} getMinimumBalanceForRentExemption"),
+            json!({"result":1_447_680}),
+        );
+        fake_host::install(host);
+        let response = execute(
+            &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+            Action::OrderSlot,
+            owner(),
+            &serde_json::to_vec(
+                &json!({"operationId":"bounded-fee","slot":1,"frontRunningProtection":false}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            response,
+            DispatchResponse::Write,
+            "{}",
+            dispatch_message(&response)
+        );
+        fake_host::with(|h| {
+            let request = h.sign_requests.last().unwrap();
+            let claim: Value = serde_json::from_slice(&request.petal_use_claim_jcs).unwrap();
+            let local = local_fee_floor(&message(&request.preimage).unwrap(), &Map::new()).unwrap();
+            assert_eq!(claim["declared_fee"]["amount"], json!(local.to_string()));
+            assert!(local <= MAX_PRIORITY_FEE_LAMPORTS + 5_000);
+            assert!(local >= 45_000);
+        });
+    }
+
+    #[test]
+    fn an_atomic_reservation_survives_failure_before_the_operation_record() {
+        let mut host = host_with_order_slot();
+        // The reservation succeeds but the Pending write fails.
+        host.fail_store_after = Some(1);
+        fake_host::install(host);
+        let response = place_order("reserved-retry", 20.0);
+        assert!(matches!(response, DispatchResponse::Error { .. }));
+        fake_host::with(|h| {
+            assert!(h.sign_requests.is_empty());
+            h.fail_store_after = None;
+        });
+        assert!(
+            dispatch_message(&place_order("competing-reservation", 20.0))
+                .contains("no free order slot")
+        );
+        let listing = orders::list_value(&ctx(&[("wallet", WALLET)]), WALLET).unwrap();
+        assert_eq!(listing["slots"][0]["order"], json!("reserved-retry"));
+        assert_eq!(place_order("reserved-retry", 20.0), DispatchResponse::Write);
+        fake_host::with(|h| assert_eq!(h.sign_requests.len(), 1));
+    }
+
+    #[test]
+    fn a_slot_reservation_cannot_be_reused_for_changed_economics() {
+        let mut host = host_with_order_slot();
+        host.fail_store_after = Some(1);
+        fake_host::install(host);
+        let _ = place_order("reserved-intent", 20.0);
+        fake_host::with(|h| h.fail_store_after = None);
+        let changed = place_order("reserved-intent", 30.0);
+        assert!(matches!(changed, DispatchResponse::Error { .. }));
+        fake_host::with(|h| assert!(h.sign_requests.is_empty()));
+    }
+
+    #[test]
+    fn limit_review_matches_the_final_instruction_amounts() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("review-limit", 20.0), DispatchResponse::Write);
+        let tx = B64.decode(stored_order_signed("review-limit")).unwrap();
+        let parsed = message(&tx[65..]).unwrap();
+        let ix = parsed
+            .instructions
+            .iter()
+            .find(|i| has_discriminator(i, IX_BUY))
+            .unwrap();
+        let review = public_operation("review-limit")["review"].to_string();
+        assert!(review.contains(&token_display(
+            instruction_u64(ix, 8).unwrap(),
+            BOND_MINT,
+            None
+        )));
+        assert!(review.contains("Approval scope"));
+        assert!(review.contains("does not seal the coin"));
+    }
+
+    #[test]
+    fn cancelling_during_approval_suspends_checks_without_claiming_success() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(
+            place_order("approval-cancel", 20.0),
+            DispatchResponse::Write
+        );
+        fake_host::with(|h| {
+            h.sign_outcome(Ok(SignOutcome::ApprovalPending {
+                action_id: "cancel-approval".into(),
+                expires_ms: NOW_MS + 60_000,
+            }));
+        });
+        assert!(
+            dispatch_message(&cancel_limit("approval-cancel", "approval-cancel-op"))
+                .contains("approval required")
+        );
+        assert_eq!(stored_order("approval-cancel").state, "cancel_pending");
+        check_orders();
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+        assert_eq!(
+            cancel_limit("approval-cancel", "approval-cancel-op"),
+            DispatchResponse::Write
+        );
+        assert!(
+            stored_order("approval-cancel")
+                .cancellation
+                .unwrap()
+                .signed
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cancellation_refuses_a_second_operation_id_until_the_first_is_reconciled() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(
+            place_order("duplicate-cancel", 20.0),
+            DispatchResponse::Write
+        );
+        assert_eq!(
+            cancel_limit("duplicate-cancel", "cancel-once"),
+            DispatchResponse::Write
+        );
+        assert!(
+            dispatch_message(&cancel_limit("duplicate-cancel", "cancel-twice"))
+                .contains("already requested")
+        );
+        fake_host::with(|h| assert_eq!(h.sign_requests.len(), 2));
+    }
+
+    #[test]
+    fn a_late_cancellation_write_cannot_overwrite_a_settled_fill() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("settled-race", 20.0), DispatchResponse::Write);
+        assert_eq!(
+            cancel_limit("settled-race", "settled-cancel"),
+            DispatchResponse::Write
+        );
+        let cancel: Pending = get_secret(&secret_key(&owner(), "settled-cancel"))
+            .unwrap()
+            .unwrap();
+        update_order("settled-race", |p| {
+            let order = p.order.as_mut().unwrap();
+            order.state = "filled".into();
+            order.settled = true;
+            p.status = "filled".into();
+        });
+        let response =
+            orders::request_cancel(&owner(), "settled-race", "settled-cancel", &cancel, None)
+                .unwrap_err();
+        assert!(dispatch_message(&response).contains("already settled"));
+        assert_eq!(stored_order("settled-race").state, "filled");
+    }
+
+    #[test]
+    fn a_confirmed_fill_that_disappears_can_resume_the_same_order() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("rollback", 20.0), DispatchResponse::Write);
+        let tx = stored_order_signed("rollback");
+        order_status(&tx, "confirmed", Value::Null);
+        check_orders();
+        assert_eq!(stored_order("rollback").state, "confirmed");
+        fake_host::with(|h| h.chain.statuses.clear());
+        check_orders();
+        assert_eq!(stored_order("rollback").state, "submitted");
+        fake_host::with(|h| {
+            assert_eq!(h.sign_requests.len(), 1);
+            assert_eq!(h.broadcasts(), 1);
+        });
+    }
+
+    fn validator_nonce(account: &Value) -> [u8; 32] {
+        let data = owned_data(account, &pk(PROGRAMS[1]).unwrap()).unwrap();
+        assert_eq!(key_at(&data, 8), Some(pk(USER).unwrap()));
+        key_at(&data, 40).unwrap()
+    }
+
+    fn validator_rpc(url: &str, method: &str, params: Value) -> Value {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // This fixture key must never sign or receive funds on a live cluster.
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let mut child = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                "--header",
+                "content-type: application/json",
+                "--data-binary",
+                "@-",
+                url,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&rpc(method, params)).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "local validator RPC failed");
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn validator_finalized(url: &str, signature: &str) {
+        for _ in 0..300 {
+            let result = validator_rpc(
+                url,
+                "getSignatureStatuses",
+                json!([[signature],{"searchTransactionHistory":true}]),
+            );
+            if let Some(value) = result.pointer("/result/value/0")
+                && value["confirmationStatus"] == json!("finalized")
+            {
+                assert_eq!(
+                    value["err"],
+                    Value::Null,
+                    "local transaction failed: {value}"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("local transaction did not finalize");
+    }
+
+    /// Category: local-validator. Exercises the Petal's actual slot and cancel
+    /// encodings, Ed25519 signatures, and both nonce races in the real runtime.
+    #[test]
+    #[ignore = "requires a disposable local Agave validator and PUMPFUN_LOCAL_RPC"]
+    fn durable_cancel_and_order_races_on_a_local_validator() {
+        let url = std::env::var("PUMPFUN_LOCAL_RPC").expect("PUMPFUN_LOCAL_RPC required");
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let genesis = validator_rpc(&url, "getGenesisHash", json!([]));
+        assert_ne!(genesis["result"], json!(MAINNET_BETA_GENESIS_BASE58));
+        assert!(genesis["result"].is_string());
+        let funded = validator_rpc(&url, "requestAirdrop", json!([USER, 1_000_000_000]));
+        validator_finalized(&url, funded["result"].as_str().expect("local airdrop"));
+        let latest = validator_rpc(
+            &url,
+            "getLatestBlockhash",
+            json!([{"commitment":"confirmed"}]),
+        );
+        let rent = validator_rpc(&url, "getMinimumBalanceForRentExemption", json!([80]));
+        let mut host = host_serving_a_buy();
+        host.reply_only(&format!("{RPC} getLatestBlockhash"), latest.clone());
+        host.reply(&format!("{RPC} getMinimumBalanceForRentExemption"), rent);
+        fake_host::install(host);
+        let existing = validator_rpc(
+            &url,
+            "getAccountInfo",
+            json!([slot0(), {"encoding":"base64", "commitment":"finalized"}]),
+        );
+        if existing
+            .pointer("/result/value")
+            .is_some_and(Value::is_null)
+        {
+            let created = execute(
+                &ctx(&[("bloom.route_id", "ROUTE_SLOT")]),
+                Action::OrderSlot,
+                owner(),
+                &serde_json::to_vec(
+                    &json!({"operationId":"local-slot","slot":0,"frontRunningProtection":false}),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                created,
+                DispatchResponse::Write,
+                "{}",
+                dispatch_message(&created)
+            );
+            let create_tx = fake_host::with(|h| {
+                h.calls_for("sendTransaction")[0].rpc_params().unwrap()[0].clone()
+            });
+            let sent = validator_rpc(
+                &url,
+                "sendTransaction",
+                json!([create_tx,{"encoding":"base64","preflightCommitment":"confirmed"}]),
+            );
+            validator_finalized(
+                &url,
+                sent["result"].as_str().expect("slot creation accepted"),
+            );
+        } else {
+            validator_nonce(
+                existing
+                    .pointer("/result/value")
+                    .expect("local nonce account"),
+            );
+        }
+
+        for fill_first in [false, true] {
+            let account = validator_rpc(
+                &url,
+                "getAccountInfo",
+                json!([slot0(),{"encoding":"base64","commitment":"finalized"}]),
+            );
+            let account = account.pointer("/result/value").unwrap().clone();
+            let nonce = validator_nonce(&account);
+            let mut host = host_with_order_slot();
+            host.chain.accounts.insert(slot0(), account);
+            host.reply_only(&format!("{RPC} getLatestBlockhash"), latest.clone());
+            fake_host::install(host);
+            assert_eq!(place_order("local-race", 20.0), DispatchResponse::Write);
+            // Pump programs are absent locally. Substitute an ordinary System
+            // transfer with the same payer/nonce to test runtime lifetime and
+            // cancellation; market validation is covered by the builder tests.
+            let user = pk(USER).unwrap();
+            let system = pk(PROGRAMS[1]).unwrap();
+            let transfer = Ix {
+                program: 2,
+                accounts: vec![0, 1],
+                data: [&2u32.to_le_bytes()[..], &1_000_000u64.to_le_bytes()].concat(),
+            };
+            let base = txedit::plain_message(
+                [1, 0, 1],
+                &[user, pk(BOND_MINT).unwrap(), system],
+                &[0; 32],
+                std::slice::from_ref(&transfer),
+            )
+            .unwrap();
+            let durable = txedit::with_durable_nonce(
+                &base,
+                &[transfer],
+                &pk(&slot0()).unwrap(),
+                &nonce,
+                &system,
+                &pk(orders::RECENT_BLOCKHASHES).unwrap(),
+            )
+            .unwrap();
+            let mut signed = txedit::unsigned_transaction(&durable).unwrap();
+            signed[1..65].copy_from_slice(&fake_host::sign_message(&durable));
+            let order_tx = B64.encode(signed);
+            update_order("local-race", |p| {
+                p.order.as_mut().unwrap().signed = Some(order_tx.clone())
+            });
+            assert_eq!(
+                cancel_limit("local-race", "local-cancel"),
+                DispatchResponse::Write
+            );
+            let cancel_tx = stored_order("local-race")
+                .cancellation
+                .unwrap()
+                .signed
+                .unwrap();
+            let (winner, loser) = if fill_first {
+                (&order_tx, &cancel_tx)
+            } else {
+                (&cancel_tx, &order_tx)
+            };
+            let sent = validator_rpc(
+                &url,
+                "sendTransaction",
+                json!([winner,{"encoding":"base64","preflightCommitment":"confirmed"}]),
+            );
+            validator_finalized(
+                &url,
+                sent["result"]
+                    .as_str()
+                    .expect("winning transaction accepted"),
+            );
+            let losing = validator_rpc(
+                &url,
+                "sendTransaction",
+                json!([loser,{"encoding":"base64","preflightCommitment":"confirmed"}]),
+            );
+            assert!(
+                losing.get("error").is_some(),
+                "the old nonce cannot execute a second transaction"
+            );
+            let after = validator_rpc(
+                &url,
+                "getAccountInfo",
+                json!([slot0(),{"encoding":"base64","commitment":"finalized"}]),
+            );
+            assert_ne!(
+                validator_nonce(after.pointer("/result/value").unwrap()),
+                nonce
+            );
+        }
     }
 }

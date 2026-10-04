@@ -23,9 +23,9 @@ Their routes are gone, not merely disabled.
 
 ## What a write costs
 
-One Bloom ceremony per transaction. A buy and a later sell are two, because the
-amount to sell is only known once the buy settles. Closing an empty token
-account is a third.
+One Bloom ceremony per transaction. A buy and a later sell are two. Selling
+`all` also closes the emptied token account in that sell transaction; a
+separate account close requires another ceremony.
 
 What the owner sees before approving comes from the transaction itself, read
 back out of the bytes that were just validated: the trading account, the token,
@@ -46,8 +46,11 @@ declares is refused unsigned.
 A sell's floor — the least SOL it may return — is the builder's figure, and the
 program enforces only that. The Petal prices every sell itself from the
 bonding curve's or the pool's reserves on chain and refuses a floor below that
-price less 2% for Pump's fees (measured at 1.25% on the curve and 0.85% on
-PumpSwap) and the requested slippage.
+price less a conservative 1.5% protocol-fee allowance and the requested
+slippage. PumpSwap fees vary by market-cap tier; 0.85% is one tier, not a
+fixed rate. Buys independently check the named token amount against the
+requested budget and on-chain reserves, with price impact, the same fee
+allowance and slippage. An unsafe builder quote is refused before approval.
 
 ## Reading it
 
@@ -77,7 +80,7 @@ trade/<wallet>/operations/<operationId>.json
 status.json
 ```
 
-`coins/<mint>.json` is a safety summary rather than Pump's raw record: the
+`coins/<mint>.json` is a risk-observation summary rather than Pump's raw record: the
 price, market cap and curve progress read from the chain now, whether the coin
 has graduated, its age and creator, plain warnings, and a `risk` block. Only
 `https://` links are kept, and the creator's description is not passed through.
@@ -91,6 +94,13 @@ has graduated, its age and creator, plain warnings, and a `risk` block. Only
 | `creatorOtherCoins`, `creatorGraduatedCoins` | Pump's listing filtered by creator | five or more other coins and none graduated |
 | `mintAuthority`, `freezeAuthority`, `tokenExtensions` | the mint account, on chain | anyone can mint or freeze, or the mint has an extension Pump coins lack |
 | `belowAllTimeHighPct` | Pump's market caps | 50% or more below the high |
+
+These observations do not establish that a coin is safe. Creator holdings
+cover associated token accounts only; other accounts and related wallets are
+not checked. Holder and creator-history indexes can lag. Partial launch
+samples are shown as incomplete in both human views, never as a clean pass.
+Coin and holdings JSON include `observedMs`; browser pages show their snapshot
+time and refresh only on reload.
 
 Each check is best effort; one that could not be made is named in
 `risk.unchecked` and the rest still report. The creation block is read only
@@ -113,7 +123,8 @@ symbols are the creator's own text, not unique, and cleaned of control and
 direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
 
 Bloom mounts Petals only at `petals/`, so `<wallet>` is the wallet id in the
-path and the account is the one Bloom injects — account 0 on current Bloom.
+path and the account number is injected by Bloom; a mount without an account
+number defaults to account 0.
 Operation records are scoped by both, so one operation id used on two accounts
 is two unrelated operations.
 
@@ -153,9 +164,11 @@ and a 0.00001 SOL tip (above the median landed tip), and the transaction is
 sent through Jito's block engine, which rejects any bundle that places a
 transaction ahead of it — how most sandwiches are built. It does not stop a
 validator outside Jito from reordering. `"frontRunningProtection":false` sends
-through the public RPC instead. `minOutputAmount` is optional: the Petal
-prices every sell against the chain and caps every buy's spend, and a floor
-the caller names is still enforced.
+through the public RPC instead. `minOutputAmount` is optional: the Petal prices both sides against the chain,
+caps each buy's spend and enforces any explicit raw output floor. A rebuild
+can use a new quote; 1% slippage is not a promise to retain the token quantity
+shown before the ceremony. The reusable approval seals the operation class
+and spending/fee ceilings, while the Petal validates the coin and quote.
 
 Pump's builder always asks for about 0.001 SOL of priority, whatever the trade
 size. Unless the request sets `"priorityFee":"builder"`, the Petal lowers the
@@ -167,7 +180,7 @@ ceremony that meets a busier market stays inside what the owner approved.
 `SETUP.md` has the measurements, and their limits.
 
 Protected writes are sent only to Jito; ordinary writes use the declared public
-Solana RPC and fall back to the second RPC once. Protection is routing, not a
+Solana RPC, the verifying RPC and Jito with identical signed bytes. Protection is routing, not a
 guarantee.
 
 ## Holdings and selling everything
@@ -226,14 +239,18 @@ read `operations/<operationId>.json`, `api.mintPublicKey`.
 
 ## Limit orders
 
-A limit buy fills only while the market cap is at or below a level; a limit
-sell (take-profit) only once it is at or above one. You approve an order once,
+A limit buy caps the SOL cost per raw token; a limit sell (take-profit) sets
+the minimum SOL received per raw token. `marketCapSol` is a target converted
+to that fixed unit-price limit using the mint supply at placement. The
+on-chain instruction enforces amounts, including protocol fees, rather than
+watching market cap. Price impact and fees can require the spot price to move
+past the target before a fill; later supply changes do not change the limit. You approve an order once,
 when you place it, and it stays valid until it fills or you cancel it.
 
 ```sh
-# once: an order slot, a nonce account the trading account owns (0.00106 SOL rent)
+# once: an order slot, a nonce account the trading account owns (RPC-quoted rent)
 echo '{"operationId":"slot-0","slot":0}' > trade/<wallet>/order_slot.json
-# place: buy 0.05 SOL of a coin once its market cap is at or below 30 SOL
+# place: buy up to 0.05 SOL with a price limit derived from a 30 SOL market cap
 echo '{"operationId":"dip-1","mint":"<mint>","side":"buy","amount":"50000000","marketCapSol":30}' > trade/<wallet>/limit.json
 # check, from an agent or a timer: sends any order whose price has arrived
 echo '{}' > trade/<wallet>/check_orders.json
@@ -246,24 +263,36 @@ An order is an ordinary Pump buy or sell from the builder, validated as any
 trade is, with two changes. Its amounts are set to the limit, so Pump's own
 program refuses it until the price is there: a buy names the tokens its SOL
 buys at the limit, and a sell names the least SOL its tokens fetch at the
-limit, both with 1.5% left for Pump's fee so the fill is at the limit or
-better. And its recent blockhash is the slot's durable nonce, with the
+limit. The price limit includes protocol fees; it is not widened by a fixed fee allowance. And its recent blockhash is the slot's durable nonce, with the
 nonce's advance as its first instruction, so the signed transaction does not
-expire. The Petal stores it and a check simulates it, sending it only when the
+expire. The Petal stores it and a check simulates an unsigned copy, sending the signed bytes only when the
 simulation succeeds; Pump's "price not reached" errors leave it waiting, and
 a coin that graduated off its curve retires a curve order. Cancelling
-advances the nonce, which voids the stored transaction. When the order is
+uses the same durable nonce as the order, so only one can land. RPC acceptance
+means `cancel_pending`, not cancelled. The slot stays reserved until both RPCs
+agree on a finalized fill/cancel, failure, or nonce invalidation. A confirmed
+fill is displayed as `confirmed`; `filled` requires finality. A graduated
+curve order remains visible and reserved until cancellation invalidates it.
+If a finalized nonce moved but the transaction outcome is unavailable, the
+record says `invalidated`, not filled or cancelled; inspect its signatures. When the order is
 signed, the Petal simulates it at today's price to hold what it can spend to
 the approval, as for any trade.
 
-One slot holds one open order, because landing or cancelling anything on a
+An atomic reservation gives one unsettled order each slot, because landing or cancelling anything on a
 nonce advances it; there are four slots. Each slot's address must be an
 allowed destination in the wallet policy, since its rent moves into it; the
 Petal names it before asking for approval. Nothing fills unless something
 writes to `check_orders.json`: an agent, or a timer such as
 `watch -n 10 "echo '{}' > …/check_orders.json"`. A stop-loss cannot be
 expressed: a sell's floor keeps it from filling below a price, never above
-one.
+one. Funds are not escrowed: other trades can reduce the available SOL or
+tokens and prevent a fill. Signed durable orders have no time expiry. Changing
+wallet policy or removing the Petal does not cryptographically revoke an
+already signed order; cancel and verify its nonce before retiring the package.
+Checks reconcile missing acknowledgements and may resend identical bytes;
+they never rebuild or sign another order. Read `checkedMs`, `note`,
+`cancelOperation` and `cancelSignature` in `orders.json` for recovery. Retry
+pending cancellation approval/signing using its original operation ID.
 
 ## Closing an empty token account
 
@@ -323,6 +352,9 @@ script, then run the architecture and Rust checks:
 cargo fmt --manifest-path route/Cargo.toml -- --check
 cargo clippy --manifest-path route/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path route/Cargo.toml --locked
+# Disposable local validator only; this test uses a public fixture key.
+PUMPFUN_LOCAL_RPC=http://127.0.0.1:8899 cargo test --manifest-path route/Cargo.toml \
+  --locked durable_cancel_and_order_races_on_a_local_validator -- --ignored
 ```
 
 There is no Cargo workspace at the repository root, so a bare `cargo test` here

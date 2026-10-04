@@ -95,7 +95,7 @@ pub(crate) fn risk(
             .map(|s| amount as f64 / s as f64 * 100.0)
     };
     let creator_pct = facts.as_ref().and_then(|f| f.creator_holds).and_then(pct);
-    if creator.is_some() && creator_pct.is_none() {
+    if creator_pct.is_none() {
         unchecked.push("creatorHolds");
     }
     if let Some(facts) = &facts {
@@ -145,7 +145,7 @@ pub(crate) fn risk(
     }
 
     let history = creator.and_then(|c| creator_history(c, m));
-    if creator.is_some() && history.is_none() {
+    if history.is_none() {
         unchecked.push("creatorHistory");
     }
     if let Some((others, graduated, capped)) = history
@@ -170,7 +170,10 @@ pub(crate) fn risk(
             }
             found
         }
-        _ => None,
+        _ => {
+            unchecked.push("launch");
+            None
+        }
     };
     if let Some(launch) = &launch {
         let others = pct(launch.others_bought);
@@ -199,6 +202,7 @@ pub(crate) fn risk(
         "top10HoldPct": holders.map(|h| h.0),
         "holders": holders.and_then(|h| h.1),
         "creatorHoldsPct": creator_pct,
+        "creatorHoldingScope": "associated_token_accounts_only",
         "creatorBoughtAtLaunchPct": launch.as_ref().and_then(|l| pct(l.creator_bought)),
         "launchBlockBuyers": launch.as_ref().map(|l| l.other_buyers),
         "launchBlockBoughtPct": launch.as_ref().and_then(|l| pct(l.others_bought)),
@@ -236,12 +240,19 @@ fn mint_facts(mint: &[u8; 32], creator: Option<&[u8; 32]>) -> Option<MintFacts> 
         return None;
     }
     let info = accounts[0].pointer("/data/parsed/info")?;
-    let authority = |field: &str| {
-        info.get(field)
-            .and_then(Value::as_str)
-            .filter(|a| pk(a).is_ok())
-            .map(str::to_owned)
+    let authority = |field: &str| -> Option<Option<String>> {
+        match info.get(field)? {
+            Value::Null => Some(None),
+            Value::String(address) if pk(address).is_ok() => Some(Some(address.clone())),
+            _ => None,
+        }
     };
+    let mint_authority = authority("mintAuthority")?;
+    let freeze_authority = authority("freezeAuthority")?;
+    // Missing Token-2022 extension information must not become a clean bill.
+    if owner == PROGRAMS[4] && !info.get("extensions").is_some_and(Value::is_array) {
+        return None;
+    }
     let creator_holds = if creator.is_some() {
         accounts[1..]
             .iter()
@@ -263,23 +274,25 @@ fn mint_facts(mint: &[u8; 32], creator: Option<&[u8; 32]>) -> Option<MintFacts> 
     Some(MintFacts {
         supply: info.get("supply")?.as_str()?.parse().ok()?,
         decimals: u8::try_from(info.get("decimals")?.as_u64()?).ok()?,
-        mint_authority: authority("mintAuthority"),
-        freeze_authority: authority("freezeAuthority"),
-        extensions: info
-            .get("extensions")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|e| e.get("extension")?.as_str())
-                    .map(|e| {
-                        e.chars()
-                            .filter(char::is_ascii_alphanumeric)
-                            .take(40)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        mint_authority,
+        freeze_authority,
+        extensions: match info.get("extensions") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|e| {
+                    e.get("extension")?
+                        .as_str()
+                        .filter(|name| {
+                            !name.is_empty()
+                                && name.len() <= 40
+                                && name.chars().all(|c| c.is_ascii_alphanumeric())
+                        })
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()?,
+            None if owner == PROGRAMS[3] => Vec::new(),
+            _ => return None,
+        },
         creator_holds,
     })
 }
@@ -718,5 +731,49 @@ mod tests {
             );
         }
         fake_host::with(|host| assert!(host.calls.is_empty()));
+    }
+
+    #[test]
+    fn missing_or_malformed_mint_facts_remain_unchecked() {
+        let valid = json!({"supply":"1000000000000000","decimals":6,"mintAuthority":null,"freezeAuthority":null,"extensions":[]});
+        let mut cases = Vec::new();
+        for field in ["mintAuthority", "freezeAuthority", "extensions"] {
+            let mut info = valid.clone();
+            info.as_object_mut().unwrap().remove(field);
+            cases.push(info);
+        }
+        let mut bad_authority = valid.clone();
+        bad_authority["mintAuthority"] = json!("invalid");
+        cases.push(bad_authority);
+        let mut bad_extension = valid.clone();
+        bad_extension["extensions"] = json!([{}]);
+        cases.push(bad_extension);
+        for info in cases {
+            let mut host = FakeHost::new(NOW_MS);
+            host.chain.accounts.insert(
+                MINT.into(),
+                json!({"owner":PROGRAMS[4],"data":{"parsed":{"info":info}}}),
+            );
+            fake_host::install(host);
+            let result = risk(&pk(MINT).unwrap(), MINT, &json!({}), None, None);
+            assert!(
+                result.report["unchecked"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("mint"))
+            );
+            assert!(result.report["tokenExtensions"].is_null());
+        }
+    }
+
+    #[test]
+    fn explicit_absent_authorities_and_known_extensions_can_be_read() {
+        let mut host = FakeHost::new(NOW_MS);
+        host.chain.accounts.insert(MINT.into(), json!({"owner":PROGRAMS[4],"data":{"parsed":{"info":
+            {"supply":"1000000","decimals":6,"mintAuthority":null,"freezeAuthority":null,"extensions":[{"extension":"metadataPointer"},{"extension":"tokenMetadata"}]}}}}));
+        fake_host::install(host);
+        let facts = mint_facts(&pk(MINT).unwrap(), None).unwrap();
+        assert!(facts.mint_authority.is_none() && facts.freeze_authority.is_none());
+        assert_eq!(facts.extensions, vec!["metadataPointer", "tokenMetadata"]);
     }
 }
