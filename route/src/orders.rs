@@ -1189,7 +1189,7 @@ fn reconcile(p: &Pending, order: &Order) -> Result<(String, String), DispatchRes
     })
 }
 
-/// `trade/<wallet>/orders.json`: every order and every slot.
+/// `trade/<wallet>/<index>/orders.json`: every order and every slot.
 pub fn list(c: &Ctx, w: String) -> DispatchResponse {
     match list_value(c, &w) {
         Ok(v) => petal::read_json_value(&v),

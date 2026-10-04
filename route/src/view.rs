@@ -398,7 +398,7 @@ fn coin_markdown(
         }
     }
     out.push_str(&format!(
-        "\n## Trade\n\nBuy 0.01 SOL of it (the amount is in lamports) from the mounted folder:\n\n    echo '{{\"operationId\":\"buy-1\",\"mint\":\"{m}\",\"amount\":\"10000000\"}}' > trade/<wallet>/buy.json\n\nSell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`. Every trade waits for your approval in Bloom.\n\nNames and links are the creator's own; prices, authorities and the creator's holding are read from the chain; holders and the creator's other coins are Pump's figures.\n"
+        "\n## Trade\n\nBuy 0.01 SOL of it (the amount is in lamports) from the mounted folder:\n\n    echo '{{\"operationId\":\"buy-1\",\"mint\":\"{m}\",\"amount\":\"10000000\"}}' > trade/<wallet>/<index>/buy.json\n\nSell with `sell.json` and `\"amount\":\"all\"` or `\"50%\"`. Every trade waits for your approval in Bloom.\n\nNames and links are the creator's own; prices, authorities and the creator's holding are read from the chain; holders and the creator's other coins are Pump's figures.\n"
     ));
     out
 }
@@ -491,7 +491,7 @@ fn coin_html(
         ));
     }
     out.push_str(&format!(
-        "</ul><h2>Trade</h2><p class=muted>Buy 0.01 SOL of it (the amount is in lamports) from the petal's mounted folder. Every trade waits for your approval in Bloom.</p><pre class=snippet>echo '{{\"operationId\":\"buy-1\",\"mint\":\"{m}\",\"amount\":\"10000000\"}}' &gt; trade/&lt;wallet&gt;/buy.json</pre><p class=muted>Sell with <code>sell.json</code> and <code>\"amount\":\"all\"</code> or <code>\"50%\"</code>.</p><p><a href=\"https://pump.fun/coin/{m}\" rel=noreferrer>pump.fun</a> · <a href=\"https://solscan.io/token/{m}\" rel=noreferrer>Solscan</a></p></section>"
+        "</ul><h2>Trade</h2><p class=muted>Buy 0.01 SOL of it (the amount is in lamports) from the petal's mounted folder. Every trade waits for your approval in Bloom.</p><pre class=snippet>echo '{{\"operationId\":\"buy-1\",\"mint\":\"{m}\",\"amount\":\"10000000\"}}' &gt; trade/&lt;wallet&gt;/&lt;index&gt;/buy.json</pre><p class=muted>Sell with <code>sell.json</code> and <code>\"amount\":\"all\"</code> or <code>\"50%\"</code>.</p><p><a href=\"https://pump.fun/coin/{m}\" rel=noreferrer>pump.fun</a> · <a href=\"https://solscan.io/token/{m}\" rel=noreferrer>Solscan</a></p></section>"
     ));
     if let Some(trades) = trades {
         let list = trades["trades"].as_array().cloned().unwrap_or_default();
@@ -825,10 +825,13 @@ const b=document.getElementById('copy');if(b)b.onclick=()=>{navigator.clipboard.
 
 // --------------------------------------------------------------- holdings
 
+/// From `trade/<wallet>/<index>/holdings.html` back up to `coins/`.
+const HOLDINGS_TO_COINS: &str = "../../../coins/";
+
 pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
     let data = match holdings_value(c, w.clone()) {
         Ok(data) => data,
-        Err(e) => return unavailable(&e, format, "../../coins/"),
+        Err(e) => return unavailable(&e, format, HOLDINGS_TO_COINS),
     };
     let now = host::now_ms();
     // Orders are shown when they can be read; holdings do not depend on them.
@@ -941,7 +944,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
                         .unwrap_or_else(|| ("?".into(), "unknown token".into()));
                     let image = Some(image_link(mint, 86));
                     format!(
-                        "<tr><td><a class=coin href=\"../../coins/{mint}.html\">{avatar}<span><b>{sym}</b><br><span class=muted>{name}</span></span></a></td><td class=num>{amount}</td><td class=num>{worth}</td><td><code>{short}</code></td></tr>",
+                        "<tr><td><a class=coin href=\"{HOLDINGS_TO_COINS}{mint}.html\">{avatar}<span><b>{sym}</b><br><span class=muted>{name}</span></span></a></td><td class=num>{amount}</td><td class=num>{worth}</td><td><code>{short}</code></td></tr>",
                         avatar = avatar(image.as_deref(), &symbol, 36),
                         sym = html(&symbol),
                         name = html(&name),
@@ -990,7 +993,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
             };
             page(
                 "Holdings · Pump.fun",
-                &nav_from("../../coins/", "holdings"),
+                &nav_from(HOLDINGS_TO_COINS, "holdings"),
                 &body,
                 "",
             )
@@ -1503,8 +1506,8 @@ mod tests {
 
     struct HoldingsRoute;
     impl petal::RouteIdentity for HoldingsRoute {
-        const PATH: &'static str = "trade/[wallet]/holdings.html";
-        const CANONICAL_PATH: &'static str = "trade/[wallet]/holdings.html";
+        const PATH: &'static str = "trade/[wallet]/[index]/holdings.html";
+        const CANONICAL_PATH: &'static str = "trade/[wallet]/[index]/holdings.html";
         const PARAMS: &'static [(&'static str, usize)] = &[];
     }
 
@@ -1538,13 +1541,20 @@ mod tests {
         let ctx = petal::Ctx::bind::<HoldingsRoute>(petal::RawCtx {
             petal_root: "/petals/pumpfun".into(),
             package_hash: "test".into(),
-            path: "trade/main/holdings.html".into(),
-            params: vec![("wallet".into(), "main".into())],
+            path: "trade/main/0/holdings.html".into(),
+            params: [
+                ("wallet", "main"),
+                ("index", "0"),
+                ("bloom.wallet", "main"),
+                ("bloom.account", "0"),
+            ]
+            .map(|(key, value)| (key.into(), value.into()))
+            .to_vec(),
             actor: None,
         });
         let page = text(holdings(&ctx, "main".into(), Format::Html));
         assert!(
-            page.contains(&format!("href=\"../../coins/{MINT}.html\"")),
+            page.contains(&format!("href=\"../../../coins/{MINT}.html\"")),
             "{page}"
         );
         assert!(page.contains("Mog &lt;b&gt;") && page.contains("35.3K"));
@@ -1552,7 +1562,7 @@ mod tests {
             page.contains("0.00204 SOL"),
             "rent in the empty account: {page}"
         );
-        assert!(page.contains("href=\"../../coins/latest.html\""));
+        assert!(page.contains("href=\"../../../coins/latest.html\""));
         install();
         let md = text(holdings(&ctx, "main".into(), Format::Markdown));
         assert!(md.contains("1 empty token account(s)"), "{md}");

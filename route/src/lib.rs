@@ -246,15 +246,17 @@ fn pk(s: &str) -> Result<[u8; 32], String> {
         .try_into()
         .map_err(|_| "pubkey is not 32 bytes".to_string())
 }
-/// Which Bloom account trades: the wallet from the route path and the account
-/// number the host injected. Both halves identify the signing key, so both
-/// scope the operation records — two accounts of one wallet never share an
-/// operation id.
+/// Which Bloom account trades: the wallet and account index the route names,
+/// as Bloom resolved and vouched for them. Both halves identify the signing
+/// key, so both scope the operation records — two accounts of one wallet
+/// never share an operation id.
 ///
-/// `bloom.wallet` and `bloom.account` are host-supplied route parameters
-/// (`petal::route_param`), never path segments, so a guest cannot forge them
-/// by naming a directory. When the host injects no account the number is 0,
-/// which is the account Bloom resolves for a root-mounted Petal.
+/// Every trading route sits under `trade/<wallet>/<index>/`. Bloom checks
+/// that pair against the live wallet projection and passes it back as the
+/// host-supplied `bloom.wallet` and `bloom.account` parameters
+/// (`petal::route_param`), which a guest cannot forge by naming a directory.
+/// Both must be present and equal the route's own captures: there is no
+/// default account, because Bloom signs only for an account it named.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TradeOwner {
     wallet: String,
@@ -263,32 +265,36 @@ pub struct TradeOwner {
 
 impl TradeOwner {
     pub fn scope(ctx: &Ctx, wallet: &str) -> Result<Self, DispatchResponse> {
+        let index = petal::param(ctx, "index")?;
         Self::from_params(
             wallet,
+            index,
             petal::route_param(ctx, "bloom.wallet"),
             petal::route_param(ctx, "bloom.account"),
         )
-        .map_err(bad)
+        .map_err(deny)
     }
 
     fn from_params(
         wallet: &str,
-        mounted_wallet: Option<&str>,
-        account: Option<&str>,
+        index: &str,
+        trusted_wallet: Option<&str>,
+        trusted_account: Option<&str>,
     ) -> Result<Self, String> {
-        if let Some(mounted) = mounted_wallet
-            && mounted != wallet
-        {
+        let (Some(trusted_wallet), Some(trusted_account)) = (trusted_wallet, trusted_account)
+        else {
             return Err(format!(
-                "route wallet {wallet:?} is not the mounted wallet {mounted:?}"
+                "trade/{wallet}/{index}/ carries no Bloom account context; trading needs the wallet and account Bloom selected"
+            ));
+        };
+        if trusted_wallet != wallet || trusted_account != index {
+            return Err(format!(
+                "route account {wallet}/{index} is not the account Bloom selected ({trusted_wallet}/{trusted_account})"
             ));
         }
-        let account = match account {
-            None => 0,
-            Some(raw) => raw
-                .parse::<u32>()
-                .map_err(|error| format!("bloom.account must be a u32: {error}"))?,
-        };
+        let account = trusted_account
+            .parse::<u32>()
+            .map_err(|error| format!("bloom.account must be a u32: {error}"))?;
         Ok(Self {
             wallet: wallet.to_owned(),
             account,
@@ -326,11 +332,6 @@ impl TradeOwner {
 /// they are; nothing here reads or writes them.
 fn trades_prefix(owner: &TradeOwner) -> String {
     format!("trades/{}/{}/", owner.account, owner.wallet)
-}
-fn account_number(c: &Ctx) -> Result<u32, DispatchResponse> {
-    petal::route_param(c, "bloom.account")
-        .map_or(Ok(0), |raw| raw.parse::<u32>())
-        .map_err(|error| bad(format!("bloom.account must be a u32: {error}")))
 }
 fn public_key(owner: &TradeOwner, o: &str) -> String {
     format!("state/{}operations/{o}.json", trades_prefix(owner))
@@ -2659,10 +2660,6 @@ fn stored_children(prefix: &str, suffix: Option<&str>) -> Result<Vec<String>, Di
     children.dedup();
     Ok(children)
 }
-pub fn list_wallets(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
-    stored_children(&format!("state/trades/{}/", account_number(c)?), None)
-        .map(|children| children.into_iter().map(petal::dir).collect())
-}
 pub fn list_operations(c: &Ctx) -> Result<Vec<petal::RouteChild>, DispatchResponse> {
     let owner = TradeOwner::scope(c, &wallet(c)?)?;
     stored_children(
@@ -4364,23 +4361,52 @@ mod tests {
     }
 
     #[test]
-    fn a_trade_owner_is_the_mounted_wallet_and_account_number() {
-        let account = |n| TradeOwner::from_params(WALLET, Some(WALLET), Some(n)).unwrap();
-        // A root mount injects no account, and Bloom resolves account 0 for
-        // it, so the two are one owner.
+    fn a_trade_owner_is_the_account_bloom_selected_for_the_route() {
+        let account = |n| TradeOwner::from_params(WALLET, n, Some(WALLET), Some(n)).unwrap();
         assert_eq!(owner(), account("0"));
         assert_ne!(owner(), account("1"));
-        // A route wallet other than the mounted one never borrows the
-        // mounted account's scope.
-        assert!(TradeOwner::from_params("other", Some(WALLET), Some("1")).is_err());
-        assert!(TradeOwner::from_params(WALLET, Some(WALLET), Some("-1")).is_err());
+        // Without Bloom's account context there is no owner: the Petal never
+        // falls back to account 0 or trusts the path alone.
+        for (wallet, account) in [(None, None), (Some(WALLET), None), (None, Some("0"))] {
+            assert!(TradeOwner::from_params(WALLET, "0", wallet, account).is_err());
+        }
+        // The route's captures must be the pair Bloom resolved.
+        assert!(TradeOwner::from_params("other", "1", Some(WALLET), Some("1")).is_err());
+        assert!(TradeOwner::from_params(WALLET, "1", Some(WALLET), Some("0")).is_err());
+        assert!(TradeOwner::from_params(WALLET, "-1", Some(WALLET), Some("-1")).is_err());
+    }
+
+    #[test]
+    fn a_route_without_trusted_account_context_is_refused_before_any_host_call() {
+        fake_host::install(FakeHost::new(NOW_MS));
+        let untrusted = ctx(&[("wallet", WALLET), ("index", "0")]);
+        for response in [
+            route_action(&untrusted, &buy_body("op-untrusted", false), Action::Buy),
+            route_operation(&ctx(&[
+                ("wallet", WALLET),
+                ("index", "0"),
+                ("operation", "op-untrusted"),
+            ])),
+            holdings(&untrusted, WALLET.to_owned()),
+        ] {
+            assert!(
+                matches!(response, DispatchResponse::Error { code: -2, .. }),
+                "{response:?}"
+            );
+        }
+        assert!(list_operations(&untrusted).is_err());
+        fake_host::with(|host| {
+            assert!(host.calls.is_empty(), "{:?}", host.calls);
+            assert!(host.sign_requests.is_empty());
+            assert_eq!(host.puts, 0);
+        });
     }
 
     #[test]
     fn two_accounts_of_one_wallet_never_share_an_operation_record() {
-        let account = |n| TradeOwner::from_params(WALLET, Some(WALLET), Some(n)).unwrap();
-        let (flat, zero, one, two) = (owner(), account("0"), account("1"), account("2"));
-        assert_eq!(public_key(&flat, "op-1"), public_key(&zero, "op-1"));
+        let account = |n| TradeOwner::from_params(WALLET, n, Some(WALLET), Some(n)).unwrap();
+        let (zero, one, two) = (account("0"), account("1"), account("2"));
+        assert_eq!(public_key(&zero, "op-1"), public_key(&owner(), "op-1"));
         assert_eq!(
             public_key(&one, "op-1"),
             format!("state/trades/1/{WALLET}/operations/op-1.json")
@@ -4390,9 +4416,9 @@ mod tests {
             format!("trades/2/{WALLET}/operations/op-1.json")
         );
         // Each account's listing root holds exactly its own wallet tree.
-        for listed in [&flat, &one, &two] {
+        for listed in [&zero, &one, &two] {
             let root = format!("state/trades/{}/", listed.account);
-            for other in [&flat, &one, &two] {
+            for other in [&zero, &one, &two] {
                 assert_eq!(
                     public_key(other, "op-1").starts_with(&format!("{root}{WALLET}/")),
                     listed == other
@@ -4400,7 +4426,7 @@ mod tests {
             }
         }
         // Records the removed session routes wrote are left where they are.
-        assert!(!public_key(&flat, "op-1").starts_with("state/sessions/"));
+        assert!(!public_key(&zero, "op-1").starts_with("state/sessions/"));
     }
 
     #[test]
@@ -4416,7 +4442,7 @@ mod tests {
                 &format!("{AMM_CREATOR}\n"),
             );
         });
-        let account = |n| TradeOwner::from_params(WALLET, Some(WALLET), Some(n)).unwrap();
+        let account = |n| TradeOwner::from_params(WALLET, n, Some(WALLET), Some(n)).unwrap();
         assert_eq!(owner().address().unwrap(), USER);
         assert_eq!(account("1").address().unwrap(), AMM_CREATOR);
         // An account Bloom projects no Solana address for cannot trade, and
@@ -4890,13 +4916,21 @@ mod tests {
     const PROBE_URL: &str = "https://fun-block.pump.fun/agents/swap";
 
     fn owner() -> TradeOwner {
-        TradeOwner::from_params(WALLET, None, None).unwrap()
+        TradeOwner::from_params(WALLET, "0", Some(WALLET), Some("0")).unwrap()
     }
+
+    /// The parameters Bloom passes a route under `trade/<WALLET>/0/`.
+    const ACCOUNT_ZERO: [(&str, &str); 4] = [
+        ("wallet", WALLET),
+        ("index", "0"),
+        ("bloom.wallet", WALLET),
+        ("bloom.account", "0"),
+    ];
 
     struct TestRoute;
     impl RouteIdentity for TestRoute {
-        const PATH: &'static str = "trade/[wallet]/buy.json";
-        const CANONICAL_PATH: &'static str = "trade/[wallet]/buy.json";
+        const PATH: &'static str = "trade/[wallet]/[index]/buy.json";
+        const CANONICAL_PATH: &'static str = "trade/[wallet]/[index]/buy.json";
         const PARAMS: &'static [(&'static str, usize)] = &[];
     }
 
@@ -4904,7 +4938,7 @@ mod tests {
         Ctx::bind::<TestRoute>(petal::RawCtx {
             petal_root: "/petals/pumpfun".into(),
             package_hash: "pumpfun-test-package".into(),
-            path: "trade/main/buy.json".into(),
+            path: "trade/main/0/buy.json".into(),
             params: params
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
@@ -4976,13 +5010,40 @@ mod tests {
         serde_json::to_vec(&request).expect("request serializes")
     }
 
+    /// A buy written the way Bloom dispatches it: under `trade/<WALLET>/0/`
+    /// with the account context Bloom resolved for that path.
     fn run_buy(operation: &str, protected: bool) -> DispatchResponse {
-        execute(
-            &ctx(&[("bloom.route_id", "ROUTE_BUY")]),
-            Action::Buy,
-            owner(),
-            &buy_body(operation, protected),
-        )
+        let mut params = ACCOUNT_ZERO.to_vec();
+        params.push(("bloom.route_id", "ROUTE_BUY"));
+        route_action(&ctx(&params), &buy_body(operation, protected), Action::Buy)
+    }
+
+    #[test]
+    fn an_operation_is_read_and_listed_only_under_the_account_that_made_it() {
+        fake_host::install(host_serving_a_buy());
+        assert_eq!(run_buy("op-mine", false), DispatchResponse::Write);
+        let account = |n: &'static str| {
+            vec![
+                ("wallet", WALLET),
+                ("index", n),
+                ("bloom.wallet", WALLET),
+                ("bloom.account", n),
+                ("operation", "op-mine"),
+            ]
+        };
+        assert!(matches!(
+            route_operation(&ctx(&account("0"))),
+            DispatchResponse::Read(_)
+        ));
+        assert!(matches!(
+            route_operation(&ctx(&account("1"))),
+            DispatchResponse::Error { .. }
+        ));
+        assert_eq!(
+            list_operations(&ctx(&account("0"))).unwrap(),
+            [petal::file("op-mine.json")]
+        );
+        assert!(list_operations(&ctx(&account("1"))).unwrap().is_empty());
     }
 
     const TOKEN_ACCOUNT: &str = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
@@ -6068,7 +6129,7 @@ mod tests {
         host.reply(PROBE_URL, json!({"statusCode":400,"message":"invalid"}));
         fake_host::install(host);
 
-        let response = preflight(&ctx(&[("wallet", WALLET)]), WALLET.into());
+        let response = preflight(&ctx(&ACCOUNT_ZERO), WALLET.into());
         let DispatchResponse::Read(body) = response else {
             panic!("preflight is a read: {response:?}");
         };
@@ -6134,7 +6195,7 @@ mod tests {
         host.reply(PROBE_URL, json!({"statusCode":400}));
         fake_host::install(host);
 
-        let response = preflight(&ctx(&[("wallet", WALLET)]), WALLET.into());
+        let response = preflight(&ctx(&ACCOUNT_ZERO), WALLET.into());
         let DispatchResponse::Read(body) = response else {
             panic!("preflight is a read: {response:?}");
         };
@@ -6161,7 +6222,7 @@ mod tests {
         host.reply(PROBE_URL, json!({"statusCode":400}));
         fake_host::install(host);
 
-        let response = preflight(&ctx(&[("wallet", WALLET)]), WALLET.into());
+        let response = preflight(&ctx(&ACCOUNT_ZERO), WALLET.into());
         let DispatchResponse::Read(body) = response else {
             panic!("preflight is a read: {response:?}");
         };
@@ -6284,7 +6345,7 @@ mod tests {
         fake_host::install(host);
         assert_eq!(run_buy("shared-id", false), DispatchResponse::Write);
 
-        let second = TradeOwner::from_params(WALLET, Some(WALLET), Some("1")).unwrap();
+        let second = TradeOwner::from_params(WALLET, "1", Some(WALLET), Some("1")).unwrap();
         let response = execute(
             &ctx(&[("bloom.route_id", "ROUTE_BUY")]),
             Action::Buy,
@@ -6305,7 +6366,7 @@ mod tests {
             );
             assert!(
                 host.secret_json(&secret_key(
-                    &TradeOwner::from_params(WALLET, Some(WALLET), Some("1")).unwrap(),
+                    &TradeOwner::from_params(WALLET, "1", Some(WALLET), Some("1")).unwrap(),
                     "shared-id"
                 ))
                 .is_none(),
@@ -6558,15 +6619,15 @@ mod tests {
             ("root", include_str!("../files/$index.rs")),
             (
                 "buy.json",
-                include_str!("../files/trade/[wallet]/buy.json.rs"),
+                include_str!("../files/trade/[wallet]/[index]/buy.json.rs"),
             ),
             (
                 "sell.json",
-                include_str!("../files/trade/[wallet]/sell.json.rs"),
+                include_str!("../files/trade/[wallet]/[index]/sell.json.rs"),
             ),
             (
                 "close_token_account.json",
-                include_str!("../files/trade/[wallet]/close_token_account.json.rs"),
+                include_str!("../files/trade/[wallet]/[index]/close_token_account.json.rs"),
             ),
         ];
         for (name, source) in sources {
@@ -7319,7 +7380,7 @@ mod tests {
             curve_account(1_072_993_493_000_000, 30_000_182_059, false),
         );
         fake_host::install(host);
-        let body = match holdings(&ctx(&[("wallet", WALLET)]), WALLET.to_owned()) {
+        let body = match holdings(&ctx(&ACCOUNT_ZERO), WALLET.to_owned()) {
             DispatchResponse::Read(bytes) => bytes,
             other => panic!("{other:?}"),
         };
@@ -7782,7 +7843,7 @@ mod tests {
 
     fn check_orders() {
         assert_eq!(
-            orders::check(&ctx(&[("wallet", WALLET)]), WALLET.to_owned()),
+            orders::check(&ctx(&ACCOUNT_ZERO), WALLET.to_owned()),
             DispatchResponse::Write
         );
     }
@@ -8105,12 +8166,14 @@ mod tests {
         serde_json::to_vec(&request).unwrap()
     }
 
+    /// A launch written the way Bloom dispatches it, under `trade/<WALLET>/0/`.
     fn run_launch(operation: &str, fields: Value) -> DispatchResponse {
-        execute(
-            &ctx(&[("bloom.route_id", "ROUTE_LAUNCH")]),
-            Action::Launch,
-            owner(),
+        let mut params = ACCOUNT_ZERO.to_vec();
+        params.push(("bloom.route_id", "ROUTE_LAUNCH"));
+        route_action(
+            &ctx(&params),
             &launch_body(operation, fields),
+            Action::Launch,
         )
     }
 
@@ -8428,6 +8491,52 @@ mod tests {
         fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
     }
 
+    fn slot_holder(slot: usize) -> Value {
+        orders::list_value(&ctx(&ACCOUNT_ZERO), WALLET).unwrap()["slots"][slot]["order"].clone()
+    }
+
+    /// A fill seen only at `processed`, then missing, then finalized: the
+    /// order keeps its slot and is signed once, and is filled only when final.
+    #[test]
+    fn processed_then_missing_then_finalized_is_one_fill_reserved_until_final() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("sequence", 20.0), DispatchResponse::Write);
+        let tx = stored_order_signed("sequence");
+        order_status(&tx, "processed", Value::Null);
+        check_orders();
+        assert_eq!(stored_order("sequence").state, "submitted");
+        fake_host::with(|h| h.chain.statuses.clear());
+        check_orders();
+        assert_ne!(stored_order("sequence").state, "filled");
+        assert!(!stored_order("sequence").settled);
+        assert_eq!(slot_holder(0), json!("sequence"));
+        order_status(&tx, "finalized", Value::Null);
+        check_orders();
+        assert_eq!(stored_order("sequence").state, "filled");
+        assert!(stored_order("sequence").settled);
+        fake_host::with(|h| assert_eq!(h.sign_requests.len(), 1));
+    }
+
+    /// A node answering `BlockhashNotFound` for the order while both RPCs
+    /// still read its nonce unchanged does not retire it or free its slot.
+    #[test]
+    fn blockhash_not_found_with_an_unmoved_nonce_keeps_the_order() {
+        fake_host::install(host_with_order_slot());
+        assert_eq!(place_order("lagging", 20.0), DispatchResponse::Write);
+        fake_host::with(|h| {
+            h.reply_only(
+                &format!("{RPC} simulateTransaction"),
+                json!({"result":{"value":{"err":"BlockhashNotFound"}}}),
+            );
+        });
+        check_orders();
+        let order = stored_order("lagging");
+        assert_eq!(order.state, "open", "{:?}", order.note);
+        assert!(!order.settled);
+        assert_eq!(slot_holder(0), json!("lagging"));
+        fake_host::with(|h| assert!(h.calls_for("sendTransaction").is_empty()));
+    }
+
     #[test]
     fn malformed_status_never_reports_a_fill_or_sends_an_order() {
         fake_host::install(host_with_order_slot());
@@ -8721,7 +8830,7 @@ mod tests {
         );
         let order = stored_order("secret-order");
         let public = public_operation("secret-order").to_string();
-        let list = orders::list_value(&ctx(&[("wallet", WALLET)]), WALLET)
+        let list = orders::list_value(&ctx(&ACCOUNT_ZERO), WALLET)
             .unwrap()
             .to_string();
         for tx in [
@@ -8827,7 +8936,7 @@ mod tests {
             dispatch_message(&place_order("competing-reservation", 20.0))
                 .contains("no free order slot")
         );
-        let listing = orders::list_value(&ctx(&[("wallet", WALLET)]), WALLET).unwrap();
+        let listing = orders::list_value(&ctx(&ACCOUNT_ZERO), WALLET).unwrap();
         assert_eq!(listing["slots"][0]["order"], json!("reserved-retry"));
         assert_eq!(place_order("reserved-retry", 20.0), DispatchResponse::Write);
         fake_host::with(|h| assert_eq!(h.sign_requests.len(), 1));

@@ -68,15 +68,15 @@ more:
   The creator's own image link is never loaded.
 
 ```text
-index.html                                  newest coins, for a browser
-coins/{latest,live}.{md,html,json}          25 coins each
-coins/<mint>.{md,html,json}                 price, chart, risks, trades
-market/<mint>/{candles,trades}.json         the chart and trades as data
-trade/<wallet>/holdings.{md,html,json}      what the account holds, and its worth
-trade/<wallet>/{buy,sell,launch,close_token_account}.json
-trade/<wallet>/{limit,order_slot,cancel_order,check_orders}.json, orders.json
-trade/<wallet>/preflight.json
-trade/<wallet>/operations/<operationId>.json
+index.html                                      newest coins, for a browser
+coins/{latest,live}.{md,html,json}              25 coins each
+coins/<mint>.{md,html,json}                     price, chart, risks, trades
+market/<mint>/{candles,trades}.json             the chart and trades as data
+trade/<wallet>/<index>/holdings.{md,html,json}  what the account holds, and its worth
+trade/<wallet>/<index>/{buy,sell,launch,close_token_account}.json
+trade/<wallet>/<index>/{limit,order_slot,cancel_order,check_orders}.json, orders.json
+trade/<wallet>/<index>/preflight.json
+trade/<wallet>/<index>/operations/<operationId>.json
 status.json
 ```
 
@@ -122,11 +122,13 @@ creator is streaming, up to 25 each, without banned or NSFW coins. Names and
 symbols are the creator's own text, not unique, and cleaned of control and
 direction-changing characters: trade by mint, after reading `coins/<mint>.json`.
 
-Bloom mounts Petals only at `petals/`, so `<wallet>` is the wallet id in the
-path and the account number is injected by Bloom; a mount without an account
-number defaults to account 0.
-Operation records are scoped by both, so one operation id used on two accounts
-is two unrelated operations.
+`<wallet>/<index>` names the Bloom account that trades, exactly as under
+`/wallets/<wallet>/<index>/`. Bloom lists the wallets and accounts under
+`trade/`, checks the pair against the live wallet projection before the Petal
+runs, and hands the Petal that same pair as trusted context; a route without it
+is refused, and there is no default account. Each account, including 0, has its
+own private store, and operation records are scoped by both halves, so one
+operation id used on two accounts is two unrelated operations.
 
 ## How a transaction is checked
 
@@ -185,7 +187,7 @@ guarantee.
 
 ## Holdings and selling everything
 
-`trade/<wallet>/holdings.json` lists every token account the trading account
+`trade/<wallet>/<index>/holdings.json` lists every token account the trading account
 holds under both token programs: mint, raw and display amount, rent, whether
 it is empty, and for a Pump coin what selling the whole position returns at
 the current curve or pool price, before Pump's fee and slippage.
@@ -201,7 +203,7 @@ the claim declares and the review shows.
 
 ## Launching a coin
 
-Write to `trade/<wallet>/launch.json`:
+Write to `trade/<wallet>/<index>/launch.json`:
 
 ```json
 {"operationId":"launch-1","name":"My Coin","symbol":"MYC","amount":"10000000",
@@ -249,14 +251,14 @@ when you place it, and it stays valid until it fills or you cancel it.
 
 ```sh
 # once: an order slot, a nonce account the trading account owns (RPC-quoted rent)
-echo '{"operationId":"slot-0","slot":0}' > trade/<wallet>/order_slot.json
+echo '{"operationId":"slot-0","slot":0}' > trade/<wallet>/<index>/order_slot.json
 # place: buy up to 0.05 SOL with a price limit derived from a 30 SOL market cap
-echo '{"operationId":"dip-1","mint":"<mint>","side":"buy","amount":"50000000","marketCapSol":30}' > trade/<wallet>/limit.json
+echo '{"operationId":"dip-1","mint":"<mint>","side":"buy","amount":"50000000","marketCapSol":30}' > trade/<wallet>/<index>/limit.json
 # check, from an agent or a timer: sends any order whose price has arrived
-echo '{}' > trade/<wallet>/check_orders.json
-cat trade/<wallet>/orders.json
+echo '{}' > trade/<wallet>/<index>/check_orders.json
+cat trade/<wallet>/<index>/orders.json
 # cancel
-echo '{"operationId":"cancel-1","order":"dip-1"}' > trade/<wallet>/cancel_order.json
+echo '{"operationId":"cancel-1","order":"dip-1"}' > trade/<wallet>/<index>/cancel_order.json
 ```
 
 An order is an ordinary Pump buy or sell from the builder, validated as any
@@ -367,6 +369,13 @@ validators. The fake host signs with a real Ed25519 key whose public key is the
 payer in `route/tests/pump-builder-fixtures.json`, so a test drives a signature
 that genuinely belongs to the trading account.
 
+`scripts/check-bloom-contract.sh` installs the built package into Bloom's own
+Petal router, at the Bloom revision the script pins, with a two-account wallet,
+and checks that `trade/` lists Bloom's wallets and accounts, that the old
+unscoped paths are gone, and that preflight, a buy and the operation listings
+each use only the account the path names. Point `BLOOM_ROOT` at a Bloom checkout
+of that revision.
+
 Install a reviewed package archive into a running Bloom instance:
 
 ```sh
@@ -378,8 +387,18 @@ the selected account bound to the exact reviewed release before trading.
 
 ## Compatibility
 
-This package needs Bloom with `[sign].fee_asset` (bloom#276) and, for the
+This package needs Bloom with explicit `[wallet]/[index]` Petal routes and
+per-account stores (bloom#328) and `[sign].fee_asset` (bloom#276) and, for the
 ceremony to display the review above rather than an opaque digest, the review
 transport described in `SETUP.md`. It does **not** need bounded session keys
 (bloom#302) or session-key Exact signing (bloom#304); those cover a delegation
 model this Petal no longer uses.
+
+### Upgrading from `trade/<wallet>/`
+
+Earlier builds served trades at `trade/<wallet>/` and kept their records in the
+Petal-wide store. This build cannot read those records. Before upgrading, read
+every `trade/<wallet>/operations/<id>.json` with the installed build until each
+operation is `confirmed`, `finalized`, `chain_failed` or abandoned, and keep
+that package installed until it is. The transactions themselves are on chain;
+only the Petal's record of them stays behind.
