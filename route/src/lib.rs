@@ -2975,22 +2975,54 @@ fn declared_native_total(debits: &[Value], fee: u64) -> Result<u128, String> {
 /// takes no more SOL from the trading account than the claim declares. The
 /// Broker holds the approval to what the claim declares, and cannot see what
 /// a program does inside the transaction; this is where that is checked.
+/// The trading account's balance and the slot it was read at. `at_least`
+/// holds the read until the node has reached that slot, so a balance can be
+/// compared with a simulation that ran on it.
+fn balance_at(payer: &str, at_least: Option<u64>) -> Result<(u64, u64), DispatchResponse> {
+    let mut config = json!({"commitment":COMMITMENT});
+    if let Some(slot) = at_least {
+        config["minContextSlot"] = json!(slot);
+    }
+    let v = post(RPC, &rpc("getBalance", json!([payer, config])))?;
+    let balance = v
+        .pointer("/result/value")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| fail("Solana RPC omitted the trading account's balance"))?;
+    let slot = v
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| fail("Solana RPC omitted the balance's slot"))?;
+    Ok((balance, slot))
+}
 fn simulate_within(tx: &str, payer: &str, declared: u128) -> Result<(), DispatchResponse> {
-    let before = post(
-        RPC,
-        &rpc("getBalance", json!([payer, {"commitment":COMMITMENT}])),
-    )?
-    .pointer("/result/value")
-    .and_then(Value::as_u64)
-    .ok_or_else(|| fail("Solana RPC omitted the trading account's balance"))?;
+    // What the transaction spends is measured as a balance before it minus the
+    // balance the simulation leaves, and those are two separate observations of
+    // the chain. SOL arriving between them would make the difference smaller
+    // than the transaction really costs, and this is the check that refuses a
+    // transaction taking more than the claim declared, so it must not be
+    // possible to widen by paying the account. The balance is read twice, once
+    // before the simulation and once held until the node has reached the slot
+    // the simulation ran on, and the spend is measured from the larger reading.
+    // A concurrent movement can then only overstate the spend and refuse a
+    // transaction that was within its declaration, which is the safe direction:
+    // the approval is kept and the retry rebuilds. What this still cannot see
+    // is a deposit and a withdrawal that bracket the simulated slot inside one
+    // pair of reads; nothing the RPC exposes gives the simulation's own
+    // pre-state atomically.
+    let (first, _) = balance_at(payer, None)?;
     let (v, after) = simulate_accounts(tx, &[payer.to_owned()])?;
     simulation_result(&v).map_err(fail)?;
+    let slot = v
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| fail("Solana RPC omitted the simulation's slot"))?;
     let after = after
         .first()
         .copied()
         .flatten()
         .ok_or_else(|| fail("Solana RPC omitted the trading account's simulated balance"))?;
-    let spent = before.saturating_sub(after);
+    let (second, _) = balance_at(payer, Some(slot))?;
+    let spent = first.max(second).saturating_sub(after);
     if u128::from(spent) > declared {
         return Err(fail(format!(
             "simulation failed: the transaction takes {} from the trading account, more than the {} declared for approval",
@@ -6614,6 +6646,48 @@ mod tests {
         // Within what was declared, it signs.
         fake_host::with(|host| host.chain.spend = 1_000_000);
         assert_eq!(run_buy("buy-overspend", false), DispatchResponse::Write);
+    }
+
+    /// The balance before and the simulation's balance after are two separate
+    /// readings of the chain, so SOL arriving between them would hide what the
+    /// transaction really spends. Anyone can pay the trading account, so that
+    /// would be a way to widen the only check that holds a transaction to what
+    /// the claim declared. The spend is measured from the larger of a reading
+    /// taken before the simulation and one held until the simulated slot.
+    #[test]
+    fn a_deposit_between_the_balance_readings_cannot_widen_the_declared_spend() {
+        let mut host = host_serving_a_buy();
+        host.chain.balance = 1_000_000_000;
+        host.chain.spend = 50_000_000;
+        // Read before the simulation: the deposit has not landed yet.
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":951_000_000}}),
+        );
+        // Read at the simulated slot: it has.
+        host.reply(
+            &format!("{RPC} getBalance"),
+            json!({"result":{"value":1_000_000_000}}),
+        );
+        fake_host::install(host);
+        let message = dispatch_message(&run_buy("buy-deposit", false));
+        assert!(message.contains("more than the"), "{message}");
+        fake_host::with(|host| {
+            assert!(host.sign_requests.is_empty(), "nothing is signed");
+            let balances = host.calls_for("getBalance");
+            assert_eq!(balances.len(), 2, "the balance is read twice");
+            assert_eq!(
+                balances[1].rpc_params().unwrap()[1]["minContextSlot"],
+                json!(300_000_000),
+                "the second reading is held until the simulated slot"
+            );
+            assert!(
+                balances[0].rpc_params().unwrap()[1]
+                    .get("minContextSlot")
+                    .is_none(),
+                "the first reading is not held"
+            );
+        });
     }
 
     fn sell_message(name: &str, sold: u64, floor: u64) -> Msg {
