@@ -1,1 +1,1 @@
-petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[]));
+petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("latest.md",false,false),("latest.html",false,false),("live.md",false,false),("live.html",false,false),("latest.json",false,false),("live.json",false,false)]));

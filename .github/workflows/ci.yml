@@ -39,16 +39,19 @@ jobs:
         run: |
           scripts/build.sh
           petal check --root .
-      # This package declares [sign].fee_asset, which the Bloom CLI only
-      # accepts since bloom#276 (`pumpfun-fee-classes`). Build the CLI from
-      # that branch until it lands, then flip this ref back to master.
+      # This package declares [sign].fee_asset, which Bloom only accepts since
+      # bloom#276 (`pumpfun-fee-classes`), and uses explicit [wallet]/[index]
+      # routes (bloom#328). Pin #276's head, which includes current master,
+      # until it lands; keep this rev and scripts/check-bloom-contract.sh equal.
       - name: Checkout Bloom CLI
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: pumpfun-fee-classes
+          ref: d033f2b17cbe21ff8e38716fcaecbe7540ce52c1
           path: bloom
           persist-credentials: false
+      - name: Installed package selects only the Bloom account a route names
+        run: BLOOM_ROOT="$GITHUB_WORKSPACE/bloom" scripts/check-bloom-contract.sh
       - name: Build key-free debug Bloom CLI for install smoke tests
         run: cargo build --manifest-path bloom/Cargo.toml -p bloom --bin bloom
       - name: Validate package and static dispatch

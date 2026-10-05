@@ -1,1 +1,2 @@
-petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("preflight.json",false,false),("buy.json",false,true),("sell.json",false,true),("close_token_account.json",false,true),("operations",true,false)]));
+// Bloom supplies live wallet/index directory inventory from the core projection.
+petal::route_file!(spec: petal::static_dir_spec(), list: Vec::new());

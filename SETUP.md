@@ -2,10 +2,10 @@
 
 ## Scope
 
-Buy or sell an existing coin from the Bloom account already selected, and
-optionally close an empty token account afterwards. Each of those is one owner
-approval. Coin creation, fee collection and fee-sharing configuration are not in
-this release and their routes have been removed.
+Buy or sell an existing coin from the Bloom account already selected, launch a
+new coin from it, and optionally close an empty token account afterwards. Each
+of those is one owner approval. Fee collection and fee-sharing configuration
+are not in this release and their routes have been removed.
 
 ## Compatibility
 
@@ -27,7 +27,7 @@ session model this Petal no longer uses.
 
 There is no session to create, no key to derive and no address to fund.
 
-1. `GET trade/<wallet>/preflight.json` — verifies the trading account has a
+1. `GET trade/<wallet>/<index>/preflight.json` — verifies the trading account has a
    readable Solana address, that the RPC is serving mainnet-beta, and that
    Pump's builder is reachable.
 
@@ -40,7 +40,7 @@ There is no session to create, no key to derive and no address to fund.
 2. Make sure wallet policy allows the protocol programs the trade will route
    through. See the table below.
 
-3. `POST trade/<wallet>/buy.json {operationId, mint, amount, minOutputAmount}`.
+3. `POST trade/<wallet>/<index>/buy.json {operationId, mint, amount, minOutputAmount}`.
    The first call returns `approval required` with an `action_id`; complete the
    ceremony, then repeat the identical write to continue.
 
@@ -53,7 +53,7 @@ Bloom compares every destination a claim declares against
 | --- | --- | --- |
 | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Pump bonding curve | a buy or sell before the coin migrates |
 | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` | PumpSwap AMM | a buy or sell after it migrates |
-| the selected Jito tip account | a protected write | only with `frontRunningProtection` |
+| all eight Jito tip accounts | a protected write | every buy and sell, unless `"frontRunningProtection":false` |
 | the trading account's own Solana address | `close_token_account` | returning the rent — see below |
 
 Which Pump program a given mint routes through depends on whether it has
@@ -68,9 +68,11 @@ the write is refused after the owner has already approved it, with
 `CLAIM_INVALID: claim names destination <account> for chain "solana" outside
 wallet policy`. Add it before the first close.
 
-The eight Jito tip accounts the Petal accepts are listed in
-`route/src/lib.rs`. A write declares only the one it selects, and only when
-`frontRunningProtection` is set.
+Swaps are protected by default, and Pump's builder picks one of Jito's eight
+tip accounts at random each time it builds, so the rebuild after approval can
+name a different one: allow all eight (listed in `JITO_TIPS` in
+`route/src/lib.rs`). Without them a protected write stops before asking for
+approval and names the accounts to add; nothing is signed.
 
 Read the current policy before assuming any of this is missing:
 
@@ -169,7 +171,8 @@ So the tolerance is on what the trade spends. The pool can move against the
 owner between building and landing, and the program pays what the curve now
 asks, up to that ceiling; past it the trade fails rather than pay more, which
 is what both failed simulations in that run showed at the 2% default.
-A wider `slippagePct` buys the same tokens and risks more SOL.
+A wider `slippagePct` buys the same tokens and risks more SOL, which is why it
+is capped at 10.
 
 That is why the maximum spend is the figure the review states first and totals
 at the end: it is what can change after the owner has read it.

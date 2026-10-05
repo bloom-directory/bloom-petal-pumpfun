@@ -1,0 +1,1 @@
+petal::route_file!(spec:petal::static_dir_spec(),list:crate::static_list(&[("preflight.json",false,false),("holdings.md",false,false),("holdings.html",false,false),("holdings.json",false,false),("buy.json",false,true),("sell.json",false,true),("close_token_account.json",false,true),("launch.json",false,true),("operations",true,false)]));
