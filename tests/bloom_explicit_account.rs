@@ -166,7 +166,14 @@ async fn trades_run_only_under_the_wallet_and_account_bloom_selected() {
     assert_eq!(names(&vfs, "trade").await, [WALLET]);
     assert_eq!(names(&vfs, "trade/alice").await, ["0", "1"]);
     let leaves = names(&vfs, "trade/alice/1").await;
-    for leaf in ["buy.json", "sell.json", "preflight.json", "operations"] {
+    for leaf in [
+        "buy.json",
+        "sell.json",
+        "launch.json",
+        "holdings.html",
+        "preflight.json",
+        "operations",
+    ] {
         assert!(leaves.iter().any(|name| name == leaf), "{leaves:?}");
     }
 
@@ -219,6 +226,35 @@ async fn trades_run_only_under_the_wallet_and_account_bloom_selected() {
         .await
         .expect_err("the fixture refuses the builder");
     eprintln!("account 1 buy refused as expected: {refused}");
+    let requests = host.http.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains(ADDRESSES[1])),
+        "{requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains(ADDRESSES[0]))
+    );
+    assert_eq!(*host.signing_attempts.lock().unwrap(), 0);
+
+    // A launch makes account 1 the coin's creator and payer, the same way.
+    host.http.lock().unwrap().clear();
+    let launch = serde_json::to_vec(&serde_json::json!({
+        "operationId": "launch-1",
+        "name": "Fixture Coin",
+        "symbol": "FIX",
+        "amount": "1000000",
+        "uri": "https://example.com/coin.json",
+    }))
+    .unwrap();
+    let refused = vfs
+        .write(&mounted("trade/alice/1/launch.json"), &launch)
+        .await
+        .expect_err("the fixture refuses the builder");
+    eprintln!("account 1 launch refused as expected: {refused}");
     let requests = host.http.lock().unwrap().clone();
     assert!(
         requests

@@ -179,12 +179,14 @@ impl FakeHost {
     }
 
     fn fetch(&mut self, request: &HttpRequest) -> Result<HttpResponse, SdkError> {
+        // A multipart upload is recorded as text, so a test can see what
+        // was sent.
         let body: Value = if request.body.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&request.body).map_err(|error| {
-                SdkError::Message(format!("fake host: unreadable body: {error}"))
-            })?
+            serde_json::from_slice(&request.body).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(&request.body).into_owned())
+            })
         };
         let call = Call {
             method: request.method.clone(),

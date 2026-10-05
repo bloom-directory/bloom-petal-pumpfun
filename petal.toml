@@ -10,7 +10,7 @@ command = "scripts/build.sh"
 outputs = ["petal/pumpfun"]
 
 [consent]
-summary = "List the latest and live Pump.fun coins, see what the selected Bloom account holds, and buy or sell an existing coin from the Bloom account you selected. Every trade is one operation you approve in Bloom, capped at the SOL ceiling the approval shows, and rebuilt with a fresh blockhash after you approve; no session key, no separate wallet and no standing budget. An empty token account can be closed, returning its rent to the same account. Coin creation, fee collection and fee sharing are not supported."
+summary = "List the latest and live Pump.fun coins, check a coin's holders, creator and launch for risks, chart its price and list its trades, see what the selected Bloom account holds, and buy or sell an existing coin from the Bloom account you selected. Every trade is one operation you approve in Bloom, capped at the SOL ceiling the approval shows, and rebuilt with a fresh blockhash after you approve; no session key, no separate wallet and no standing budget. Launch a new coin with that account as its creator and a first buy, approved the same way; an uploaded image and metadata are pinned to IPFS through Pump before approval. An empty token account can be closed, returning its rent to the same account. Fee collection and fee sharing are not supported."
 
 [caps]
 allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
@@ -19,13 +19,25 @@ allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
 binding = "pump"
 host = "fun-block.pump.fun"
 methods = ["post"]
-paths = ["/agents/swap"]
+paths = ["/agents/swap", "/agents/create-coin"]
+
+[[net.allow]]
+binding = "pump-metadata"
+host = "pump.fun"
+methods = ["post"]
+paths = ["/api/ipfs"]
 
 [[net.allow]]
 binding = "coins"
 host = "frontend-api-v3.pump.fun"
 methods = ["get"]
-paths = ["/coins-v2/*", "/coins", "/coins/currently-live"]
+paths = ["/coins-v2/*", "/coins", "/coins/currently-live", "/coins/top-holders/*"]
+
+[[net.allow]]
+binding = "pump-trades"
+host = "swap-api.pump.fun"
+methods = ["get"]
+paths = ["/v2/coins/*/candles", "/v2/coins/*/trades"]
 
 [[net.allow]]
 binding = "solana"
@@ -46,7 +58,7 @@ methods = ["post"]
 paths = ["/api/v1/transactions"]
 
 [sign]
-allowed_intents = ["pumpfun.buy", "pumpfun.sell", "pumpfun.close_token_account"]
+allowed_intents = ["pumpfun.buy", "pumpfun.sell", "pumpfun.close_token_account", "pumpfun.launch"]
 fee_asset = { chain = "solana", asset = "native" }
 
 [store]
