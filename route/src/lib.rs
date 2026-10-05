@@ -2964,9 +2964,17 @@ pub(crate) fn holdings_value(c: &Ctx, w: String) -> Result<Value, DispatchRespon
             let amount = info
                 .and_then(|i| i.pointer("/tokenAmount/amount"))
                 .and_then(Value::as_str);
+            // The mint and the token account are the RPC's words, and they go
+            // on to name a link, a page and a request path. Only an address
+            // the RPC could actually have read is kept.
             let (Some(token_account), Some(mint), Some(amount)) = (
-                entry.get("pubkey").and_then(Value::as_str),
-                info.and_then(|i| i.get("mint")).and_then(Value::as_str),
+                entry
+                    .get("pubkey")
+                    .and_then(Value::as_str)
+                    .filter(|a| pk(a).is_ok()),
+                info.and_then(|i| i.get("mint"))
+                    .and_then(Value::as_str)
+                    .filter(|m| pk(m).is_ok()),
                 amount,
             ) else {
                 continue;
@@ -7175,6 +7183,37 @@ mod tests {
             assert!(host.calls.iter().all(|c| c.url != SWAP_URL));
             assert!(host.sign_requests.is_empty());
         });
+    }
+
+    /// Holdings carry whatever mint and token account the RPC named, and each
+    /// goes on to name a link, a page and a request path. An address the RPC
+    /// could not have read is not one: the entry is dropped.
+    #[test]
+    fn a_token_account_the_rpc_misnames_is_left_out_of_holdings() {
+        let mut host = host_serving_a_buy();
+        host.reply(
+            &format!("{RPC_VERIFY} getTokenAccountsByOwner"),
+            json!({"result":{"value":[
+                {"pubkey": "x\" onmouseover=alert(1) y=\"", "account": {
+                    "owner": PROGRAMS[3], "lamports": 2_039_280,
+                    "data": {"parsed": {"info": {"mint": BOND_MINT,
+                        "tokenAmount": {"amount": "1", "decimals": 6, "uiAmountString": "1"}}}}}},
+                {"pubkey": TOKEN_ACCOUNT, "account": {
+                    "owner": PROGRAMS[3], "lamports": 2_039_280,
+                    "data": {"parsed": {"info": {"mint": "../../../etc/passwd",
+                        "tokenAmount": {"amount": "1", "decimals": 6, "uiAmountString": "1"}}}}}}
+            ]}}),
+        );
+        fake_host::install(host);
+        let body = match holdings(&ctx(&ACCOUNT_ZERO), WALLET.to_owned()) {
+            DispatchResponse::Read(bytes) => bytes,
+            other => panic!("{other:?}"),
+        };
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["tokens"].as_array().unwrap().len(), 0, "{v}");
+        let rendered = String::from_utf8(body).unwrap();
+        assert!(!rendered.contains("onmouseover"), "{rendered}");
+        assert!(!rendered.contains("passwd"), "{rendered}");
     }
 
     #[test]

@@ -100,7 +100,7 @@ fn listing_at(listing: Listing, format: Format, prefix: &str) -> DispatchRespons
             let cards = coins
                 .iter()
                 .map(|coin| {
-                    let mint = coin["mint"].as_str().unwrap_or("");
+                    let mint = id(coin["mint"].as_str().unwrap_or(""));
                     let symbol = coin["symbol"].as_str().unwrap_or("?");
                     let progress = coin["curveProgressPct"].as_f64();
                     let status = if let Some(label) = quote_label(coin) {
@@ -295,6 +295,7 @@ fn coin_markdown(
     trades: Option<&Value>,
     now: u64,
 ) -> String {
+    let m = id(m);
     let symbol = cell(summary["symbol"].as_str().unwrap_or("?"));
     let name = cell(summary["name"].as_str().unwrap_or(""));
     let title = if name.is_empty() || name.eq_ignore_ascii_case(&symbol) {
@@ -397,6 +398,7 @@ fn coin_html(
     trades: Option<&Value>,
     now: u64,
 ) -> String {
+    let m = id(m);
     let symbol = summary["symbol"].as_str().unwrap_or("?");
     let mut out = format!(
         "<header class=\"head coinhead\">{avatar}<div><h1>{sym} <span class=muted>{name}</span></h1><div class=muted><code id=mint>{m}</code> <button id=copy type=button>Copy</button></div><div class=tags><span class=pill>{status}</span><span class=pill>launched {age} ago</span><span class=pill>{stamp}</span></div></div></header>",
@@ -495,8 +497,8 @@ fn coin_html(
             } else {
                 "sell"
             };
-            let wallet = t["wallet"].as_str().unwrap_or("");
-            let tx = t["tx"].as_str().unwrap_or("");
+            let wallet = id(t["wallet"].as_str().unwrap_or(""));
+            let tx = id(t["tx"].as_str().unwrap_or(""));
             out.push_str(&format!(
                 "<tr><td><a href=\"https://solscan.io/tx/{tx}\" rel=noreferrer>{when}</a></td><td class={side}>{arrow} {side}</td><td class=num>{sol}</td><td class=num>{tokens}</td><td><a href=\"https://solscan.io/account/{wallet}\" rel=noreferrer><code>{short}</code></a></td></tr>",
                 when = iso_ms(t["time"].as_str().unwrap_or(""))
@@ -837,7 +839,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
         .iter()
         .take(NAMED_HOLDINGS)
         .filter_map(|t| {
-            let mint = t["mint"].as_str()?;
+            let mint = t["mint"].as_str().map(id).filter(|mint| !mint.is_empty())?;
             let record = fetch("GET", format!("{COINS}/{mint}"), vec![]).ok()?;
             Some((
                 mint.to_owned(),
@@ -867,7 +869,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
             let rows = held
                 .iter()
                 .map(|t| {
-                    let mint = t["mint"].as_str().unwrap_or("");
+                    let mint = id(t["mint"].as_str().unwrap_or(""));
                     let (symbol, name) = names
                         .get(mint)
                         .cloned()
@@ -907,7 +909,7 @@ pub fn holdings(c: &Ctx, w: String, format: Format) -> DispatchResponse {
             let rows = held
                 .iter()
                 .map(|t| {
-                    let mint = t["mint"].as_str().unwrap_or("");
+                    let mint = id(t["mint"].as_str().unwrap_or(""));
                     let (symbol, name) = names
                         .get(mint)
                         .cloned()
@@ -1146,6 +1148,25 @@ fn cell(text: &str) -> String {
         .collect()
 }
 
+/// A chain identifier as it may appear in a page or a request: base58 and
+/// nothing else, so it cannot close an attribute or change a link's path.
+/// Anything else is not an identifier Pump or the chain could have returned,
+/// so it renders as nothing.
+///
+/// Coin listings and Pump's trades are already narrowed where they are read,
+/// and a coin page's mint is a route parameter Bloom validated. Holdings are
+/// not: they carry whatever mint and token account the RPC named. This is the
+/// render boundary, so the invariant is stated here as well as there, and
+/// holds for every page whatever reaches it.
+pub(crate) fn id(text: &str) -> &str {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if !text.is_empty() && text.len() <= 96 && text.chars().all(|c| BASE58.contains(c)) {
+        text
+    } else {
+        ""
+    }
+}
+
 pub(crate) fn html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -1222,10 +1243,15 @@ fn compact(amount: f64) -> String {
 }
 
 fn short(address: &str) -> String {
-    if address.len() <= 12 {
+    let count = address.chars().count();
+    if count <= 12 {
         return address.to_owned();
     }
-    format!("{}…{}", &address[..5], &address[address.len() - 5..])
+    let at = |n: usize| address.char_indices().nth(n).map(|(at, _)| at);
+    match (at(5), at(count - 5)) {
+        (Some(head), Some(tail)) => format!("{}…{}", &address[..head], &address[tail..]),
+        _ => address.to_owned(),
+    }
 }
 
 fn duration(ms: u64) -> String {
@@ -1532,6 +1558,23 @@ mod tests {
             html("<script>'x'&\"y\"</script>"),
             "&lt;script&gt;&#39;x&#39;&amp;&quot;y&quot;&lt;/script&gt;"
         );
+    }
+
+    /// Mints, signatures and addresses are written into link paths and
+    /// attributes, and they come from Pump's API and from the chain rather
+    /// than from this Petal. Only base58 reaches a page.
+    #[test]
+    fn a_chain_identifier_cannot_escape_a_link_or_an_attribute() {
+        assert_eq!(id(MINT), MINT);
+        assert_eq!(id("x\" onmouseover=alert(1) y=\""), "");
+        assert_eq!(id("../../secret"), "");
+        assert_eq!(id("not/a/mint"), "");
+        assert_eq!(id(""), "");
+        assert_eq!(id("0OIl"), "", "base58 leaves out the ambiguous four");
+        // Shortening is by character, so an address that is not ASCII cannot
+        // slice a byte that is not a character boundary.
+        assert_eq!(short("火火火火火火火火火火火火火"), "火火火火火…火火火火火");
+        assert_eq!(short("short"), "short");
     }
 
     #[test]
