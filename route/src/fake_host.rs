@@ -204,7 +204,7 @@ impl FakeHost {
         };
         self.calls.push(call);
         if let Some(reply) = synthesized {
-            return Ok(json_response(&reply));
+            return Ok(json_response(&with_context(&reply)));
         }
         let Some(replies) = self.replies.get(&key) else {
             return Err(SdkError::Message(format!(
@@ -227,7 +227,7 @@ impl FakeHost {
             let call = self.calls.last().expect("recorded").clone();
             self.fill_simulated_accounts(&call, &mut reply);
         }
-        Ok(json_response(&reply))
+        Ok(json_response(&with_context(&reply)))
     }
 
     fn account_view(&self, address: &str) -> Value {
@@ -292,6 +292,23 @@ impl FakeHost {
     }
 }
 
+/// The slot every synthesized or scripted reply is read at. Solana's RPC
+/// puts one on each response, and the trade checks compare a balance with a
+/// simulation that ran on the same slot.
+const CONTEXT_SLOT: u64 = 300_000_000;
+
+/// A reply with the slot it was read at, when its result is an object that
+/// does not carry one already.
+fn with_context(reply: &Value) -> Value {
+    let mut reply = reply.clone();
+    if let Some(result) = reply.get_mut("result")
+        && result.is_object()
+        && result.get("context").is_none()
+    {
+        result["context"] = serde_json::json!({"slot": CONTEXT_SLOT});
+    }
+    reply
+}
 fn json_response(reply: &Value) -> HttpResponse {
     HttpResponse {
         status: 200,
