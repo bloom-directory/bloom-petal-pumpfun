@@ -6296,6 +6296,9 @@ mod tests {
                 "amount": builder_request["amount"],
                 "minOutputAmount": quoted,
                 "slippagePct": builder_request["slippagePct"],
+                "frontRunningProtection": builder_request["frontRunningProtection"],
+                // The builder takes lamports; the route takes SOL.
+                "tipAmount": builder_request["tipAmount"].as_u64().expect("tip lamports") as f64 / 1_000_000_000.0,
             });
             let mut normalized = body.as_object().expect("body").clone();
             if let Err(error) = normalize(action, user, &mut normalized) {
