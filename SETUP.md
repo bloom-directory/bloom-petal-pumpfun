@@ -12,7 +12,8 @@ are not in this release and their routes have been removed.
 | Requirement | Why | State |
 | --- | --- | --- |
 | `[sign].fee_asset` in `petal.toml` | Bloom must know which asset the declared fee is in | bloom#276, unreleased |
-| review transport to the ceremony | otherwise the owner approves an opaque digest | see "What the owner sees" |
+| reusable approval replacement and signing outcome handling | repeated trades and uncertain signing retries must recover correctly | bloom#329 signing changes and bloom#325, unreleased |
+| review transport to the ceremony | otherwise the owner sees declared totals but not the app's trade description | see "What the owner sees" |
 
 Bloom v0.3.0 refuses to install this package: it does not recognize
 `[sign].fee_asset`. Record the first Bloom release containing it here when it
@@ -101,22 +102,24 @@ payload as the SDK's `advisory` bytes, a bounded versioned object:
 {"schema":"bloom.petal.review.v1","items":["Buy on Pump.fun","Trading account: …"]}
 ```
 
-Bloom hashes those bytes into the approval's canonical facts, so an approval
-prepared for one review cannot sign a different one — changing the review
-changes the facts digest and the retry is refused as a different operation.
+This Petal uses a **Reusable** selector for one operation. Its approval binds
+the package, route, account, operation class and declared-value limits. It does
+not bind the advisory to the coin or to exact transaction bytes. The earlier
+statement that changing this review always changes the approval's canonical
+facts was incorrect for this path.
 
-**On Bloom master those bytes are hashed and go nowhere**: the daemon puts an
-`advisory_digest` in its canonical facts and passes no advisory to
-`sign_or_prepare_petal`, and Broker's `prepare_approval` sets
-`attributed_advisory_items: Vec::new()`. The ceremony then shows the claim's
-declared debits, destinations and fee — real figures, already rendered with SOL
-units — but not the minimum output or the direction. On a build carrying the
-review transport the page shows the lines above, attributed to the app, in
-their own block. A live run confirmed it: see
-`shared/pumpfun-direct-live-2026-09-22/`.
+On default Bloom, the reusable path does not forward those bytes to Broker.
+The ceremony shows the claim's declared debits, destinations and fee, already
+rendered with SOL units, but not the app's detailed trade description. The
+developer review candidate adds transport in Bloom and Broker so the page also
+shows the advisory lines in a separate block attributed to the app. This
+description is a snapshot of the staged transaction when approval is prepared;
+the Petal rebuilds the transaction after approval with a fresh blockhash.
 
-Bloom does not verify any of it. The page says so, and the review is worded as
-the app's own statement for that reason.
+Broker does not independently verify the advisory's economics. Its page says
+“Bloom has not checked these statements.” Displaying a mint or minimum output
+does not add an enforcement constraint to the reusable approval. The final
+transaction and its recomputed review remain in the Petal's operation record.
 
 ## Approval and retry continuation
 

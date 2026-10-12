@@ -6296,6 +6296,8 @@ mod tests {
                 "amount": builder_request["amount"],
                 "minOutputAmount": quoted,
                 "slippagePct": builder_request["slippagePct"],
+                "frontRunningProtection": builder_request["frontRunningProtection"],
+                "tipAmount": builder_request["tipAmount"],
             });
             let mut normalized = body.as_object().expect("body").clone();
             if let Err(error) = normalize(action, user, &mut normalized) {
