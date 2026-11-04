@@ -16,7 +16,9 @@ and the network fee cap. After
 the owner approves, the Petal rebuilds the transaction with a fresh blockhash
 and signs it under that approval, because a blockhash lives about a minute and
 a ceremony can take most of it. The approval is scoped to this package, route,
-account and kind of trade, and capped in SOL; it does not name the coin.
+account and kind of trade, and capped in SOL. With the developer review combination in `SETUP.md`,
+Bloom also binds the Solana message except its recent blockhash; changing the
+coin or other message bytes requires a new approval.
 
 Fee collection and fee-sharing configuration are not part of this release.
 Their routes are gone, not merely disabled.
@@ -32,8 +34,9 @@ back out of the bytes that were just validated: the trading account, the token,
 **the maximum the trade can spend** (or, for a sell, the amount sold and the
 least SOL the instruction may return), the tokens a buy names, the network fee,
 rent for every account the trade creates, any Jito tip, and for a buy the
-worst-case total. These figures are the Petal's and are labelled as such —
-Bloom does not independently re-derive them.
+worst-case total. The Petal supplies this review as additional context. In the developer review
+combination, Broker independently decodes and verifies the actual Solana message;
+see `SETUP.md` for the required transport.
 
 Rent is measured, not estimated. Pump's program creates accounts the builder's
 instructions never mention — a first buy also opens a per-user volume-rewards

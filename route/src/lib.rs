@@ -6233,43 +6233,44 @@ mod tests {
             Err(_) => panic!("set PUMPFUN_LIVE_BUILDER_DIR, or run scripts/check-live-builder.sh"),
         };
         let mut checked = 0;
-        for label in ["buy_bond", "buy_amm", "sell_bond", "sell_amm"] {
+        for label in [
+            "buy_bond",
+            "buy_bond_protected",
+            "buy_amm",
+            "buy_amm_protected",
+        ] {
             let request_path = format!("{dir}/{label}-request.json");
             let response_path = format!("{dir}/{label}-response.json");
-            let (Ok(request_raw), Ok(response_raw)) = (
-                std::fs::read_to_string(&request_path),
-                std::fs::read_to_string(&response_path),
-            ) else {
-                continue;
-            };
-            let Ok(builder_request) = serde_json::from_str::<Value>(&request_raw) else {
-                continue;
-            };
-            let Ok(response) = serde_json::from_str::<Value>(&response_raw) else {
-                continue;
-            };
-            if response
-                .get("transaction")
-                .and_then(Value::as_str)
-                .is_none()
-            {
-                println!("{label}: builder returned no transaction; skipped");
-                continue;
-            }
+            let request_raw = std::fs::read_to_string(&request_path)
+                .unwrap_or_else(|error| panic!("{label}: {request_path}: {error}"));
+            let response_raw = std::fs::read_to_string(&response_path)
+                .unwrap_or_else(|error| panic!("{label}: {response_path}: {error}"));
+            let builder_request: Value = serde_json::from_str(&request_raw)
+                .unwrap_or_else(|error| panic!("{label}: invalid request: {error}"));
+            let response: Value = serde_json::from_str(&response_raw)
+                .unwrap_or_else(|error| panic!("{label}: invalid response: {error}"));
+            let protected = label.ends_with("_protected");
+            assert_eq!(
+                builder_request["frontRunningProtection"],
+                json!(protected),
+                "{label}: wrong protection setting"
+            );
+            assert_eq!(
+                builder_request["tipAmount"].as_f64(),
+                Some(if protected {
+                    DEFAULT_TIP_LAMPORTS as f64 / 1e9
+                } else {
+                    0.0
+                }),
+                "{label}: wrong tip"
+            );
             checked += 1;
 
-            let action = if label.starts_with("buy") {
-                Action::Buy
-            } else {
-                Action::Sell
-            };
+            let action = Action::Buy;
             let user = builder_request["user"].as_str().expect("request user");
-            let mint = if matches!(action, Action::Buy) {
-                builder_request["outputMint"].as_str()
-            } else {
-                builder_request["inputMint"].as_str()
-            }
-            .expect("request mint");
+            let mint = builder_request["outputMint"]
+                .as_str()
+                .expect("request mint");
 
             // The scale the script agreed across two independent RPCs, written
             // only when they matched. Absent means the review must fall back to
@@ -6312,6 +6313,16 @@ mod tests {
                     dispatch_message(&error)
                 ),
             };
+
+            let program = if label.starts_with("buy_bond") {
+                PROGRAMS[5]
+            } else {
+                PROGRAMS[6]
+            };
+            assert!(
+                protocol_program_of(&parsed).contains(program),
+                "{label}: transaction uses the wrong venue"
+            );
 
             // The review the owner would read, from the validated transaction.
             let review = swap_review(
@@ -6371,10 +6382,7 @@ mod tests {
             );
             assert!(!destinations.is_empty(), "{label}: no declared destination");
         }
-        assert!(
-            checked > 0,
-            "no builder responses were readable under {dir}"
-        );
+        assert_eq!(checked, 4, "all venue/protection cases must validate");
         println!("\nvalidated {checked} live builder transactions");
     }
 

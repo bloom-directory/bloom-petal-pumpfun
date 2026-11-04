@@ -12,7 +12,7 @@ are not in this release and their routes have been removed.
 | Requirement | Why | State |
 | --- | --- | --- |
 | `[sign].fee_asset` in `petal.toml` | Bloom must know which asset the declared fee is in | bloom#276, unreleased |
-| reusable approval replacement and signing outcome handling | repeated trades and uncertain signing retries must recover correctly | bloom#329 signing changes and bloom#325, unreleased |
+| reusable approval replacement and signing outcome handling | repeated trades and uncertain signing retries must recover correctly | [landed signing recovery](https://github.com/bloom-directory/bloom/pull/329); release availability must be checked |
 | review transport to the ceremony | otherwise the owner sees declared totals but not the app's trade description | see "What the owner sees" |
 
 Bloom v0.3.0 refuses to install this package: it does not recognize
@@ -70,9 +70,10 @@ the write is refused after the owner has already approved it, with
 wallet policy`. Add it before the first close.
 
 Swaps are protected by default, and Pump's builder picks one of Jito's eight
-tip accounts at random each time it builds, so the rebuild after approval can
-name a different one: allow all eight (listed in `JITO_TIPS` in
-`route/src/lib.rs`). Without them a protected write stops before asking for
+tip accounts at random each time it builds: allow all eight (listed in
+`JITO_TIPS` in `route/src/lib.rs`). The reviewed-message contract below still
+requires a new approval if a rebuild changes that account. Without the policy
+entries a protected write stops before asking for
 approval and names the accounts to add; nothing is signed.
 
 Read the current policy before assuming any of this is missing:
@@ -95,31 +96,24 @@ or spends above the ceiling they saw.
 
 ## What the owner sees
 
-The Petal builds a review from the validated transaction and sends it with the
-payload as the SDK's `advisory` bytes, a bounded versioned object:
+The developer review combination requires
+[Bloom raw-message transport](https://github.com/bloom-directory/bloom/pull/224)
+and [Broker Solana review](https://github.com/bloom-directory/bloom-broker/pull/103).
+Bloom forwards the actual Ed25519 message to Broker, which independently decodes
+and verifies it for the ceremony. The Petal's app-attributed review is additional
+context, not the source of Broker's verified facts.
 
-```json
-{"schema":"bloom.petal.review.v1","items":["Buy on Pump.fun","Trading account: …"]}
-```
+This Petal uses a **Reusable** selector for one operation. The approval binds
+the package, route, account, operation class and declared-value limits. In the
+review combination, Bloom also persists a binding to the Solana message bytes,
+with one exception: the recent blockhash may refresh after the ceremony. Other
+changes to the message require a new approval. A fresh blockhash does not permit
+changing the mint, instructions, accounts, amounts or chosen Jito tip account.
+The final transaction and its recomputed review remain in the operation record.
 
-This Petal uses a **Reusable** selector for one operation. Its approval binds
-the package, route, account, operation class and declared-value limits. It does
-not bind the advisory to the coin or to exact transaction bytes. The earlier
-statement that changing this review always changes the approval's canonical
-facts was incorrect for this path.
-
-On default Bloom, the reusable path does not forward those bytes to Broker.
-The ceremony shows the claim's declared debits, destinations and fee, already
-rendered with SOL units, but not the app's detailed trade description. The
-developer review candidate adds transport in Bloom and Broker so the page also
-shows the advisory lines in a separate block attributed to the app. This
-description is a snapshot of the staged transaction when approval is prepared;
-the Petal rebuilds the transaction after approval with a fresh blockhash.
-
-Broker does not independently verify the advisory's economics. Its page says
-“Bloom has not checked these statements.” Displaying a mint or minimum output
-does not add an enforcement constraint to the reusable approval. The final
-transaction and its recomputed review remain in the Petal's operation record.
+Default hosts without this transport do not provide that reviewed-message
+contract. Use the compatible developer Triad described above; this document
+does not claim that the combination has shipped in a Bloom release.
 
 ## Approval and retry continuation
 
