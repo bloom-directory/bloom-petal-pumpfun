@@ -15,7 +15,7 @@
 #
 # <account> is any existing Solana address. Its balance decides whether a buy
 # can simulate; a sell needs a token balance and is reported as unsimulatable
-# without one.
+# without one, but is still validated and reviewed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ACCOUNT="${1:?usage: check-live-builder.sh <account> <out-dir>}"
@@ -121,8 +121,12 @@ LABELS=()
 for side in buy sell; do
   for venue in bond amm; do
     if [ "$venue" = bond ]; then mint="$BOND_MINT"; else mint="$AMM_MINT"; fi
-    build_one "${side}_${venue}" "$side" "$mint" 1000000 2 false 0
-    build_one "${side}_${venue}_protected" "$side" "$mint" 1000000 2 true 0.00001
+    # A sell offers the tokens the matching buy would receive, so its quote
+    # and floor are not rounded to zero.
+    amount=1000000
+    [ "$side" = sell ] && amount="$(jq -r .pumpMintInfo.expectedOutAmount "${OUT}/buy_${venue}-response.json")"
+    build_one "${side}_${venue}" "$side" "$mint" "$amount" 2 false 0
+    build_one "${side}_${venue}_protected" "$side" "$mint" "$amount" 2 true 0.00001
     LABELS+=("${side}_${venue}" "${side}_${venue}_protected")
   done
 done
