@@ -117,15 +117,19 @@ done
 say ""
 
 say "building:"
-for venue in bond amm; do
-  if [ "$venue" = bond ]; then mint="$BOND_MINT"; else mint="$AMM_MINT"; fi
-  build_one "buy_${venue}" buy "$mint" 1000000 2 false 0
-  build_one "buy_${venue}_protected" buy "$mint" 1000000 2 true 0.00001
+LABELS=()
+for side in buy sell; do
+  for venue in bond amm; do
+    if [ "$venue" = bond ]; then mint="$BOND_MINT"; else mint="$AMM_MINT"; fi
+    build_one "${side}_${venue}" "$side" "$mint" 1000000 2 false 0
+    build_one "${side}_${venue}_protected" "$side" "$mint" 1000000 2 true 0.00001
+    LABELS+=("${side}_${venue}" "${side}_${venue}_protected")
+  done
 done
 say ""
 
 say "simulating the unsigned transactions (sigVerify off, blockhash replaced):"
-for label in buy_bond buy_bond_protected buy_amm buy_amm_protected; do
+for label in "${LABELS[@]}"; do
   [ -f "${OUT}/${label}-response.json" ] && simulate_one "$label" || true
 done
 say ""

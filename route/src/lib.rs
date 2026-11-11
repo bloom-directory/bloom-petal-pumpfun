@@ -6233,12 +6233,16 @@ mod tests {
             Err(_) => panic!("set PUMPFUN_LIVE_BUILDER_DIR, or run scripts/check-live-builder.sh"),
         };
         let mut checked = 0;
-        for label in [
-            "buy_bond",
-            "buy_bond_protected",
-            "buy_amm",
-            "buy_amm_protected",
-        ] {
+        let labels = ["buy", "sell"].into_iter().flat_map(|side| {
+            ["bond", "amm"].into_iter().flat_map(move |venue| {
+                [
+                    format!("{side}_{venue}"),
+                    format!("{side}_{venue}_protected"),
+                ]
+            })
+        });
+        for label in labels {
+            let label = label.as_str();
             let request_path = format!("{dir}/{label}-request.json");
             let response_path = format!("{dir}/{label}-response.json");
             let request_raw = std::fs::read_to_string(&request_path)
@@ -6266,11 +6270,13 @@ mod tests {
             );
             checked += 1;
 
-            let action = Action::Buy;
+            let (action, mint_field) = if label.starts_with("buy") {
+                (Action::Buy, "outputMint")
+            } else {
+                (Action::Sell, "inputMint")
+            };
             let user = builder_request["user"].as_str().expect("request user");
-            let mint = builder_request["outputMint"]
-                .as_str()
-                .expect("request mint");
+            let mint = builder_request[mint_field].as_str().expect("request mint");
 
             // The scale the script agreed across two independent RPCs, written
             // only when they matched. Absent means the review must fall back to
@@ -6314,7 +6320,7 @@ mod tests {
                 ),
             };
 
-            let program = if label.starts_with("buy_bond") {
+            let program = if label.contains("_bond") {
                 PROGRAMS[5]
             } else {
                 PROGRAMS[6]
@@ -6382,7 +6388,7 @@ mod tests {
             );
             assert!(!destinations.is_empty(), "{label}: no declared destination");
         }
-        assert_eq!(checked, 4, "all venue/protection cases must validate");
+        assert_eq!(checked, 8, "every side/venue/protection case must validate");
         println!("\nvalidated {checked} live builder transactions");
     }
 
