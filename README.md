@@ -254,8 +254,9 @@ Unsigned and signed transaction material is stored only in the secret namespace.
 The unsigned transaction is simulated before signing, and the intent to
 broadcast is recorded before broadcasting. Read
 `operations/<operationId>.json` for durable build, approval, broadcast,
-confirmation, failure and finalization status, and for the review the owner was
-shown.
+confirmation, failure and finalization status, and for the Petal's own review of
+the transaction. The approval page shows Broker's decoding of the signed message
+instead.
 
 Retrying means writing the identical request under the same `operationId`. What
 it does depends on where the operation stopped:
@@ -319,8 +320,8 @@ the selected account bound to the exact reviewed release before trading.
 
 This package needs Bloom with explicit `[wallet]/[index]` Petal routes and
 per-account stores (bloom#328) and `[sign].fee_asset` (bloom#276) and, for the
-ceremony to display the review above rather than an opaque digest, the review
-transport described in `SETUP.md`. It does **not** need bounded session keys
+ceremony to show the decoded Solana message rather than an opaque digest, the
+raw-message transport described in `SETUP.md`. It does **not** need bounded session keys
 (bloom#302) or session-key Exact signing (bloom#304); those cover a delegation
 model this Petal no longer uses.
 

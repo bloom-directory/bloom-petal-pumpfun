@@ -100,8 +100,9 @@ The developer review combination requires
 [Bloom raw-message transport](https://github.com/bloom-directory/bloom/pull/224)
 and [Broker Solana review](https://github.com/bloom-directory/bloom-broker/pull/103).
 Bloom forwards the actual Ed25519 message to Broker, which independently decodes
-and verifies it for the ceremony. The Petal's app-attributed review is additional
-context, not the source of Broker's verified facts.
+and verifies it for the ceremony. The approval page shows only that decoding and
+the declared value limits. The Petal's own review is not forwarded to it; read it
+in `operations/<operationId>.json`.
 
 This Petal uses a **Reusable** selector for one operation. The approval binds
 the package, route, account, operation class and declared-value limits. In the
