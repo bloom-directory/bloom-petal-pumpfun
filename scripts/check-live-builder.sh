@@ -15,7 +15,7 @@
 #
 # <account> is any existing Solana address. Its balance decides whether a buy
 # can simulate; a sell needs a token balance and is reported as unsimulatable
-# without one.
+# without one, but is still validated and reviewed.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ACCOUNT="${1:?usage: check-live-builder.sh <account> <out-dir>}"
@@ -31,14 +31,14 @@ SOL=So11111111111111111111111111111111111111112
 say() { printf '%s\n' "$*"; }
 
 build_one() {
-  # build_one <label> <side: buy|sell> <mint> <amount> <slippage>
+  # build_one <label> <side: buy|sell> <mint> <amount> <slippage> <protected> <tip SOL>
   local label="$1" side="$2" mint="$3" amount="$4" slip="$5"
-  local input output
+  local protected="$6" tip="$7" input output
   if [ "$side" = buy ]; then input="$SOL"; output="$mint"; else input="$mint"; output="$SOL"; fi
   jq -nc --arg i "$input" --arg o "$output" --arg a "$amount" --arg u "$ACCOUNT" \
-     --argjson s "$slip" \
+     --argjson s "$slip" --argjson protected "$protected" --argjson tip "$tip" \
     '{inputMint:$i, outputMint:$o, amount:$a, user:$u, feePayer:$u,
-      slippagePct:$s, frontRunningProtection:false, tipAmount:0, encoding:"base64"}' \
+      slippagePct:$s, frontRunningProtection:$protected, tipAmount:$tip, encoding:"base64"}' \
     > "${OUT}/${label}-request.json"
   curl -s -m 30 -X POST -H 'content-type: application/json' \
     --data @"${OUT}/${label}-request.json" "$BUILDER" > "${OUT}/${label}-response.json" || true
@@ -117,12 +117,23 @@ done
 say ""
 
 say "building:"
-build_one buy_bond buy "$BOND_MINT" 1000000 2 || true
-build_one buy_amm buy "$AMM_MINT" 1000000 2 || true
+LABELS=()
+for side in buy sell; do
+  for venue in bond amm; do
+    if [ "$venue" = bond ]; then mint="$BOND_MINT"; else mint="$AMM_MINT"; fi
+    # A sell offers the tokens the matching buy would receive, so its quote
+    # and floor are not rounded to zero.
+    amount=1000000
+    [ "$side" = sell ] && amount="$(jq -r .pumpMintInfo.expectedOutAmount "${OUT}/buy_${venue}-response.json")"
+    build_one "${side}_${venue}" "$side" "$mint" "$amount" 2 false 0
+    build_one "${side}_${venue}_protected" "$side" "$mint" "$amount" 2 true 0.00001
+    LABELS+=("${side}_${venue}" "${side}_${venue}_protected")
+  done
+done
 say ""
 
 say "simulating the unsigned transactions (sigVerify off, blockhash replaced):"
-for label in buy_bond buy_amm; do
+for label in "${LABELS[@]}"; do
   [ -f "${OUT}/${label}-response.json" ] && simulate_one "$label" || true
 done
 say ""

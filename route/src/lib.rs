@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use petal::{
-    Ctx, DispatchResponse, HostStatus, HttpRequest, PayloadSignRequest, SdkError, SignOutcome,
-    SignSelector,
+    Ctx, DispatchResponse, HostStatus, HttpRequest, HttpResponse, PayloadSignRequest, SdkError,
+    SignOutcome, SignSelector,
 };
 use serde::{Deserialize, Serialize};
 pub use serde_json::json;
@@ -380,15 +380,35 @@ fn fetch_within(
     let r = host::http(
         &HttpRequest {
             method: method.into(),
-            url,
+            url: url.clone(),
             headers: vec![("content-type".into(), "application/json".into())],
             body,
         },
         max_bytes,
     )
     .map_err(|e| fail(sdk_message(&e)))?;
-    let v: Value =
-        serde_json::from_slice(&r.body).map_err(|e| fail(format!("invalid remote JSON: {e}")))?;
+    remote_json(&url, &r)
+}
+fn remote_json(url: &str, r: &HttpResponse) -> Result<Value, DispatchResponse> {
+    let Ok(v) = serde_json::from_slice::<Value>(&r.body) else {
+        let host = url
+            .split_once("://")
+            .map_or(url, |(_, rest)| rest)
+            .split(['/', '?'])
+            .next()
+            .unwrap_or_default();
+        let challenged = r.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cf-mitigated") && value.eq_ignore_ascii_case("challenge")
+        });
+        return Err(fail(if challenged {
+            format!(
+                "{host} answered HTTP {} with a Cloudflare challenge: Pump's API is not reachable from this network",
+                r.status
+            )
+        } else {
+            format!("{host} answered HTTP {} without a JSON body", r.status)
+        }));
+    };
     if !(200..300).contains(&r.status) || v.get("error").is_some() {
         Err(fail(format!("remote rejected request: {}", safe(&v))))
     } else {
@@ -4274,6 +4294,42 @@ mod tests {
         );
     }
     #[test]
+    fn a_non_json_reply_names_the_host_status_and_any_cloudflare_challenge() {
+        let reply = |status, headers: Vec<(&str, &str)>, body: &[u8]| HttpResponse {
+            status,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            body: body.to_vec(),
+        };
+        let url = "https://fun-block.pump.fun/agents/swap";
+        let challenge = reply(
+            403,
+            vec![("cf-mitigated", "challenge")],
+            b"<!DOCTYPE html><title>Just a moment...</title>",
+        );
+        assert_eq!(
+            dispatch_message(&remote_json(url, &challenge).unwrap_err()),
+            "fun-block.pump.fun answered HTTP 403 with a Cloudflare challenge: Pump's API is not reachable from this network"
+        );
+        let html = reply(502, vec![], b"<html>Bad gateway</html>");
+        assert_eq!(
+            dispatch_message(&remote_json(url, &html).unwrap_err()),
+            "fun-block.pump.fun answered HTTP 502 without a JSON body"
+        );
+        let refused = reply(400, vec![], br#"{"message":"bad mint"}"#);
+        assert!(
+            dispatch_message(&remote_json(url, &refused).unwrap_err())
+                .contains("remote rejected request")
+        );
+        assert_eq!(
+            remote_json(url, &reply(200, vec![], br#"{"ok":true}"#)).unwrap(),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
     fn zero_output_sell_quotes_are_rejected() {
         for (fixture_name, mint) in [("sell_bond", BOND_MINT), ("sell_amm", AMM_MINT)] {
             let response = fixture(fixture_name);
@@ -6233,43 +6289,50 @@ mod tests {
             Err(_) => panic!("set PUMPFUN_LIVE_BUILDER_DIR, or run scripts/check-live-builder.sh"),
         };
         let mut checked = 0;
-        for label in ["buy_bond", "buy_amm", "sell_bond", "sell_amm"] {
+        let labels = ["buy", "sell"].into_iter().flat_map(|side| {
+            ["bond", "amm"].into_iter().flat_map(move |venue| {
+                [
+                    format!("{side}_{venue}"),
+                    format!("{side}_{venue}_protected"),
+                ]
+            })
+        });
+        for label in labels {
+            let label = label.as_str();
             let request_path = format!("{dir}/{label}-request.json");
             let response_path = format!("{dir}/{label}-response.json");
-            let (Ok(request_raw), Ok(response_raw)) = (
-                std::fs::read_to_string(&request_path),
-                std::fs::read_to_string(&response_path),
-            ) else {
-                continue;
-            };
-            let Ok(builder_request) = serde_json::from_str::<Value>(&request_raw) else {
-                continue;
-            };
-            let Ok(response) = serde_json::from_str::<Value>(&response_raw) else {
-                continue;
-            };
-            if response
-                .get("transaction")
-                .and_then(Value::as_str)
-                .is_none()
-            {
-                println!("{label}: builder returned no transaction; skipped");
-                continue;
-            }
+            let request_raw = std::fs::read_to_string(&request_path)
+                .unwrap_or_else(|error| panic!("{label}: {request_path}: {error}"));
+            let response_raw = std::fs::read_to_string(&response_path)
+                .unwrap_or_else(|error| panic!("{label}: {response_path}: {error}"));
+            let builder_request: Value = serde_json::from_str(&request_raw)
+                .unwrap_or_else(|error| panic!("{label}: invalid request: {error}"));
+            let response: Value = serde_json::from_str(&response_raw)
+                .unwrap_or_else(|error| panic!("{label}: invalid response: {error}"));
+            let protected = label.ends_with("_protected");
+            assert_eq!(
+                builder_request["frontRunningProtection"],
+                json!(protected),
+                "{label}: wrong protection setting"
+            );
+            assert_eq!(
+                builder_request["tipAmount"].as_f64(),
+                Some(if protected {
+                    DEFAULT_TIP_LAMPORTS as f64 / 1e9
+                } else {
+                    0.0
+                }),
+                "{label}: wrong tip"
+            );
             checked += 1;
 
-            let action = if label.starts_with("buy") {
-                Action::Buy
+            let (action, mint_field) = if label.starts_with("buy") {
+                (Action::Buy, "outputMint")
             } else {
-                Action::Sell
+                (Action::Sell, "inputMint")
             };
             let user = builder_request["user"].as_str().expect("request user");
-            let mint = if matches!(action, Action::Buy) {
-                builder_request["outputMint"].as_str()
-            } else {
-                builder_request["inputMint"].as_str()
-            }
-            .expect("request mint");
+            let mint = builder_request[mint_field].as_str().expect("request mint");
 
             // The scale the script agreed across two independent RPCs, written
             // only when they matched. Absent means the review must fall back to
@@ -6296,6 +6359,8 @@ mod tests {
                 "amount": builder_request["amount"],
                 "minOutputAmount": quoted,
                 "slippagePct": builder_request["slippagePct"],
+                "frontRunningProtection": builder_request["frontRunningProtection"],
+                "tipAmount": builder_request["tipAmount"],
             });
             let mut normalized = body.as_object().expect("body").clone();
             if let Err(error) = normalize(action, user, &mut normalized) {
@@ -6310,6 +6375,16 @@ mod tests {
                     dispatch_message(&error)
                 ),
             };
+
+            let program = if label.contains("_bond") {
+                PROGRAMS[5]
+            } else {
+                PROGRAMS[6]
+            };
+            assert!(
+                protocol_program_of(&parsed).contains(program),
+                "{label}: transaction uses the wrong venue"
+            );
 
             // The review the owner would read, from the validated transaction.
             let review = swap_review(
@@ -6369,10 +6444,7 @@ mod tests {
             );
             assert!(!destinations.is_empty(), "{label}: no declared destination");
         }
-        assert!(
-            checked > 0,
-            "no builder responses were readable under {dir}"
-        );
+        assert_eq!(checked, 8, "every side/venue/protection case must validate");
         println!("\nvalidated {checked} live builder transactions");
     }
 
